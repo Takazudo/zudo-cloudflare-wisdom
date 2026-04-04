@@ -1,0 +1,60 @@
+---
+title: Cloudflare セットアップ
+description: アカウント設定、APIトークン、Wrangler CLI の構成
+sidebar_position: 2
+---
+
+## API トークン
+
+Cloudflare ダッシュボードの **My Profile > API Tokens** から API トークンを作成します。
+
+Pages および Workers のデプロイには、以下の権限が必要です：
+
+- **Account > Cloudflare Pages > Edit**
+- **Account > Workers Scripts > Edit**
+- **Account > Workers KV Storage > Edit**（KV を使用する場合）
+- **Account > Workers R2 Storage > Edit**（R2 を使用する場合）
+- **Account > D1 > Edit**（D1 を使用する場合）
+
+:::tip
+サービスごとに別々のトークンを作るのではなく、全権限をまとめた1つのトークンを作成しましょう。GitHub リポジトリのシークレットに `CLOUDFLARE_API_TOKEN` として保存してください。
+:::
+
+## CI 用の環境変数
+
+すべてのプロジェクトで以下の GitHub Actions シークレットが必要です：
+
+| シークレット | 説明 |
+|---|---|
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare アカウント ID（ダッシュボードの URL に含まれる） |
+| `CLOUDFLARE_API_TOKEN` | 上記で作成した API トークン |
+| `IFTTT_PROD_NOTIFY` | （任意）デプロイ通知用の IFTTT Webhook URL |
+
+## Wrangler CLI
+
+Wrangler は Cloudflare の CLI ツールです。CI では `npx wrangler@4` を使い、グローバルインストールを避けます。ローカル開発では以下のようにインストールします：
+
+```bash
+pnpm add -D wrangler
+```
+
+または npx で実行します：
+
+```bash
+npx wrangler@4 pages deploy dist --project-name=my-project
+```
+
+:::warning
+破壊的変更を避けるため、メジャーバージョンを固定してください（`wrangler@4`）。CI では `wrangler@latest` を使用しないでください。
+:::
+
+## wrangler.toml
+
+Pages Functions、KV、D1、R2 を使用するプロジェクトでは、プロジェクトルートに `wrangler.toml` が必要です：
+
+```toml
+# Cloudflare Pages project configuration
+compatibility_date = "2024-12-01"
+```
+
+バインディングや設定の詳細は [Wrangler 設定](../workers/wrangler-config.mdx) を参照してください。

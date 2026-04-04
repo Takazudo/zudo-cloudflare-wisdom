@@ -1,0 +1,48 @@
+---
+title: 互換性日付
+description: Cloudflare の互換性日付の理解と管理
+sidebar_position: 3
+---
+
+## 互換性日付とは
+
+`wrangler.toml` の `compatibility_date` は Worker を特定バージョンの Cloudflare Workers ランタイムに固定する。これにより破壊的変更がデプロイ済みコードに影響するのを防ぐ。
+
+```toml
+compatibility_date = "2024-12-01"
+```
+
+## 仕組み
+
+- Cloudflare は日付に紐づくフラグの背後にランタイム変更を導入する
+- 日付を設定するとその日付までのすべての変更が有効になる
+- 日付を更新するまで同じランタイム動作を使用する
+- 新しいプロジェクトは最近の日付を使用すべき
+
+## 更新のタイミング
+
+以下の場合に互換性日付を更新する：
+
+- プロジェクトをアクティブに作業中
+- 新しいランタイム機能にアクセスしたい場合
+- Cloudflare ドキュメントが必要な機能の最低日付を推奨している場合
+
+:::warning
+互換性日付の更新はランタイム動作を変更する可能性がある。特に数ヶ月をまたぐ更新後は十分にテストすること。
+:::
+
+## 互換性フラグ
+
+より細かい制御には特定のフラグを有効・無効にできる：
+
+```toml
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+```
+
+よく使うフラグ：
+
+| フラグ | 説明 |
+|---|---|
+| `nodejs_compat` | Node.js 組み込みモジュールのサポートを有効化 |
+| `streams_enable_constructors` | コンストラクタブル Streams API を有効化 |

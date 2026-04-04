@@ -1,0 +1,106 @@
+---
+title: Pages Functions での認証
+description: Cloudflare Pages Functions を使った認証パターン
+sidebar_position: 3
+---
+
+## 概要
+
+Pages Functions は外部認証プロバイダー（Auth0 など）との連携やカスタムトークン検証を実装することで認証を処理できます。
+
+## Auth0 連携パターン
+
+zudo-pattern-gen プロジェクトでの、Auth0 と Pages Functions の連携パターン：
+
+### Wrangler 設定
+
+```toml
+[vars]
+AUTH0_DOMAIN = "your-tenant.us.auth0.com"
+AUTH0_CLIENT_ID = "your-client-id"
+```
+
+:::danger[シークレットと変数の違い]
+`AUTH0_CLIENT_ID` は公開情報なので `[vars]` に記述して問題ありません。しかし `AUTH0_CLIENT_SECRET` は `wrangler secret put AUTH0_CLIENT_SECRET` で設定する必要があります -- `wrangler.toml` には絶対に書かないでください。
+:::
+
+### 認証ミドルウェア関数
+
+トークンを検証するミドルウェア関数を作成します：
+
+```typescript
+// functions/auth/_middleware.ts
+interface Env {
+  AUTH0_DOMAIN: string;
+  AUTH0_CLIENT_ID: string;
+}
+
+export const onRequest: PagesFunction<Env> = async (context) => {
+  const authHeader = context.request.headers.get("Authorization");
+
+  if (!authHeader?.startsWith("Bearer ")) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  const token = authHeader.slice(7);
+
+  try {
+    // Auth0 でトークンを検証
+    const response = await fetch(
+      `https://${context.env.AUTH0_DOMAIN}/userinfo`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    if (!response.ok) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    // トークンが有効なら次の関数へ
+    return context.next();
+  } catch {
+    return new Response("Unauthorized", { status: 401 });
+  }
+};
+```
+
+### ファイルベースのミドルウェアルーティング
+
+Pages Functions は実際の関数の前に実行される `_middleware.ts` ファイルをサポートしています：
+
+```
+functions/
+├── auth/
+│   ├── _middleware.ts    # /auth/* の全ルートで認証チェック
+│   └── callback.ts
+├── api/
+│   ├── _middleware.ts    # /api/* の全ルートで認証チェック
+│   └── data.ts
+└── public/
+    └── health.ts         # 認証不要
+```
+
+## CORS ヘッダー
+
+異なるドメインから呼び出される API 関数の場合：
+
+```typescript
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
+export const onRequestOptions: PagesFunction = async () => {
+  return new Response(null, { headers: corsHeaders });
+};
+
+export const onRequestGet: PagesFunction<Env> = async (context) => {
+  // ... ロジック
+  return new Response(JSON.stringify(data), {
+    headers: {
+      "Content-Type": "application/json",
+      ...corsHeaders,
+    },
+  });
+};
+```

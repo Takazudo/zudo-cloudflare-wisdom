@@ -1,0 +1,63 @@
+---
+title: R2（オブジェクトストレージ）
+description: ファイルとブロブストレージ用の Cloudflare R2
+sidebar_position: 3
+---
+
+## 概要
+
+R2 はエグレス料金ゼロの S3 互換オブジェクトストレージ。ファイル、画像、バックアップ、大容量データに使用する。
+
+## セットアップ
+
+### バケットの作成
+
+```bash
+npx wrangler r2 bucket create my-files
+```
+
+`wrangler.toml` に追加：
+
+```toml
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "my-files"
+```
+
+## 関数での使用
+
+```typescript
+interface Env {
+  FILES: R2Bucket;
+}
+
+// アップロード
+await env.FILES.put("uploads/photo.jpg", imageData, {
+  httpMetadata: { contentType: "image/jpeg" },
+});
+
+// ダウンロード
+const object = await env.FILES.get("uploads/photo.jpg");
+if (object) {
+  return new Response(object.body, {
+    headers: {
+      "Content-Type": object.httpMetadata?.contentType || "application/octet-stream",
+    },
+  });
+}
+
+// 削除
+await env.FILES.delete("uploads/photo.jpg");
+
+// オブジェクトの一覧
+const list = await env.FILES.list({ prefix: "uploads/" });
+for (const object of list.objects) {
+  console.log(object.key, object.size);
+}
+```
+
+## 注意点
+
+- **自動パブリック URL はない**: S3 のパブリックバケットとは異なり、R2 はファイルを公開配信するには Worker またはカスタムドメインが必要
+- **オブジェクトキー制限**: キーは最大1024バイト
+- **メタデータ**: 独自のキーバリューペアには `customMetadata`、HTTP ヘッダーには `httpMetadata` を使用

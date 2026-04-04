@@ -1,0 +1,82 @@
+---
+title: R2 (Object Storage)
+description: Cloudflare R2 for file and blob storage
+sidebar_position: 3
+---
+
+## Overview
+
+R2 is S3-compatible object storage with zero egress fees. Use it for files, images, backups, and large data.
+
+## Setup
+
+### Create a Bucket
+
+```bash
+npx wrangler r2 bucket create my-files
+```
+
+Add to `wrangler.toml`:
+
+```toml
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "my-files"
+```
+
+## Usage in Functions
+
+```typescript
+interface Env {
+  FILES: R2Bucket;
+}
+
+// Upload
+await env.FILES.put("uploads/photo.jpg", imageData, {
+  httpMetadata: { contentType: "image/jpeg" },
+});
+
+// Download
+const object = await env.FILES.get("uploads/photo.jpg");
+if (object) {
+  return new Response(object.body, {
+    headers: {
+      "Content-Type": object.httpMetadata?.contentType || "application/octet-stream",
+    },
+  });
+}
+
+// Delete
+await env.FILES.delete("uploads/photo.jpg");
+
+// List objects
+const list = await env.FILES.list({ prefix: "uploads/" });
+for (const object of list.objects) {
+  console.log(object.key, object.size);
+}
+```
+
+## Multipart Uploads
+
+For files larger than ~100 MB, use multipart uploads:
+
+```typescript
+const upload = await env.FILES.createMultipartUpload("large-file.zip");
+const part1 = await upload.uploadPart(1, chunk1);
+const part2 = await upload.uploadPart(2, chunk2);
+await upload.complete([part1, part2]);
+```
+
+## Public Access
+
+R2 buckets are private by default. To serve files publicly:
+
+1. **Custom domain**: Connect a domain to the bucket in the Cloudflare dashboard
+2. **Worker proxy**: Create a Worker that reads from R2 and serves files
+3. **Pages Function**: Use a Pages Function as a file serving endpoint
+
+## Gotchas
+
+- **No automatic public URLs**: Unlike S3 with public buckets, R2 requires a Worker or custom domain to serve files publicly
+- **Object key limit**: Keys can be up to 1024 bytes
+- **Metadata**: Use `customMetadata` for your own key-value pairs, `httpMetadata` for HTTP headers

@@ -1,0 +1,107 @@
+---
+title: Wrangler Config
+description: wrangler.toml configuration for Workers and Pages
+sidebar_position: 1
+---
+
+## Basic Structure
+
+The `wrangler.toml` file configures your Cloudflare project. For Pages projects, it primarily defines bindings and compatibility settings:
+
+```toml
+# Cloudflare Pages project configuration
+compatibility_date = "2024-12-01"
+```
+
+For standalone Workers, it also includes the entry point and routing:
+
+```toml
+name = "my-worker"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+```
+
+## Bindings
+
+Bindings connect your code to Cloudflare services.
+
+### KV Namespaces
+
+```toml
+[[kv_namespaces]]
+binding = "MY_KV"
+id = "abc123def456ghi789"
+```
+
+### D1 Databases
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "my-database"
+database_id = "abc123-def456-ghi789"
+```
+
+### R2 Buckets
+
+```toml
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "my-files"
+```
+
+### Environment Variables
+
+```toml
+[vars]
+API_ENDPOINT = "https://api.example.com"
+```
+
+For secrets (API keys, tokens), use `wrangler secret put`:
+
+```bash
+npx wrangler secret put MY_SECRET
+```
+
+:::danger[Never Put Secrets in wrangler.toml]
+The `[vars]` section is for non-sensitive configuration only. Secrets should be set via `wrangler secret put` or the Cloudflare dashboard. `wrangler.toml` is committed to git.
+:::
+
+## Pages-Specific Options
+
+For Pages projects, you can specify the build output directory:
+
+```toml
+pages_build_output_dir = "./dist"
+```
+
+## Multiple Bindings Example
+
+A real-world `wrangler.toml` from a project using KV, D1, and R2:
+
+```toml
+# Cloudflare Pages project configuration
+compatibility_date = "2024-12-01"
+pages_build_output_dir = "./dist"
+
+[vars]
+AUTH0_DOMAIN = "placeholder.us.auth0.com"
+AUTH0_CLIENT_ID = "placeholder"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "my-app"
+database_id = "placeholder"
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "my-app-files"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "placeholder"
+```
+
+:::tip[Placeholder IDs]
+Use placeholder values in `wrangler.toml` for database IDs and KV namespace IDs in source control. The actual IDs are environment-specific and should be managed per environment.
+:::

@@ -1,0 +1,61 @@
+---
+title: KV（キーバリュー）
+description: Cloudflare KV ネームスペースの使用パターン
+sidebar_position: 1
+---
+
+## 概要
+
+KV はグローバルで低レイテンシのキーバリューストア。**結果整合性** -- 書き込みは約60秒以内にグローバルに伝播するが、その間は古いデータを返す可能性がある。
+
+## セットアップ
+
+### ネームスペースの作成
+
+```bash
+npx wrangler kv namespace create "MY_KV"
+```
+
+出力されたネームスペース ID を `wrangler.toml` に追加：
+
+```toml
+[[kv_namespaces]]
+binding = "MY_KV"
+id = "abc123def456ghi789"
+```
+
+## 関数での使用
+
+```typescript
+interface Env {
+  MY_KV: KVNamespace;
+}
+
+// 読み取り
+const value = await env.MY_KV.get("key");
+const json = await env.MY_KV.get("key", { type: "json" });
+
+// 書き込み
+await env.MY_KV.put("key", "value");
+await env.MY_KV.put("key", JSON.stringify(data));
+
+// 有効期限付き書き込み（TTL は秒）
+await env.MY_KV.put("key", "value", { expirationTtl: 3600 });
+
+// 削除
+await env.MY_KV.delete("key");
+
+// キーの一覧
+const list = await env.MY_KV.list({ prefix: "logs:" });
+```
+
+:::tip[重要でない書き込みには `waitUntil` を使用]
+`context.waitUntil()` はレスポンス送信後に非同期処理を実行できる。ロギング、アナリティクス、その他の重要でない書き込みに使用する。
+:::
+
+## 注意点
+
+- **結果整合性**: 書き込み直後の読み取りは古いデータを返す可能性がある
+- **512バイトのキー制限**: キーは512バイトを超えられない
+- **25 MiB の値制限**: 値は25 MiB を超えられない
+- **リストのページネーション**: `list()` は1回の呼び出しで最大1000キーを返す

@@ -1,0 +1,67 @@
+export type {
+  HeaderNavItem,
+  ColorModeConfig,
+  HtmlPreviewConfig,
+  LocaleConfig,
+  VersionConfig,
+  FooterConfig,
+} from "./settings-types";
+import type {
+  HeaderNavItem,
+  ColorModeConfig,
+  HtmlPreviewConfig,
+  LocaleConfig,
+  VersionConfig,
+  FooterConfig,
+} from "./settings-types";
+
+export const settings = {
+  colorScheme: "Default Dark",
+  colorMode: {
+    defaultMode: "dark",
+    lightScheme: "Default Light",
+    darkScheme: "Default Dark",
+    respectPrefersColorScheme: true,
+  } satisfies ColorModeConfig,
+  siteName: "zudo-cloudflare-wisdom",
+  siteDescription: "Takazudo's Cloudflare dev notes for me and AI agents" as string,
+  base: "/pj/zudo-cloudflare",
+  trailingSlash: false as boolean,
+  noindex: false as boolean,
+  editUrl: false as string | false,
+  siteUrl: "" as string,
+  onBrokenMarkdownLinks: "warn" as "warn" | "error" | "ignore",
+  sidebarResizer: true as boolean,
+  sidebarToggle: true as boolean,
+  docsDir: "src/content/docs",
+  locales: {
+    ja: { label: "JA", dir: "src/content/docs-ja" },
+  } as Record<string, LocaleConfig>,
+  mermaid: true,
+  sitemap: false,
+  docMetainfo: true,
+  docTags: false,
+  llmsTxt: true,
+  math: false,
+  aiAssistant: false as boolean,
+  docHistory: true,
+  colorTweakPanel: false as boolean,
+  htmlPreview: undefined as HtmlPreviewConfig | undefined,
+  versions: false as VersionConfig[] | false,
+  claudeResources: {
+    claudeDir: ".claude",
+  } as { claudeDir: string; projectRoot?: string } | false,
+  footer: {
+    links: [],
+    copyright: `Copyright © ${new Date().getFullYear()} <a href="https://x.com/Takazudo">Takazudo</a>. Built with <a href="https://takazudomodular.com/pj/zudo-doc">zudo-doc</a>. Enjoy synth on <a href="https://takazudomodular.com/">Takazudo Modular</a>.`,
+  } as FooterConfig,
+  headerNav: [
+    { label: "Overview", path: "/docs/getting-started", categoryMatch: "getting-started" },
+    { label: "Pages", path: "/docs/pages", categoryMatch: "pages" },
+    { label: "Workers", path: "/docs/workers", categoryMatch: "workers" },
+    { label: "Storage", path: "/docs/storage", categoryMatch: "storage" },
+    { label: "CI/CD", path: "/docs/cicd", categoryMatch: "cicd" },
+    { label: "Recipes", path: "/docs/recipes", categoryMatch: "recipes" },
+    { label: "Claude", path: "/docs/claude", categoryMatch: "claude" },
+  ] as HeaderNavItem[],
+};

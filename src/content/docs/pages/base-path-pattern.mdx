@@ -1,0 +1,85 @@
+---
+title: Base Path Pattern
+description: Serving sites under a subpath like /pj/my-site/ with _redirects
+sidebar_position: 2
+---
+
+## The Pattern
+
+Many of our projects serve under a subpath (e.g., `https://example.pages.dev/pj/my-site/`) rather than the root. This requires two things:
+
+1. **Framework base path** -- Configure your framework to generate URLs with the prefix
+2. **Deploy directory nesting** -- Place built files in the correct subdirectory
+3. **Root redirect** -- A `_redirects` file to send `/` to the subpath
+
+## Astro Configuration
+
+Set the `base` in your Astro config:
+
+```typescript
+// astro.config.ts
+export default defineConfig({
+  output: "static",
+  base: "/pj/my-site",
+});
+```
+
+:::warning[Base Path Only Affects URLs]
+Astro's `base` only affects generated URLs and links. It does **not** change the output directory structure -- files are still output to `dist/` at root level. You must handle the directory nesting yourself during deployment.
+:::
+
+## Deploy Directory Setup
+
+In CI, create the nested structure before deploying:
+
+```bash
+mkdir -p deploy/pj/my-site
+cp -r dist/* deploy/pj/my-site/
+echo '/ /pj/my-site/ 302' > deploy/_redirects
+npx wrangler@4 pages deploy deploy --project-name=my-site --branch=main
+```
+
+### Handling Astro Output Modes
+
+Astro outputs to `dist/` for static output or `dist/client/` for SSR. Handle both:
+
+```bash
+if [ -d dist/client ]; then
+  cp -r dist/client/. deploy/pj/my-site/
+else
+  cp -r dist/. deploy/pj/my-site/
+fi
+```
+
+## _redirects File
+
+The `_redirects` file tells Cloudflare Pages how to handle URL routing. Place it at the root of the deploy directory:
+
+```
+/ /pj/my-site/ 302
+```
+
+This redirects visitors from the root to the actual site path.
+
+### Redirect Syntax
+
+```
+<source> <destination> <status-code>
+```
+
+- `301` -- Permanent redirect (cached by browsers)
+- `302` -- Temporary redirect (not cached)
+- Use `302` during development, `301` for stable paths
+
+### Multiple Redirects
+
+For sites that have changed URL structure:
+
+```
+/ /pj/my-site/ 302
+/pj/my-site/old-path /pj/my-site/new-path 301
+```
+
+:::tip
+When generating `_redirects` in CI with a heredoc, watch out for leading whitespace. Use `sed -i 's/^[[:space:]]*//' deploy/_redirects` to strip it.
+:::

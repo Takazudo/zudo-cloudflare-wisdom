@@ -1,0 +1,15 @@
+node_modules
+dist
+.astro
+.playwright-mcp/
+__inbox/
+{logdir}/
+worktrees/
+# Generated skill files (contain machine-specific absolute paths)
+.claude/skills/cloudflare-wisdom/SKILL.md
+.claude/skills/cloudflare-wisdom/docs
+.claude/skills/cloudflare-wisdom/docs-ja
+*.tgz
+.env
+.env.*
+!.env.example

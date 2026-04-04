@@ -1,0 +1,106 @@
+---
+title: Auth with Pages Functions
+description: Authentication patterns using Cloudflare Pages Functions
+sidebar_position: 3
+---
+
+## Overview
+
+Pages Functions can handle authentication by integrating with external auth providers (Auth0, etc.) or implementing custom token validation.
+
+## Auth0 Integration Pattern
+
+From our zudo-pattern-gen project, using Auth0 with Pages Functions:
+
+### Wrangler Config
+
+```toml
+[vars]
+AUTH0_DOMAIN = "your-tenant.us.auth0.com"
+AUTH0_CLIENT_ID = "your-client-id"
+```
+
+:::danger[Secrets vs Vars]
+`AUTH0_CLIENT_ID` is safe in `[vars]` (it's public). But `AUTH0_CLIENT_SECRET` must be set via `wrangler secret put AUTH0_CLIENT_SECRET` -- never in `wrangler.toml`.
+:::
+
+### Auth Middleware Function
+
+Create a middleware function that validates tokens:
+
+```typescript
+// functions/auth/_middleware.ts
+interface Env {
+  AUTH0_DOMAIN: string;
+  AUTH0_CLIENT_ID: string;
+}
+
+export const onRequest: PagesFunction<Env> = async (context) => {
+  const authHeader = context.request.headers.get("Authorization");
+
+  if (!authHeader?.startsWith("Bearer ")) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  const token = authHeader.slice(7);
+
+  try {
+    // Validate token with Auth0
+    const response = await fetch(
+      `https://${context.env.AUTH0_DOMAIN}/userinfo`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    if (!response.ok) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    // Token is valid, continue to the next function
+    return context.next();
+  } catch {
+    return new Response("Unauthorized", { status: 401 });
+  }
+};
+```
+
+### File-Based Middleware Routing
+
+Pages Functions support `_middleware.ts` files that run before the actual function:
+
+```
+functions/
+├── auth/
+│   ├── _middleware.ts    # Auth check for all /auth/* routes
+│   └── callback.ts
+├── api/
+│   ├── _middleware.ts    # Auth check for all /api/* routes
+│   └── data.ts
+└── public/
+    └── health.ts         # No auth needed
+```
+
+## CORS Headers
+
+For API functions called from a different domain:
+
+```typescript
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
+export const onRequestOptions: PagesFunction = async () => {
+  return new Response(null, { headers: corsHeaders });
+};
+
+export const onRequestGet: PagesFunction<Env> = async (context) => {
+  // ... your logic
+  return new Response(JSON.stringify(data), {
+    headers: {
+      "Content-Type": "application/json",
+      ...corsHeaders,
+    },
+  });
+};
+```

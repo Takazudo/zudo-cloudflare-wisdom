@@ -1,0 +1,103 @@
+---
+title: Wrangler 設定
+description: Workers と Pages 用の wrangler.toml 設定
+sidebar_position: 1
+---
+
+## 基本構造
+
+`wrangler.toml` ファイルは Cloudflare プロジェクトを設定する。Pages プロジェクトでは主にバインディングと互換性設定を定義する：
+
+```toml
+# Cloudflare Pages project configuration
+compatibility_date = "2024-12-01"
+```
+
+スタンドアロン Workers ではエントリーポイントとルーティングも含む：
+
+```toml
+name = "my-worker"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+```
+
+## バインディング
+
+バインディングはコードを Cloudflare サービスに接続する。
+
+### KV ネームスペース
+
+```toml
+[[kv_namespaces]]
+binding = "MY_KV"
+id = "abc123def456ghi789"
+```
+
+### D1 データベース
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "my-database"
+database_id = "abc123-def456-ghi789"
+```
+
+### R2 バケット
+
+```toml
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "my-files"
+```
+
+### 環境変数
+
+```toml
+[vars]
+API_ENDPOINT = "https://api.example.com"
+```
+
+シークレット（API キー、トークン）には `wrangler secret put` を使用：
+
+```bash
+npx wrangler secret put MY_SECRET
+```
+
+:::danger[シークレットを wrangler.toml に入れてはいけない]
+`[vars]` セクションは機密性のない設定専用。シークレットは `wrangler secret put` または Cloudflare ダッシュボードで設定する。`wrangler.toml` は git にコミットされる。
+:::
+
+## Pages 固有のオプション
+
+```toml
+pages_build_output_dir = "./dist"
+```
+
+## 複数バインディングの例
+
+```toml
+# Cloudflare Pages project configuration
+compatibility_date = "2024-12-01"
+pages_build_output_dir = "./dist"
+
+[vars]
+AUTH0_DOMAIN = "placeholder.us.auth0.com"
+AUTH0_CLIENT_ID = "placeholder"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "my-app"
+database_id = "placeholder"
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "my-app-files"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "placeholder"
+```
+
+:::tip[プレースホルダー ID]
+ソース管理ではデータベース ID や KV ネームスペース ID にプレースホルダー値を使用する。実際の ID は環境固有。
+:::

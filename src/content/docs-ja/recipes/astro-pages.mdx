@@ -1,0 +1,76 @@
+---
+title: Astro + Cloudflare Pages
+description: Astro 静的サイトを Cloudflare Pages にデプロイ
+sidebar_position: 1
+---
+
+## 標準セットアップ
+
+静的出力の Astro が Cloudflare Pages プロジェクトのデフォルトスタック。
+
+### Astro 設定
+
+```typescript
+// astro.config.ts
+import { defineConfig } from "astro/config";
+
+export default defineConfig({
+  output: "static",
+  base: "/pj/my-site",
+  server: { port: 4321 },
+});
+```
+
+### ビルドとデプロイ
+
+```bash
+pnpm build
+
+mkdir -p deploy/pj/my-site
+cp -r dist/* deploy/pj/my-site/
+echo '/ /pj/my-site/ 302' > deploy/_redirects
+
+npx wrangler@4 pages deploy deploy --project-name=my-site --branch=main
+```
+
+## Astro 出力モード
+
+| モード | 出力ディレクトリ | 備考 |
+|---|---|---|
+| `static` | `dist/` | 純粋な静的ファイル |
+| `server` | `dist/client/`（静的）+ `dist/server/` | SSR モード |
+| `hybrid` | `dist/client/`（静的）+ `dist/server/` | ミックスモード |
+
+CI では両方の出力構造に対応する：
+
+```bash
+if [ -d dist/client ]; then
+  cp -r dist/client/. deploy/pj/my-site/
+else
+  cp -r dist/. deploy/pj/my-site/
+fi
+```
+
+## Pages Functions の追加
+
+Astro サイトに API エンドポイントを追加するには：
+
+1. プロジェクトルートに `functions/` ディレクトリを作成
+2. 必要なバインディングを含む `wrangler.toml` を作成
+3. Functions は `pages deploy` で自動検出・デプロイされる
+
+:::warning[関数パスはベースパスと一致させる]
+Astro サイトが `base: "/pj/my-site"` を使用する場合、関数ファイルは正しい URL で配信されるよう `functions/pj/my-site/` 配下に置く必要がある。
+:::
+
+## Git 履歴付きドキュメントサイト
+
+作成日・更新日を表示するドキュメントサイトでは、checkout ステップで `fetch-depth: 0` を指定する：
+
+```yaml
+- uses: actions/checkout@v5
+  with:
+    fetch-depth: 0
+```
+
+これがないと、すべてのページの作成日が CI 実行日になってしまう。
