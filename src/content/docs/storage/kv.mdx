@@ -81,6 +81,64 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
 `context.waitUntil()` lets you perform async work after the response is sent. Use it for logging, analytics, and other non-critical writes.
 :::
 
+## Pattern: Conversation State
+
+Store multi-turn conversation history per thread with automatic TTL-based cleanup:
+
+```typescript
+const CONVERSATION_TTL = 86400; // 24 hours
+
+interface ConversationHistory {
+  messages: Array<{ role: string; content: string }>;
+}
+
+// Load with typed JSON deserialization
+const key = `conv:${threadId}`;
+const stored = await env.KV.get<ConversationHistory>(key, "json");
+const history = stored ?? { messages: [] };
+
+// Append new message
+history.messages.push({ role: "user", content: userMessage });
+
+// Save with TTL -- old conversations auto-expire
+await env.KV.put(key, JSON.stringify(history), {
+  expirationTtl: CONVERSATION_TTL,
+});
+```
+
+Key design points:
+- Use a structured key like `conv:{threadId}` for easy identification
+- The `"json"` type parameter on `get()` handles deserialization automatically
+- TTL ensures conversations don't accumulate forever
+
+## Pattern: Rate Limiting
+
+Per-user rate limiting using KV counters with TTL expiration:
+
+```typescript
+const RATE_LIMIT = 30;
+const RATE_WINDOW = 86400; // 24 hours
+
+async function checkRateLimit(
+  env: Env,
+  userId: string,
+): Promise<boolean> {
+  const key = `rate:${userId}`;
+  const count = await env.KV.get<number>(key, "json") ?? 0;
+
+  if (count >= RATE_LIMIT) return false;
+
+  await env.KV.put(key, JSON.stringify(count + 1), {
+    expirationTtl: RATE_WINDOW,
+  });
+  return true;
+}
+```
+
+:::warning[KV rate limiting is approximate]
+KV is eventually consistent, so under high concurrency a few extra requests may pass through. This is fine for bot/API rate limiting. For precise counting, use Durable Objects.
+:::
+
 ## Gotchas
 
 - **Eventually consistent**: Reads immediately after writes may return stale data

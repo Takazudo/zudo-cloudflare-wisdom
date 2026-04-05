@@ -43,6 +43,40 @@ export default {
 };
 ```
 
+## ExecutionContext とバックグラウンド処理
+
+`fetch` の第3引数は `ExecutionContext` で、レスポンス送信後に非同期処理を実行する `waitUntil()` を提供する：
+
+```typescript
+export default {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
+    // Return response immediately
+    const response = buildResponse(request, env);
+
+    // Run non-critical work in the background
+    ctx.waitUntil(logAnalytics(request, env));
+    ctx.waitUntil(updateCache(request, env));
+
+    return response;
+  },
+};
+```
+
+これが重要な場面：
+
+- **Webhook ハンドラー** -- Slack、GitHub 等は 3 秒以内のレスポンスを要求する。レスポンス後に Webhook ペイロードを処理する。
+- **ロギングとアナリティクス** -- 重要でない書き込みでユーザーのレスポンスをブロックしない。
+- **キャッシュウォーミング** -- レスポンス後にキャッシュを更新する。
+
+:::warning[`waitUntil` は CPU 時間を延長しない]
+`ctx.waitUntil()` はレスポンス送信後も Worker を生存させるが、CPU 時間制限は増えない。長時間の処理は終了される可能性がある。
+:::
+```
+
 ## デプロイ
 
 `wrangler deploy`（`wrangler pages deploy` ではなく）でデプロイ：
