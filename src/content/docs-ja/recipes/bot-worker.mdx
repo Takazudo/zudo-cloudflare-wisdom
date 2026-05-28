@@ -193,7 +193,7 @@ async function checkRateLimit(
 ```
 
 :::warning[KV のレート制限は近似的]
-KV は結果整合性。高い同時実行数では、数件の余分なリクエストが通過する可能性がある。ボットのレート制限としては許容範囲だが、正確なカウントが必要な場合は Durable Objects を使う。
+KV は結果整合性。高い同時実行数では、数件の余分なリクエストが通過する可能性がある。ボットのレート制限としては許容範囲だが、正確なカウントが必要な場合は [Durable Objects](../workers/durable-objects.mdx) を使う。
 :::
 
 ## KV での会話状態管理
