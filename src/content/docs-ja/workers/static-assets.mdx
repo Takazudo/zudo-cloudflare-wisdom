@@ -1,0 +1,140 @@
+---
+title: Workers Static Assets
+description: スタンドアロン Worker から [assets] で静的ファイルを配信する方法と、ゲーティング・プレビュー URL の罠
+sidebar_position: 5
+---
+
+## Workers Static Assets モデル
+
+**Workers Static Assets** は、スタンドアロン Worker が静的ファイルのディレクトリ（HTML、CSS、JS、画像）を Cloudflare のエッジから直接配信しつつ、動的リクエストには Worker コードを実行できる仕組み。静的 + SSR サイトにおける Cloudflare Pages の後継であり、別個の Pages プロジェクトを用意する代わりに、アセットディレクトリとリクエストロジックの両方を持つ 1 つの Worker をデプロイする。
+
+`wrangler.toml` の `[assets]` テーブルで設定する：
+
+```toml
+name = "my-site"
+main = "./dist/_worker.js"
+compatibility_date = "2024-12-01"
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "404-page"
+run_worker_first = false
+```
+
+- `directory` -- 配信する静的ファイルのフォルダ（ビルド出力）。
+- `binding = "ASSETS"` -- アセットストアを Worker に `env.ASSETS` として公開し、Worker がプログラムからアセットを取得できる（`env.ASSETS.fetch(request)`）。名前はアダプターやコードが期待するものと一致させる必要がある。
+- `not_found_handling` -- 一致するアセットがない場合に何を返すか（後述）。
+- `run_worker_first` -- Worker をアセットレイヤーより**先に**実行するかどうか（後述）。
+
+:::info[アダプターが自動生成する]
+Astro などのフレームワークは `dist/_worker.js` エントリを出力し、`binding = "ASSETS"` を期待する。通常は Worker を一から書くのではなく、`[assets]` ブロックがアダプターの期待と一致していることを確認するだけでよい。
+:::
+
+## `run_worker_first` -- ゲーティングの罠
+
+デフォルトは `run_worker_first = false`。これは**アセットレイヤーが先に参照される**ことを意味する。GET/HEAD リクエストで一致する静的ファイルが存在すれば、Cloudflare はそれを直接返し、Worker スクリプトは実行されない。Worker が動くのは、一致するアセットがない場合だけ。
+
+通常のサイトではこれがまさに望む挙動だ。静的ファイルは高速に配信され、Worker は動的ルートだけを処理する。**しかしこれはリクエストのゲーティングを密かに壊す。**
+
+Worker が**すべてのリクエストを認可・ゲート**する目的（例：ステージングデプロイの Basic 認証や、プレビューホストの許可リストチェック）の場合、デフォルトの順序はそれを無効化する：
+
+```toml
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "404-page"
+# Default false: a GET to a preview host returns 200 from the asset layer
+# and never reaches the gate-wrapped worker -> the gate is silently bypassed.
+run_worker_first = false
+```
+
+プレビューホストへの `/index.html` への GET は、Worker が動く前に**アセットレイヤーから 200 を返す**ため、認証チェックは決して実行されない。プレビューデプロイは**密かにゲートが外れる** -- 保護されているように見えて（Worker コードは存在する）実際にはされていない、本物のセキュリティホールだ。
+
+修正は、Worker を先に実行させること：
+
+```toml
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "404-page"
+# Worker runs on EVERY request first; it gates, then serves the asset
+# itself via env.ASSETS.fetch(request) once the request is authorized.
+run_worker_first = true
+```
+
+:::warning[リクエストごとのゲーティングには `run_worker_first = true` が必須]
+Worker が**すべての**リクエストを認可しなければならない場合、`run_worker_first = true` は任意ではない。デフォルトの `false` では、一致するアセットが Worker より先に配信されるため、静的ファイルに解決されるパスではゲートがバイパスされる。`true` に設定し、ゲートを通過した後に `env.ASSETS.fetch()` で Worker にアセットを配信させる。
+:::
+
+## プレビュー URL が消える罠
+
+デプロイごとのプレビュー URL（`wrangler versions upload --preview-alias` が出力する `*.workers.dev` のバージョンプレビューホスト）は `preview_urls` で制御される。罠はこうだ：**`preview_urls` はデフォルトで `workers_dev` に*一致*する。**
+
+つまり、本番を `*.workers.dev` で配信するのをやめるために `workers_dev = false` を設定した瞬間、**省略された** `preview_urls` も `false` に切り替わり、**すべてのデプロイごとのプレビュー URL が密かに消える**。これが典型的な「なぜプレビュー URL が動かなくなったのか？」という驚きだ。本番ルートを変えただけのつもりが、プレビューまで失っている。
+
+修正は、`preview_urls = true` を**明示的に**設定すること：
+
+```toml
+name = "my-site"
+main = "./dist/_worker.js"
+compatibility_date = "2024-12-01"
+
+# Don't serve production on *.workers.dev...
+workers_dev = false
+# ...but preview_urls defaults to match workers_dev, so an omitted value would
+# also become false and kill ALL per-deploy preview URLs. Set it explicitly.
+preview_urls = true
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "404-page"
+run_worker_first = false
+```
+
+:::tip[トップレベルフィールドは `[assets]` より上に置く]
+TOML では、テーブルヘッダー以降のキーはそのテーブルに*スコープされる*。`workers_dev` / `preview_urls` が `[assets]` の下にあると、wrangler は「Unexpected fields found in assets field」と警告し、それらを密かに無視する。これらのトップレベルフィールドは `[assets]` テーブルの**上**に置くこと。
+:::
+
+## Not-Found 処理と SPA/SSG フォールバック
+
+`not_found_handling` は、GET がどのファイルにも一致しなかったときにアセットレイヤーが何を配信するかを決める：
+
+- `"404-page"` -- `dist/404.html` を配信する（静的サイトジェネレーターで一般的）。各ルートが実ファイルで、未知のパスには 404 ページを表示したい SSG 出力に適する。
+- `"single-page-application"` -- 一致しないルートに `dist/index.html` を配信し、クライアントサイドルーターが処理できるようにする。SPA に使う。
+- `"none"` -- ボディなしの素の 404 を返す。
+
+```toml
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+# SSG: unmatched GETs serve dist/404.html
+not_found_handling = "404-page"
+```
+
+:::note[アセットレイヤーは GET/HEAD のみを処理する]
+`not_found_handling` は GET/HEAD リクエストに適用される。POST やその他のメソッドはアセットレイヤーから配信されることはなく、常に Worker に到達する（`run_worker_first` が許す場合）。したがって `POST /api/...` は `not_found_handling` の影響を受けない。
+:::
+
+### `.assetsignore`
+
+アセット `directory` 内の `.assetsignore` ファイルは、公開アセットストアから**除外**するファイルを `.gitignore` のように列挙する。よくある用途は、Worker エントリとその内部バンドルがダウンロード可能なファイルとして配信されないようにすることだ：
+
+```
+# dist/.assetsignore
+_worker.js
+_worker.js.map
+```
+
+これがないと、`dist/_worker.js` は静的アセットとして公開取得可能になる。`.assetsignore` の内容はアダプターの出力ファイル名に依存するため、ビルド・デプロイツールがコミットせずデプロイ時に `dist/` へ生成することが多い。
+
+## まとめ
+
+| フィールド | デフォルト | 設定する場面 |
+|---|---|---|
+| `binding` | -- | 常に。アダプターは `env.ASSETS` を読む |
+| `not_found_handling` | `"none"` | SSG -> `"404-page"`、SPA -> `"single-page-application"` |
+| `run_worker_first` | `false` | Worker が**すべての**リクエストをゲート・認可する必要がある -> `true` |
+| `workers_dev` | `true` | 本番を `*.workers.dev` で配信するのをやめる -> `false` |
+| `preview_urls` | `workers_dev` に一致 | `workers_dev = false` でもプレビューを残すため常に**明示的に**設定 |
