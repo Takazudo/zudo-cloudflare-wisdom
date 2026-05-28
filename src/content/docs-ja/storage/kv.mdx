@@ -79,6 +79,7 @@ await env.KV.put(key, JSON.stringify(history), {
 ```
 
 設計のポイント：
+
 - `conv:{threadId}` のような構造化キーで識別しやすくする
 - `get()` の `"json"` 型パラメータでデシリアライズを自動化
 - TTL により古い会話が永遠に蓄積されない

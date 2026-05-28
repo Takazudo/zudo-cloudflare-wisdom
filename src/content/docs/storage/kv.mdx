@@ -107,6 +107,7 @@ await env.KV.put(key, JSON.stringify(history), {
 ```
 
 Key design points:
+
 - Use a structured key like `conv:{threadId}` for easy identification
 - The `"json"` type parameter on `get()` handles deserialization automatically
 - TTL ensures conversations don't accumulate forever
