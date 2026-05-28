@@ -79,6 +79,7 @@ await env.KV.put(key, JSON.stringify(history), {
 ```
 
 設計のポイント：
+
 - `conv:{threadId}` のような構造化キーで識別しやすくする
 - `get()` の `"json"` 型パラメータでデシリアライズを自動化
 - TTL により古い会話が永遠に蓄積されない
@@ -108,7 +109,7 @@ async function checkRateLimit(
 ```
 
 :::warning[KV のレート制限は近似的]
-KV は結果整合性のため、高い同時実行数では数件の余分なリクエストが通過する可能性がある。ボットや API のレート制限としては問題ないが、正確なカウントが必要な場合は Durable Objects を使用する。
+KV は結果整合性のため、高い同時実行数では数件の余分なリクエストが通過する可能性がある。ボットや API のレート制限としては問題ないが、正確なカウントが必要な場合は [Durable Objects](../workers/durable-objects.mdx) を使用する。
 :::
 
 ## 注意点

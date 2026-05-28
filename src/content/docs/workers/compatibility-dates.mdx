@@ -46,3 +46,18 @@ Common flags:
 |---|---|
 | `nodejs_compat` | Enable Node.js built-in module support |
 | `streams_enable_constructors` | Enable constructable Streams API |
+
+## When You Actually Need `nodejs_compat`
+
+`nodejs_compat` is not optional decoration. If your bundle (or an adapter such as zfb's `_worker.js` wrapper) imports a Node.js built-in like `node:async_hooks` (`AsyncLocalStorage`), `node:crypto`, or `node:buffer`, then omitting the flag makes **wrangler refuse to load the worker**. That is a **deploy-time failure, not a graceful runtime fallback** — the deploy stops; you do not get a working worker that silently degrades.
+
+```toml
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+```
+
+The concrete trigger is the `AsyncLocalStorage` per-request-context pattern used by the SSR bindings adapter recipe: it threads Cloudflare bindings (KV, D1, R2, env) into a `getCloudflareContext()`-style accessor via `node:async_hooks`. The moment that import lands in your bundle, `nodejs_compat` becomes a hard requirement for every deploy of that worker.
+
+:::warning
+This is a build/deploy-time gate, not a runtime one. You will not discover it from a passing local test that never imports the Node built-in — you discover it when wrangler refuses to load the worker during deployment. If a worker depends on `node:*` modules, keep `nodejs_compat` in its `compatibility_flags` permanently.
+:::

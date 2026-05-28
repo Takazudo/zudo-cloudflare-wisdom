@@ -193,7 +193,7 @@ async function checkRateLimit(
 ```
 
 :::warning[KV rate limiting is approximate]
-KV is eventually consistent. Under high concurrency, a few extra requests may slip through. This is acceptable for bot rate limiting -- use Durable Objects if you need precise counting.
+KV is eventually consistent. Under high concurrency, a few extra requests may slip through. This is acceptable for bot rate limiting -- use [Durable Objects](../workers/durable-objects.mdx) if you need precise counting.
 :::
 
 ## Conversation State in KV

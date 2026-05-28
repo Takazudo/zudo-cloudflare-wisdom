@@ -107,6 +107,7 @@ await env.KV.put(key, JSON.stringify(history), {
 ```
 
 Key design points:
+
 - Use a structured key like `conv:{threadId}` for easy identification
 - The `"json"` type parameter on `get()` handles deserialization automatically
 - TTL ensures conversations don't accumulate forever
@@ -136,7 +137,7 @@ async function checkRateLimit(
 ```
 
 :::warning[KV rate limiting is approximate]
-KV is eventually consistent, so under high concurrency a few extra requests may pass through. This is fine for bot/API rate limiting. For precise counting, use Durable Objects.
+KV is eventually consistent, so under high concurrency a few extra requests may pass through. This is fine for bot/API rate limiting. For precise counting, use [Durable Objects](../workers/durable-objects.mdx).
 :::
 
 ## Gotchas
