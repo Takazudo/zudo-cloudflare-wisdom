@@ -46,3 +46,18 @@ compatibility_flags = ["nodejs_compat"]
 |---|---|
 | `nodejs_compat` | Node.js 組み込みモジュールのサポートを有効化 |
 | `streams_enable_constructors` | コンストラクタブル Streams API を有効化 |
+
+## `nodejs_compat` が本当に必要になるとき
+
+`nodejs_compat` は飾りで付けるオプションではない。バンドル（あるいは zfb の `_worker.js` ラッパーのようなアダプター）が `node:async_hooks`（`AsyncLocalStorage`）、`node:crypto`、`node:buffer` といった Node.js 組み込みモジュールを import している場合、このフラグを省略すると **wrangler は worker のロードを拒否する**。これは **デプロイ時の失敗であり、ランタイムでの穏やかなフォールバックではない** — デプロイが止まるだけで、こっそり機能を落として動く worker が手に入るわけではない。
+
+```toml
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+```
+
+具体的なトリガーは、SSR バインディングアダプターのレシピで使われる `AsyncLocalStorage` のリクエスト単位コンテキストパターンだ。これは `node:async_hooks` を介して Cloudflare のバインディング（KV、D1、R2、env）を `getCloudflareContext()` 形式のアクセサーへ受け渡す。この import がバンドルに入った瞬間、その worker のすべてのデプロイで `nodejs_compat` が必須になる。
+
+:::warning
+これはランタイムではなくビルド／デプロイ時のゲートだ。Node 組み込みモジュールを import しないローカルテストがパスしても気づけない — デプロイ中に wrangler が worker のロードを拒否して初めて発覚する。worker が `node:*` モジュールに依存しているなら、その `compatibility_flags` には `nodejs_compat` を恒久的に残しておくこと。
+:::
