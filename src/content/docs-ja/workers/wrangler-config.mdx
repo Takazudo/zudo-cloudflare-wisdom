@@ -101,3 +101,170 @@ id = "placeholder"
 :::tip[プレースホルダー ID]
 ソース管理ではデータベース ID や KV ネームスペース ID にプレースホルダー値を使用する。実際の ID は環境固有。
 :::
+
+## 名前付き環境とサービスバインディング
+
+実際のプロジェクトでバインディングのセットがひとつだけということはまずない。通常は使い捨てデータを指す `preview` デプロイ、本番データを指す `production` デプロイ、そしてその中間の `staging` デプロイがほしくなる。Wrangler はこれを**名前付き環境**でモデル化する：`[env.preview]`、`[env.production]`、`[env.staging]`。特定の環境は `--env` でデプロイする：
+
+```bash
+npx wrangler deploy --env preview
+npx wrangler deploy --env production
+```
+
+### 最大の落とし穴: バインディングと `[vars]` は継承されない
+
+これはマルチ環境 Worker が壊れる最も一般的な原因だ。**トップレベルで宣言したバインディング（D1、R2、KV、AI、サービス）と `[vars]` は、名前付き環境には引き継がれない。** `--env preview` でデプロイすると、Worker は `[env.preview.*]` の下に宣言されたものしか見えず、トップレベルの `[vars]` やバインディングは黙って捨てられる。
+
+その結果、Worker は D1 接続もなく、KV もなく、`API_ENDPOINT` が未定義のまま preview で動き、リクエスト時になって初めて失敗することが多い。Wrangler はデプロイ時に警告を出す：
+
+```
+Processing wrangler.toml configuration:
+  - "vars" exists at the top level, but not on "env.preview".
+    This is not what you probably want, since "vars" is not inherited by environments.
+    Please add "vars" to "env.preview".
+```
+
+修正方法は、**各環境の中ですべてのバインディングと var を再宣言する**こと：
+
+```toml
+name = "my-worker"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+# Top-level [vars] is NOT inherited by named environments below.
+# Re-declare it under each [env.*] or the Worker runs without it.
+[vars]
+API_ENDPOINT = "https://api.example.com"
+
+[env.preview]
+# Wrangler does NOT copy the top-level [vars] here. Without this block the
+# preview Worker runs with API_ENDPOINT undefined.
+[env.preview.vars]
+API_ENDPOINT = "https://api-preview.example.com"
+
+[[env.preview.kv_namespaces]]
+binding = "CACHE"
+id = "placeholder-preview-kv-id"
+
+[env.production]
+[env.production.vars]
+API_ENDPOINT = "https://api.example.com"
+
+[[env.production.kv_namespaces]]
+binding = "CACHE"
+id = "placeholder-production-kv-id"
+```
+
+:::warning[環境ごとにすべて再宣言する]
+バインディングや vars に部分的な継承は存在しない。`[env.preview]` を作るなら、その D1、R2、KV、AI、services、そして `[env.preview.vars]` を自前で列挙しなければならない。バインディングの欠落はデプロイ時にエラーにならず、Worker 内の実行時 `undefined` として表面化する。
+:::
+
+<Note>
+`workers_dev` や `preview_urls` といったバインディングではない*設定*は、トップレベルから名前付き環境へ継承される。継承されないルールはバインディングと `[vars]` に特有のものだ。可読性のために環境ごとに明示的に設定することも依然として一般的。
+</Note>
+
+### 環境ごとのデータ分離
+
+各環境に独自の `database_id` と `bucket_name` を持たせることが、staging のトラフィックを本番データに触れさせないための鍵だ。バインディング名（`DB`、`BUCKET`）は同じままにするので Worker のコードは環境非依存になり、変わるのは背後のリソースだけになる：
+
+```toml
+name = "sync-server"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sync-db"
+database_id = "placeholder-prod-d1-id"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "sync-blobs"
+
+[ai]
+binding = "AI"
+
+# Staging points the SAME bindings (DB, BUCKET, AI) at SEPARATE resources,
+# so staging never reads or writes production data.
+[env.staging]
+name = "sync-server-staging"
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "sync-db-staging"
+database_id = "placeholder-staging-d1-id"
+
+[[env.staging.r2_buckets]]
+binding = "BUCKET"
+bucket_name = "sync-blobs-staging"
+
+[env.staging.ai]
+binding = "AI"
+```
+
+参照する前に staging リソースを作成するには：
+
+```bash
+npx wrangler d1 create sync-db-staging
+npx wrangler r2 bucket create sync-blobs-staging
+```
+
+返ってきた `database_id` を `[[env.staging.d1_databases]]` に貼り付ける。
+
+### サービスバインディング: ある Worker が別の Worker を呼ぶ
+
+**サービスバインディング**を使うと、ある Worker が別の Worker を Cloudflare の内部エッジ経由で直接呼び出せる。呼び出しが Cloudflare のネットワークを出ないため、公開インターネットの経由も、DNS ルックアップも、CORS もない。論理的な名前をデプロイ済み Worker の名前にバインドする：
+
+```toml
+[env.preview]
+
+# Service binding: this preview Worker → the "image-resizer-preview" Worker.
+# The caller reaches it via env.IMAGE_RESIZER without a public request.
+[[env.preview.services]]
+binding = "IMAGE_RESIZER"
+service = "image-resizer-preview"
+
+[[env.preview.services]]
+binding = "NOTIFY_WORKER"
+service = "notify-worker-preview"
+
+[env.production]
+
+# Same logical bindings, wired to the production target Workers.
+[[env.production.services]]
+binding = "IMAGE_RESIZER"
+service = "image-resizer-prod"
+
+[[env.production.services]]
+binding = "NOTIFY_WORKER"
+service = "notify-worker-prod"
+```
+
+バインディング名（`IMAGE_RESIZER`）は環境をまたいで一定なのに対し、`service` のターゲットは `-preview` と `-prod` で切り替わる点に注目。コードからは `fetch` のように呼ぶが、リクエストは内部でディスパッチされる：
+
+```ts
+// env.IMAGE_RESIZER is the service binding; this never hits the public internet.
+const res = await env.IMAGE_RESIZER.fetch("https://internal/resize", {
+  method: "POST",
+  body: imageBytes,
+});
+```
+
+### 本番環境のみのカスタムドメインルート
+
+apex と `www` のドメインは `custom_domain = true` で production 環境にのみ割り当てる。こうすれば preview デプロイは生成された `*.workers.dev` の URL に留まり、本物のドメインを配信することはない：
+
+```toml
+[env.production]
+
+# Custom-domain routes — production environment only.
+[[env.production.routes]]
+pattern = "example.com"
+custom_domain = true
+
+[[env.production.routes]]
+pattern = "www.example.com"
+custom_domain = true
+```
+
+`custom_domain = true` は、既存のゾーンのルートパターンに一致させるのではなく、そのホスト名の DNS レコードと TLS 証明書を Cloudflare が自動で作成・管理するよう指示する。
