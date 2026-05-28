@@ -75,6 +75,125 @@ R2 buckets are private by default. To serve files publicly:
 2. **Worker proxy**: Create a Worker that reads from R2 and serves files
 3. **Pages Function**: Use a Pages Function as a file serving endpoint
 
+## Direct browser uploads (presigned URLs)
+
+The native `R2Bucket` binding routes every upload through your Worker, so the file body counts against the Worker's request-body size limit and burns Worker CPU time. For large user uploads (photos, video), mint a **presigned PUT URL** and let the browser upload **directly to R2**, bypassing the Worker entirely for the bytes.
+
+R2 exposes an S3-compatible API at `https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com`, so any S3 presigner works. On Workers, the catch is bundle size.
+
+### Use aws4fetch, not the AWS SDK
+
+Use [`aws4fetch`](https://github.com/mhart/aws4fetch) (~5 KB minified), **not** `@aws-sdk/client-s3` + `@aws-sdk/s3-request-presigner`. The AWS SDK v3 ships heavy smithy / `AbortSignal` plumbing that blows the Worker **1 MB code-size limit** for what is, here, a single signing call.
+
+```bash
+npm install aws4fetch
+```
+
+### Minting a presigned PUT URL
+
+```typescript
+import { AwsClient } from "aws4fetch";
+
+interface Env {
+  R2_ACCOUNT_ID: string;
+  R2_ACCESS_KEY_ID: string;
+  R2_SECRET_ACCESS_KEY: string;
+  R2_BUCKET_NAME: string;
+}
+
+interface SignOpts {
+  objectKey: string;
+  contentType: string;
+  expiresIn?: number; // seconds; defaults to 300 (5 minutes)
+}
+
+async function signPutUrl(env: Env, opts: SignOpts): Promise<string> {
+  const client = new AwsClient({
+    accessKeyId: env.R2_ACCESS_KEY_ID,
+    secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+    service: "s3",
+    region: "auto",
+  });
+
+  const expiresIn = opts.expiresIn ?? 300;
+  const url = new URL(
+    `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_BUCKET_NAME}/${opts.objectKey}`,
+  );
+  // aws4fetch reads X-Amz-Expires from the URL when signQuery is true.
+  // Without it, the s3 default is 86400 (24h) — far too long for an upload window.
+  url.searchParams.set("X-Amz-Expires", String(expiresIn));
+
+  const signed = await client.sign(
+    new Request(url.toString(), {
+      method: "PUT",
+      headers: { "content-type": opts.contentType },
+    }),
+    {
+      aws: {
+        signQuery: true,
+        // content-type is in aws4fetch's UNSIGNABLE_HEADERS by default.
+        // allHeaders forces it into the signed-headers list.
+        allHeaders: true,
+      },
+    },
+  );
+  return signed.url;
+}
+```
+
+### The content-type gotcha
+
+By default `aws4fetch` treats `content-type` as **unsignable** and leaves it out of the signature. Passing `allHeaders: true` forces it into the signed headers — which is what you want, because it pins the upload to a declared MIME type.
+
+The catch: once `content-type` is signed, the **browser MUST PUT with the exact same `content-type`** header. Any mismatch and R2 rejects the upload with `SignatureDoesNotMatch`.
+
+```javascript
+// Browser side — the content-type MUST match what was signed.
+await fetch(presignedUrl, {
+  method: "PUT",
+  headers: { "Content-Type": "image/jpeg" }, // exactly what signPutUrl signed
+  body: fileBlob,
+});
+```
+
+:::warning[Presigned URLs are not single-use]
+R2 does **not** invalidate a presigned URL after the first PUT. The only enforcement is the expiry window (`X-Amz-Expires`). Keep the TTL short (300 s is a sane default) and treat the URL as a capability that anyone holding it can replay until it expires.
+:::
+
+### S3 API tokens, not the binding
+
+Presigned signing needs R2 **S3 API tokens** — `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`, created under **R2 → Manage R2 API Tokens** in the dashboard. These are a **different credential** from the native `[[r2_buckets]]` binding. A Worker can use both: the binding for server-side reads/writes, S3 tokens for minting presigned URLs.
+
+## Coordinating R2 + D1 without transactions
+
+When a record spans both R2 (the blob) and D1 (the metadata row), there is **no distributed transaction** across the two. A delete or update can fail halfway, and you have to choose which inconsistency you can tolerate.
+
+:::danger[Delete R2 objects first, the D1 row last]
+For deletes, the safe ordering is: **delete the R2 objects FIRST, then the D1 row LAST.**
+
+- An **orphaned R2 object** (blob gone from D1's view but still in the bucket) is recoverable — you can list the bucket and reconcile.
+- A **dangling D1 pointer** (row still claims a blob that R2 already deleted) is **data loss** — the UI shows a record that 404s on access.
+
+Make the whole operation **idempotent on retry**: deleting an already-deleted R2 key is a no-op, and re-running the D1 delete on a missing row succeeds. So if D1 fails after R2 succeeded, return **HTTP 503** ("temporarily unavailable, please retry") — the operator retries, the R2 list is now empty, and the D1 delete completes. The trade-off favours user-visible correctness over storage tidiness.
+:::
+
+```typescript
+// 1. R2 first (best-effort — swallow per-object failures, surface a count)
+const r2 = await deletePhotoR2Objects(slug, env);
+
+// 2. D1 row last. On D1 failure, return 503 so the caller can safely retry.
+try {
+  await deletePhotoRow(slug, env.DB);
+} catch (err) {
+  return Response.json(
+    { success: false, error: "Photo store temporarily unavailable, please retry" },
+    { status: 503 },
+  );
+}
+
+return Response.json({ success: true, r2 }, { status: 200 });
+```
+
 ## Gotchas
 
 - **No automatic public URLs**: Unlike S3 with public buckets, R2 requires a Worker or custom domain to serve files publicly
