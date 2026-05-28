@@ -1,0 +1,239 @@
+---
+title: HTTP-only Cookie Sessions
+description: HTTP-only cookie sessions with refresh-token rotation on Workers
+sidebar_position: 9
+---
+
+## Overview
+
+Workers have **no cookie helper**. The runtime hands you raw `Set-Cookie` strings and a raw `Cookie` request header -- nothing parses or serializes them for you. So you hand-roll both directions yourself, and getting the attributes right (`HttpOnly`, `Secure`, `SameSite`, `Domain`, `Max-Age`) is security-critical: a missing `HttpOnly` exposes the session to JavaScript, a missing `Secure` leaks it over plain HTTP.
+
+This page covers an HTTP-only cookie session built on two tokens -- a short-lived access cookie and a long-lived refresh cookie -- with server-side rotation so the access cookie can be silently re-minted without a fresh login.
+
+## Hand-rolled cookie serialize / parse
+
+There is no `res.cookie()` on Workers. You build the `Set-Cookie` value as a string and append it to the response headers yourself.
+
+```typescript
+// utils/cookies.ts
+export interface CookieOptions {
+  httpOnly?: boolean;
+  secure?: boolean;
+  sameSite?: 'Strict' | 'Lax' | 'None';
+  path?: string;
+  maxAge?: number;
+  domain?: string;
+}
+
+export function parseCookies(cookieHeader: string): Record<string, string> {
+  const cookies: Record<string, string> = {};
+  if (!cookieHeader) {
+    return cookies;
+  }
+  const pairs = cookieHeader.split(';');
+  for (const pair of pairs) {
+    const trimmed = pair.trim();
+    if (!trimmed) continue;
+    const eqIndex = trimmed.indexOf('=');
+    if (eqIndex === -1) continue;
+    const key = trimmed.substring(0, eqIndex).trim();
+    const value = trimmed.substring(eqIndex + 1).trim();
+    cookies[key] = value;
+  }
+  return cookies;
+}
+
+export function serializeCookie(name: string, value: string, options: CookieOptions): string {
+  const parts: string[] = [`${name}=${value}`];
+
+  if (options.httpOnly) {
+    parts.push('HttpOnly');
+  }
+  if (options.secure) {
+    parts.push('Secure');
+  }
+  if (options.sameSite) {
+    parts.push(`SameSite=${options.sameSite}`);
+  }
+  if (options.path) {
+    parts.push(`Path=${options.path}`);
+  }
+  if (options.maxAge !== undefined) {
+    parts.push(`Max-Age=${options.maxAge}`);
+  }
+  if (options.domain) {
+    parts.push(`Domain=${options.domain}`);
+  }
+
+  return parts.join('; ');
+}
+```
+
+:::warning[Each attribute is load-bearing]
+`HttpOnly` blocks `document.cookie` access (XSS can't read the token). `Secure` restricts the cookie to HTTPS. `SameSite` controls cross-site sending (`Lax` is the practical default for a same-site app with cross-origin links). Omitting any of these silently weakens the session -- there is no framework to fill in safe defaults for you.
+:::
+
+## Two-token model
+
+A single long-lived session cookie is a liability: if it leaks, it's valid for its entire lifetime. The fix is two tokens:
+
+- **Access token** -- short-lived (`maxAge: 900` = 15 minutes), sent on every request, carries the user identity.
+- **Refresh token** -- long-lived, sent only to the refresh endpoint, used solely to mint new access tokens.
+
+Both are JWTs signed with the same secret. The thing that keeps them from being interchangeable is a server-side `type` claim baked into each token (`access` vs `refresh`), enforced at verification time:
+
+```typescript
+// utils/jwt.ts
+import { SignJWT, jwtVerify, decodeJwt } from 'jose';
+
+import type { TokenPayload } from '../types/auth.js';
+
+export async function createToken(
+  payload: Omit<TokenPayload, 'iat' | 'exp'>,
+  secret: string,
+  expiresIn: string,
+): Promise<string> {
+  const secretKey = new TextEncoder().encode(secret);
+  const token = await new SignJWT({ ...payload })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime(expiresIn)
+    .sign(secretKey);
+  return token;
+}
+
+export async function verifyToken(
+  token: string,
+  secret: string,
+  expectedType: 'access' | 'refresh',
+): Promise<TokenPayload> {
+  const secretKey = new TextEncoder().encode(secret);
+  const { payload } = await jwtVerify(token, secretKey);
+  const tokenPayload = payload as unknown as TokenPayload;
+  if (tokenPayload.type !== expectedType) {
+    throw new Error(`Expected token type "${expectedType}" but got "${tokenPayload.type}"`);
+  }
+  return tokenPayload;
+}
+```
+
+:::danger[Why the `type` claim matters]
+Without the `type` check, a refresh token -- which is long-lived -- would also pass verification as an access token. An attacker who captured a refresh token could use it directly as a session credential for its full lifetime. The `if (tokenPayload.type !== expectedType) throw` line is what forces a refresh token to go through the rotation endpoint and never act as an access token.
+:::
+
+## Refresh flow
+
+The refresh endpoint reads the `refresh_token` cookie, verifies it is genuinely a `refresh` token, and mints a **new short-lived access cookie**. The cookie's `Max-Age` (`900`) is deliberately matched to the JWT's `'15m'` expiry so the cookie and the token expire together.
+
+```typescript
+// handlers/refresh.ts
+import type { Env } from '../index.js';
+import { parseCookies, serializeCookie } from '../utils/cookies.js';
+import { createToken, verifyToken } from '../utils/jwt.js';
+
+export async function handleRefresh(request: Request, env: Env): Promise<Response> {
+  const cookieHeader = request.headers.get('cookie') || '';
+  const cookies = parseCookies(cookieHeader);
+  const refreshToken = cookies['refresh_token'];
+
+  if (!refreshToken) {
+    return new Response(
+      JSON.stringify({
+        error: 'Unauthorized',
+        message: 'No refresh token',
+      }),
+      {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      },
+    );
+  }
+
+  try {
+    const payload = await verifyToken(refreshToken, env.JWT_SECRET, 'refresh');
+
+    const newAccessToken = await createToken(
+      {
+        sub: payload.sub,
+        email: payload.email,
+        name: payload.name,
+        picture: payload.picture,
+        type: 'access',
+      },
+      env.JWT_SECRET,
+      '15m',
+    );
+
+    const accessCookie = serializeCookie('access_token', newAccessToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'Lax',
+      path: '/',
+      maxAge: 900,
+      domain: env.COOKIE_DOMAIN,
+    });
+
+    return new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: new Headers([
+        ['Content-Type', 'application/json'],
+        ['Set-Cookie', accessCookie],
+      ]),
+    });
+  } catch {
+    return new Response(
+      JSON.stringify({
+        error: 'Unauthorized',
+        message: 'Invalid refresh token',
+      }),
+      {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      },
+    );
+  }
+}
+```
+
+The client never touches the tokens -- they are `HttpOnly`, so the browser stores and sends them automatically. When an access cookie expires, a request to the refresh endpoint transparently issues a new one as long as the refresh cookie is still valid.
+
+## Sharing the session across subdomains
+
+Setting `Domain=` on the cookie lets it be sent to every subdomain of that domain. The value comes from a `COOKIE_DOMAIN` binding so it stays environment-specific (e.g. `.example.com` shares the session across `app.example.com`, `api.example.com`, and so on).
+
+```typescript
+const accessCookie = serializeCookie('access_token', newAccessToken, {
+  httpOnly: true,
+  secure: true,
+  sameSite: 'Lax',
+  path: '/',
+  maxAge: 900,
+  domain: env.COOKIE_DOMAIN,
+});
+```
+
+## Wrangler config: secret vs vars
+
+`COOKIE_DOMAIN` is public configuration and is fine in `[vars]`. `JWT_SECRET` is the signing key for every token -- it must **never** sit in `wrangler.toml`. Leave it blank in `[vars]` as a placeholder and inject the real value as a secret.
+
+```toml
+name = "auth-worker"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[vars]
+AUTH0_DOMAIN = ""
+AUTH0_CLIENT_ID = ""
+AUTH0_CLIENT_SECRET = ""
+JWT_SECRET = ""
+APP_URL = ""
+COOKIE_DOMAIN = ""
+```
+
+:::danger[Secrets vs Vars]
+The blank `JWT_SECRET` in `[vars]` is only a placeholder for local typing -- the real value is set with `wrangler secret put JWT_SECRET` and never committed. Anyone with the JWT secret can forge valid access and refresh tokens for any user.
+:::
+
+## See also
+
+- [Auth with Pages Functions](./auth-functions.mdx) -- token validation in Pages Functions and the Auth0 integration pattern.
