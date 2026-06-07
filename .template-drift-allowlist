@@ -109,3 +109,7 @@ pages/docs/tags/index.tsx
 # (`fmMatch[0] ?? ""` vs `const [whole, ...] = fmMatch`). Both are correct;
 # the template uses more defensive nullish coalescing.
 scripts/tags-audit.ts
+
+# scripts/run-b4push.sh is intentionally customized for this consuming site
+# (zfb gate set: format + drift + pin + check + build + html + links; cloudflare-specific).
+scripts/run-b4push.sh
