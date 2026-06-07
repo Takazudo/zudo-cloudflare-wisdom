@@ -1,7 +1,8 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect } from "preact/compat";
+import type { ComponentChildren } from "preact";
 
 interface SidebarToggleProps {
-  children: React.ReactNode;
+  children: ComponentChildren;
 }
 
 export default function SidebarToggle({ children }: SidebarToggleProps) {
@@ -23,8 +24,10 @@ export default function SidebarToggle({ children }: SidebarToggleProps) {
     function handleSwap() {
       setOpen(false);
     }
-    document.addEventListener("astro:after-swap", handleSwap);
-    return () => document.removeEventListener("astro:after-swap", handleSwap);
+    // zfb's `<ViewTransitions />` does a real page load on every
+    // navigation, so `DOMContentLoaded` is the post-navigate signal.
+    document.addEventListener("DOMContentLoaded", handleSwap);
+    return () => document.removeEventListener("DOMContentLoaded", handleSwap);
   }, []);
 
   return (
@@ -39,7 +42,7 @@ export default function SidebarToggle({ children }: SidebarToggleProps) {
         {open ? (
           <svg
             xmlns="http://www.w3.org/2000/svg"
-            className="h-[1.5rem] w-[1.5rem]"
+            className="h-icon-lg w-icon-lg"
             fill="none"
             viewBox="0 0 24 24"
             stroke="currentColor"
@@ -54,7 +57,7 @@ export default function SidebarToggle({ children }: SidebarToggleProps) {
         ) : (
           <svg
             xmlns="http://www.w3.org/2000/svg"
-            className="h-[1.5rem] w-[1.5rem]"
+            className="h-icon-lg w-icon-lg"
             fill="none"
             viewBox="0 0 24 24"
             stroke="currentColor"
@@ -72,8 +75,7 @@ export default function SidebarToggle({ children }: SidebarToggleProps) {
       {/* Backdrop overlay - mobile only */}
       {open && (
         <div
-          className="fixed inset-0 z-30 lg:hidden"
-          style={{ backgroundColor: "rgba(0, 0, 0, 0.3)" }}
+          className="fixed inset-0 z-30 bg-overlay/30 lg:hidden"
           onClick={() => setOpen(false)}
         />
       )}

@@ -1,4 +1,5 @@
-import { type ReactNode, useMemo } from "react";
+import { useMemo } from "preact/compat";
+import type { VNode } from "preact";
 import PreviewBase from "./preview-base";
 import { dedent } from "@/utils/dedent";
 import { preflightCss } from "./preflight";
@@ -57,16 +58,20 @@ export default function HtmlPreview({
   componentCss,
   componentHead,
   componentJs,
-}: HtmlPreviewProps): ReactNode {
+}: HtmlPreviewProps): VNode {
   const srcdoc = useMemo(
     () => buildSrcdoc(html, css, head, js),
     [html, css, head, js],
   );
   const hasScripts = containsScript(head, js);
   const syncDelay = hasScripts ? 300 : 0;
-  // allow-same-origin is needed alongside allow-scripts so that syncHeight
-  // can access iframe.contentDocument for auto-height measurement
-  const sandboxValue = hasScripts ? "allow-scripts allow-same-origin" : "";
+  // allow-same-origin is always required so that syncHeight can access
+  // iframe.contentDocument for auto-height measurement; sandbox="" without
+  // allow-same-origin gives the srcdoc iframe an opaque origin and blocks
+  // contentDocument reads even from the parent page.
+  const sandboxValue = hasScripts
+    ? "allow-scripts allow-same-origin"
+    : "allow-same-origin";
 
   const codeBlocks = useMemo(
     () => [

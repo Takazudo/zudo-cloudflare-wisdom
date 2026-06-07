@@ -1,8 +1,12 @@
-import type { CollectionKey } from "astro:content";
 import { settings } from "./settings";
 
-/** Default locale code (always "en", served from docsDir). */
-export const defaultLocale = "en" as const;
+// Collection name string used by zfb's content engine (`getCollection(...)`).
+// Kept as a structural string-literal alias so callers don't have to redeclare
+// it; it's a structural type so the underlying engine is interchangeable.
+type CollectionKey = string;
+
+/** Default locale code, served from docsDir. */
+export const defaultLocale = settings.defaultLocale;
 
 /** All supported locale codes, derived from settings. */
 export const locales = [
@@ -11,11 +15,9 @@ export const locales = [
 ] as const;
 export type Locale = (typeof locales)[number];
 
-type LocaleKey = keyof typeof settings.locales;
-
 /** Safely look up a locale in settings.locales. */
 function getLocaleConfig(locale: string) {
-  return (settings.locales as Record<string, (typeof settings.locales)[LocaleKey]>)[locale];
+  return settings.locales[locale];
 }
 
 /** Get the content directory for a locale. */
@@ -37,7 +39,7 @@ export function getCollectionName(locale: Locale | string): CollectionKey {
 
 /** Get the display label for a locale. */
 export function getLocaleLabel(locale: Locale | string): string {
-  if (locale === defaultLocale) return "EN";
+  if (locale === defaultLocale) return defaultLocale.toUpperCase();
   return getLocaleConfig(locale)?.label ?? locale.toUpperCase();
 }
 
@@ -64,13 +66,17 @@ const translations: Record<string, Record<string, string>> = {
     "nav.develop": "Develop",
     "nav.previous": "Previous",
     "nav.next": "Next",
+    "nav.overview": "Overview",
     "toc.title": "On this page",
     "docs.browseAll": "Browse all documentation sections.",
     "search.label": "Search",
+    "search.resultCount": "{count} results",
     "code.copy": "Copy code",
     "code.copied": "Copied!",
     "code.wrapToggle": "Toggle word wrap",
     "doc.editPage": "Edit this page",
+    "doc.viewSource": "View source on GitHub",
+    "header.github": "GitHub repository",
     "doc.tags": "Tags",
     "doc.taggedWith": "Pages tagged with",
     "doc.allTags": "All Tags",
@@ -82,6 +88,9 @@ const translations: Record<string, Record<string, string>> = {
     "nav.backToMenu": "Back to main menu",
     "doc.fallbackNotice":
       "This page has not been translated yet and is shown in the original language.",
+    "frontmatter.preview.title": "Frontmatter",
+    "frontmatter.preview.keyCol": "Key",
+    "frontmatter.preview.valueCol": "Value",
     "version.latest": "Latest",
     "version.switcher.label": "Version",
     "version.banner.unmaintained":
@@ -115,13 +124,17 @@ const translations: Record<string, Record<string, string>> = {
     "nav.develop": "開発",
     "nav.previous": "前へ",
     "nav.next": "次へ",
+    "nav.overview": "概要",
     "toc.title": "目次",
     "docs.browseAll": "すべてのドキュメントセクションを閲覧",
     "search.label": "検索",
+    "search.resultCount": "{count} 件",
     "code.copy": "コードをコピー",
     "code.copied": "コピーしました！",
     "code.wrapToggle": "折り返し切替",
     "doc.editPage": "このページを編集",
+    "doc.viewSource": "GitHub でソースを見る",
+    "header.github": "GitHub リポジトリ",
     "doc.tags": "タグ",
     "doc.taggedWith": "タグ付きページ",
     "doc.allTags": "すべてのタグ",
@@ -133,6 +146,9 @@ const translations: Record<string, Record<string, string>> = {
     "nav.backToMenu": "メインメニューに戻る",
     "doc.fallbackNotice":
       "このページはまだ翻訳されていません。原文のまま表示しています。",
+    "frontmatter.preview.title": "フロントマター",
+    "frontmatter.preview.keyCol": "キー",
+    "frontmatter.preview.valueCol": "値",
     "version.latest": "最新",
     "version.switcher.label": "バージョン",
     "version.banner.unmaintained":
@@ -166,14 +182,18 @@ const translations: Record<string, Record<string, string>> = {
     "nav.develop": "Entwicklung",
     "nav.previous": "Zurück",
     "nav.next": "Weiter",
+    "nav.overview": "Überblick",
     "toc.title": "Auf dieser Seite",
     "docs.browseAll": "Alle Dokumentationsabschnitte durchsuchen.",
     "search.label": "Suche",
+    "search.resultCount": "{count} Ergebnisse",
     "code.copy": "Code kopieren",
     "code.copied": "Kopiert!",
     "code.wrapToggle": "Zeilenumbruch umschalten",
     "nav.backToMenu": "Zurück zum Hauptmenü",
     "doc.editPage": "Diese Seite bearbeiten",
+    "doc.viewSource": "Quellcode auf GitHub ansehen",
+    "header.github": "GitHub-Repository",
     "doc.tags": "Tags",
     "doc.taggedWith": "Seiten mit Tag",
     "doc.allTags": "Alle Tags",
@@ -184,6 +204,9 @@ const translations: Record<string, Record<string, string>> = {
     "doc.pageCountSingle": "{count} Seite",
     "doc.fallbackNotice":
       "Diese Seite wurde noch nicht übersetzt und wird in der Originalsprache angezeigt.",
+    "frontmatter.preview.title": "Frontmatter",
+    "frontmatter.preview.keyCol": "Schlüssel",
+    "frontmatter.preview.valueCol": "Wert",
     "version.latest": "Neueste",
     "version.switcher.label": "Version",
     "version.banner.unmaintained":

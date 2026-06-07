@@ -1,9 +1,6 @@
 import { settings } from "@/config/settings";
 import { defaultLocale, locales, getLocaleLabel, type Locale } from "@/config/i18n";
 import type { LocaleLink } from "@/types/locale";
-import { isExternal } from "@/plugins/url-utils";
-
-export { isExternal };
 
 /** Normalized base path with no trailing slash (empty string when "/"). */
 export const normalizedBase = settings.base.replace(/\/+$/, "");
@@ -51,6 +48,11 @@ export function docsUrl(slug: string, lang: Locale = defaultLocale): string {
   return withBase(path);
 }
 
+/** Check if a URL is external (starts with http:// or https://). */
+export function isExternal(href: string): boolean {
+  return href.startsWith("http://") || href.startsWith("https://");
+}
+
 /** Resolve a href: external URLs pass through, internal ones get the base prefix. */
 export function resolveHref(href: string): string {
   return isExternal(href) ? href : withBase(href);
@@ -58,9 +60,9 @@ export function resolveHref(href: string): string {
 
 /**
  * Build a localized, versioned nav href.
- * Note: uses /{lang}/v/{version}/... ordering (for header/sidebar nav links).
- * This differs from versionedDocsUrl() which uses /v/{version}/{lang}/... (for doc page links).
- * Both orderings are handled by the routing layer.
+ * Uses /v/{version}/{lang}/... ordering — the only shape the routing layer
+ * serves (pages/v/[version]/ja/docs/...), matching versionedDocsUrl().
+ * The /{lang}/v/{version}/... ordering has no route and 404s.
  */
 export function navHref(
   path: string,
@@ -71,9 +73,19 @@ export function navHref(
   const versionPrefix = currentVersion ? `/v/${currentVersion}` : "";
   return withBase(
     isNonDefaultLocale
-      ? `/${lang}${versionPrefix}${path}`
+      ? `${versionPrefix}/${lang}${path}`
       : `${versionPrefix}${path}`,
   );
+}
+
+/**
+ * Split a leading /v/{version} prefix off a base-stripped path.
+ * Versioned routes nest the locale AFTER the version (/v/1.0/ja/docs/...),
+ * so locale stripping/prefixing must operate on the remainder only.
+ */
+function splitVersionPrefix(path: string): { versionPrefix: string; rest: string } {
+  const m = path.match(/^(\/v\/[^/]+)(\/.*|$)/);
+  return m ? { versionPrefix: m[1], rest: m[2] || "/" } : { versionPrefix: "", rest: path };
 }
 
 /** Build a locale-switched path from the current page path. */
@@ -82,24 +94,51 @@ export function getPathForLocale(
   currentLang: Locale,
   targetLang: Locale,
 ): string {
-  let relativePath = stripBase(path);
+  const { versionPrefix, rest } = splitVersionPrefix(stripBase(path));
+  let relativePath = rest;
   if (currentLang !== defaultLocale) {
-    relativePath = relativePath.replace(new RegExp(`^/${currentLang}/`), "/");
+    relativePath = relativePath.replace(new RegExp(`^/${currentLang}(?:/|$)`), "/");
   }
   if (targetLang !== defaultLocale) {
     relativePath = `/${targetLang}${relativePath}`;
   }
-  return withBase(relativePath);
+  return withBase(`${versionPrefix}${relativePath}`);
 }
 
 /** Build locale links for locale switcher UI components. */
 export function buildLocaleLinks(currentPath: string, currentLang: Locale): LocaleLink[] {
+  let defaultLocalePath = splitVersionPrefix(stripBase(currentPath)).rest;
+  if (currentLang !== defaultLocale) {
+    defaultLocalePath = defaultLocalePath.replace(new RegExp(`^/${currentLang}(?:/|$)`), "/");
+  }
+  if (isDefaultLocaleOnlyPath(defaultLocalePath)) {
+    return [{
+      code: currentLang,
+      label: getLocaleLabel(currentLang),
+      href: getPathForLocale(currentPath, currentLang, currentLang),
+      active: true,
+    }];
+  }
   return locales.map((code) => ({
     code,
     label: getLocaleLabel(code),
     href: getPathForLocale(currentPath, currentLang, code),
     active: code === currentLang,
   }));
+}
+
+/**
+ * Returns true when the given default-locale-shaped path falls under one of
+ * the configured `defaultLocaleOnlyPrefixes`.  Callers that work with
+ * locale-prefixed paths (e.g. `/ja/docs/...`) are responsible for stripping
+ * the locale segment before calling this function.  The path is normalized to
+ * end with `/` before the comparison so the helper is robust to projects that
+ * disable `settings.trailingSlash` (where `docsUrl` returns slashless paths).
+ */
+export function isDefaultLocaleOnlyPath(path: string): boolean {
+  const stripped = stripBase(path);
+  const normalized = stripped.endsWith("/") ? stripped : `${stripped}/`;
+  return settings.defaultLocaleOnlyPrefixes.some((prefix) => normalized.startsWith(prefix));
 }
 
 /** Build a versioned docs URL for the given slug, version, and lang. */

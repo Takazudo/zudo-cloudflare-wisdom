@@ -1,27 +1,22 @@
-import { useEffect, useState } from "react";
-import { createHighlighterCore, type HighlighterCore } from "@shikijs/core";
-import { createJavaScriptRegexEngine } from "@shikijs/engine-javascript";
+import { useEffect, useState } from "preact/compat";
+import type { HighlighterCore } from "shiki";
 
 let highlighterPromise: Promise<HighlighterCore> | null = null;
 
 function getHighlighter(): Promise<HighlighterCore> {
   if (!highlighterPromise) {
-    highlighterPromise = createHighlighterCore({
-      themes: [
-        import("@shikijs/themes/catppuccin-latte"),
-        import("@shikijs/themes/vitesse-dark"),
-      ],
-      langs: [
-        import("@shikijs/langs/html"),
-        import("@shikijs/langs/css"),
-        import("@shikijs/langs/javascript"),
-      ],
-      engine: createJavaScriptRegexEngine(),
-    }).catch((err) => {
-      // Clear cached rejection so next call retries
-      highlighterPromise = null;
-      throw err;
-    });
+    highlighterPromise = import("shiki")
+      .then(({ createHighlighter }) =>
+        createHighlighter({
+          themes: ["catppuccin-latte", "vitesse-dark"],
+          langs: ["html", "css", "javascript"],
+        }),
+      )
+      .catch((err) => {
+        // Clear cached rejection so next call retries
+        highlighterPromise = null;
+        throw err;
+      });
   }
   return highlighterPromise;
 }
