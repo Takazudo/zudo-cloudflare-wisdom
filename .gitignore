@@ -25,6 +25,13 @@ pnpm-debug.log*
 # Worktrees
 worktrees/
 
+# Claude-resources generated directories (regenerated at build time, do not track)
+src/content/docs/claude/
+src/content/docs/claude-md/
+src/content/docs/claude-commands/
+src/content/docs/claude-skills/
+src/content/docs/claude-agents/
+
 # Claude skill generated files (contain machine-specific absolute paths)
 .claude/skills/cloudflare-wisdom/SKILL.md
 .claude/skills/cloudflare-wisdom/docs
