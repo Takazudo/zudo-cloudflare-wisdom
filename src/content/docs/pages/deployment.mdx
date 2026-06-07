@@ -1,0 +1,68 @@
+---
+title: Pages Deployment
+description: Deploying static sites with wrangler pages deploy
+sidebar_position: 1
+---
+
+## Creating a Pages Project
+
+Before your first deploy, create the project:
+
+```bash
+npx wrangler@4 pages project create zudo-cloudflare
+```
+
+Or let the first `pages deploy` create it automatically.
+
+## Deploy Command
+
+The core deploy command:
+
+```bash
+npx wrangler@4 pages deploy <directory> \
+  --project-name=<project-name> \
+  --branch=<branch> \
+  --commit-hash="${GITHUB_SHA}" \
+  --commit-message="Production deploy: ${GITHUB_SHA}"
+```
+
+### Parameters
+
+| Parameter | Description |
+|---|---|
+| `<directory>` | The directory containing built static files |
+| `--project-name` | The Pages project name (must match what was created) |
+| `--branch` | Branch name. `main` triggers production; anything else is a preview |
+| `--commit-hash` | Git SHA for tracking (optional but recommended) |
+| `--commit-message` | Deploy description (optional) |
+
+### Environment Variables
+
+The deploy command needs these environment variables:
+
+```bash
+CLOUDFLARE_API_TOKEN=<your-token>
+CLOUDFLARE_ACCOUNT_ID=<your-account-id>
+```
+
+## Production vs Preview
+
+- **Production**: Deploy with `--branch=main`. This updates the primary URL.
+- **Preview**: Deploy with any other branch name (e.g., `--branch=pr-42`). This creates a preview URL.
+
+:::warning
+The `--branch` flag determines whether the deploy is production or preview. Always use `main` for production deploys, not your actual branch name.
+:::
+
+## Deploy Directory Structure
+
+The deploy directory must contain the final files as they should be served. If your site uses a base path (e.g., `/pj/my-site/`), you need to nest files accordingly:
+
+```bash
+mkdir -p deploy/pj/my-site
+cp -r dist/* deploy/pj/my-site/
+echo '/ /pj/my-site/ 302' > deploy/_redirects
+npx wrangler@4 pages deploy deploy --project-name=my-site --branch=main
+```
+
+See [Base Path Pattern](./base-path-pattern.mdx) for details.

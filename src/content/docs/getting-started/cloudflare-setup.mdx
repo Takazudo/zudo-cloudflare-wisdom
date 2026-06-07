@@ -1,0 +1,60 @@
+---
+title: Cloudflare Setup
+description: Account setup, API tokens, and Wrangler CLI configuration
+sidebar_position: 2
+---
+
+## API Tokens
+
+Create an API token in the Cloudflare dashboard under **My Profile > API Tokens**.
+
+For Pages and Workers deployment, the token needs:
+
+- **Account > Cloudflare Pages > Edit**
+- **Account > Workers Scripts > Edit**
+- **Account > Workers KV Storage > Edit** (if using KV)
+- **Account > Workers R2 Storage > Edit** (if using R2)
+- **Account > D1 > Edit** (if using D1)
+
+:::tip
+Create one token with all permissions rather than separate tokens per service. Store it as `CLOUDFLARE_API_TOKEN` in your GitHub repo secrets.
+:::
+
+## Environment Variables for CI
+
+Every project needs these GitHub Actions secrets:
+
+| Secret | Description |
+|---|---|
+| `CLOUDFLARE_ACCOUNT_ID` | Your Cloudflare account ID (found in dashboard URL) |
+| `CLOUDFLARE_API_TOKEN` | API token created above |
+| `IFTTT_PROD_NOTIFY` | (Optional) IFTTT webhook URL for deploy notifications |
+
+## Wrangler CLI
+
+Wrangler is the Cloudflare CLI. In CI, use `npx wrangler@4` to avoid installing it globally. For local development:
+
+```bash
+pnpm add -D wrangler
+```
+
+Or use it via npx:
+
+```bash
+npx wrangler@4 pages deploy dist --project-name=my-project
+```
+
+:::warning
+Always pin to a major version (`wrangler@4`) to avoid breaking changes. Do not use `wrangler@latest` in CI.
+:::
+
+## wrangler.toml
+
+Projects that use Pages Functions, KV, D1, or R2 need a `wrangler.toml` at the project root:
+
+```toml
+# Cloudflare Pages project configuration
+compatibility_date = "2024-12-01"
+```
+
+See [Wrangler Config](../workers/wrangler-config.mdx) for full details on bindings and configuration.

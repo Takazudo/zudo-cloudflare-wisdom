@@ -1,0 +1,68 @@
+---
+title: Pages デプロイ
+description: wrangler pages deploy による静的サイトのデプロイ
+sidebar_position: 1
+---
+
+## Pages プロジェクトの作成
+
+初回デプロイの前に、プロジェクトを作成します：
+
+```bash
+npx wrangler@4 pages project create zudo-cloudflare
+```
+
+または、最初の `pages deploy` で自動作成させることもできます。
+
+## デプロイコマンド
+
+基本的なデプロイコマンドは以下の通りです：
+
+```bash
+npx wrangler@4 pages deploy <directory> \
+  --project-name=<project-name> \
+  --branch=<branch> \
+  --commit-hash="${GITHUB_SHA}" \
+  --commit-message="Production deploy: ${GITHUB_SHA}"
+```
+
+### パラメータ
+
+| パラメータ | 説明 |
+|---|---|
+| `<directory>` | ビルド済み静的ファイルが格納されたディレクトリ |
+| `--project-name` | Pages プロジェクト名（作成時の名前と一致させる必要がある） |
+| `--branch` | ブランチ名。`main` の場合は本番デプロイ、それ以外はプレビュー |
+| `--commit-hash` | 追跡用の Git SHA（任意だが推奨） |
+| `--commit-message` | デプロイの説明文（任意） |
+
+### 環境変数
+
+デプロイコマンドには以下の環境変数が必要です：
+
+```bash
+CLOUDFLARE_API_TOKEN=<your-token>
+CLOUDFLARE_ACCOUNT_ID=<your-account-id>
+```
+
+## 本番デプロイとプレビュー
+
+- **本番**: `--branch=main` でデプロイします。プライマリ URL が更新されます。
+- **プレビュー**: その他のブランチ名（例：`--branch=pr-42`）でデプロイします。プレビュー URL が作成されます。
+
+:::warning
+`--branch` フラグがデプロイの種類（本番/プレビュー）を決定します。本番デプロイには実際のブランチ名ではなく、必ず `main` を使用してください。
+:::
+
+## デプロイディレクトリの構造
+
+デプロイディレクトリには、配信される最終的なファイルがそのまま含まれている必要があります。サイトがベースパス（例：`/pj/my-site/`）を使用する場合、ファイルを適切にネストする必要があります：
+
+```bash
+mkdir -p deploy/pj/my-site
+cp -r dist/* deploy/pj/my-site/
+echo '/ /pj/my-site/ 302' > deploy/_redirects
+npx wrangler@4 pages deploy deploy --project-name=my-site --branch=main
+```
+
+詳細は [ベースパスパターン](./base-path-pattern.mdx) を参照してください。

@@ -1,0 +1,182 @@
+---
+title: R2（オブジェクトストレージ）
+description: ファイルとブロブストレージ用の Cloudflare R2
+sidebar_position: 3
+---
+
+## 概要
+
+R2 はエグレス料金ゼロの S3 互換オブジェクトストレージ。ファイル、画像、バックアップ、大容量データに使用する。
+
+## セットアップ
+
+### バケットの作成
+
+```bash
+npx wrangler r2 bucket create my-files
+```
+
+`wrangler.toml` に追加：
+
+```toml
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "my-files"
+```
+
+## 関数での使用
+
+```typescript
+interface Env {
+  FILES: R2Bucket;
+}
+
+// アップロード
+await env.FILES.put("uploads/photo.jpg", imageData, {
+  httpMetadata: { contentType: "image/jpeg" },
+});
+
+// ダウンロード
+const object = await env.FILES.get("uploads/photo.jpg");
+if (object) {
+  return new Response(object.body, {
+    headers: {
+      "Content-Type": object.httpMetadata?.contentType || "application/octet-stream",
+    },
+  });
+}
+
+// 削除
+await env.FILES.delete("uploads/photo.jpg");
+
+// オブジェクトの一覧
+const list = await env.FILES.list({ prefix: "uploads/" });
+for (const object of list.objects) {
+  console.log(object.key, object.size);
+}
+```
+
+## ブラウザからの直接アップロード（署名付き URL）
+
+ネイティブの `R2Bucket` バインディングは、すべてのアップロードを Worker 経由でルーティングするため、ファイル本体が Worker のリクエストボディサイズ制限にカウントされ、Worker の CPU 時間を消費する。写真や動画など大きなユーザーアップロードには、**署名付き PUT URL** を発行し、ブラウザから **R2 へ直接** アップロードさせて、バイト列については Worker を完全にバイパスする。
+
+R2 は `https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com` で S3 互換 API を公開しているため、任意の S3 署名付き URL 生成ツールが使える。Worker 上での落とし穴はバンドルサイズだ。
+
+### AWS SDK ではなく aws4fetch を使う
+
+[`aws4fetch`](https://github.com/mhart/aws4fetch)（minify 後 ~5 KB）を使い、`@aws-sdk/client-s3` + `@aws-sdk/s3-request-presigner` は **使わない**。AWS SDK v3 は重い smithy / `AbortSignal` の仕組みを同梱しており、ここでは単一の署名呼び出しのためだけに Worker の **1 MB コードサイズ制限** を突破してしまう。
+
+```bash
+npm install aws4fetch
+```
+
+### 署名付き PUT URL の発行
+
+```typescript
+import { AwsClient } from "aws4fetch";
+
+interface Env {
+  R2_ACCOUNT_ID: string;
+  R2_ACCESS_KEY_ID: string;
+  R2_SECRET_ACCESS_KEY: string;
+  R2_BUCKET_NAME: string;
+}
+
+interface SignOpts {
+  objectKey: string;
+  contentType: string;
+  expiresIn?: number; // seconds; defaults to 300 (5 minutes)
+}
+
+async function signPutUrl(env: Env, opts: SignOpts): Promise<string> {
+  const client = new AwsClient({
+    accessKeyId: env.R2_ACCESS_KEY_ID,
+    secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+    service: "s3",
+    region: "auto",
+  });
+
+  const expiresIn = opts.expiresIn ?? 300;
+  const url = new URL(
+    `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_BUCKET_NAME}/${opts.objectKey}`,
+  );
+  // aws4fetch reads X-Amz-Expires from the URL when signQuery is true.
+  // Without it, the s3 default is 86400 (24h) — far too long for an upload window.
+  url.searchParams.set("X-Amz-Expires", String(expiresIn));
+
+  const signed = await client.sign(
+    new Request(url.toString(), {
+      method: "PUT",
+      headers: { "content-type": opts.contentType },
+    }),
+    {
+      aws: {
+        signQuery: true,
+        // content-type is in aws4fetch's UNSIGNABLE_HEADERS by default.
+        // allHeaders forces it into the signed-headers list.
+        allHeaders: true,
+      },
+    },
+  );
+  return signed.url;
+}
+```
+
+### content-type の落とし穴
+
+`aws4fetch` はデフォルトで `content-type` を **署名不可（unsignable）** として扱い、署名から除外する。`allHeaders: true` を渡すと署名対象ヘッダーに含められる——宣言した MIME タイプにアップロードを固定できるため、これがまさに狙いだ。
+
+落とし穴は、`content-type` が署名されたら、**ブラウザは署名されたものと完全に同一の `content-type`** ヘッダーで PUT しなければならない点だ。少しでも不一致があると、R2 は `SignatureDoesNotMatch` でアップロードを拒否する。
+
+```javascript
+// Browser side — the content-type MUST match what was signed.
+await fetch(presignedUrl, {
+  method: "PUT",
+  headers: { "Content-Type": "image/jpeg" }, // exactly what signPutUrl signed
+  body: fileBlob,
+});
+```
+
+:::warning[署名付き URL は使い捨てではない]
+R2 は最初の PUT のあとに署名付き URL を **無効化しない**。唯一の制約は有効期限（`X-Amz-Expires`）だけだ。TTL は短く保ち（300 秒が妥当なデフォルト）、URL を保持している者なら誰でも期限切れまで再利用できるケイパビリティとして扱うこと。
+:::
+
+### バインディングではなく S3 API トークン
+
+署名付き URL の生成には R2 の **S3 API トークン**——`R2_ACCESS_KEY_ID` と `R2_SECRET_ACCESS_KEY`——が必要で、ダッシュボードの **R2 → Manage R2 API Tokens** から作成する。これらはネイティブの `[[r2_buckets]]` バインディングとは **別の認証情報** だ。Worker は両方を併用できる：サーバーサイドの読み書きにはバインディング、署名付き URL の発行には S3 トークンを使う。
+
+## トランザクションなしでの R2 + D1 の整合
+
+レコードが R2（ブロブ）と D1（メタデータの行）の両方にまたがる場合、両者をまたぐ **分散トランザクションは存在しない**。削除や更新は途中で失敗しうるため、どちらの不整合を許容できるかを選ぶ必要がある。
+
+:::danger[R2 オブジェクトを先に、D1 の行を最後に削除する]
+削除の安全な順序は、**R2 オブジェクトを最初（FIRST）に、D1 の行を最後（LAST）に削除する** ことだ。
+
+- **孤立した R2 オブジェクト**（D1 から見えなくなったがバケットには残っているブロブ）は復旧可能——バケットを一覧して突き合わせればよい。
+- **宙ぶらりんの D1 ポインタ**（R2 が既に削除したブロブをまだ参照している行）は **データ損失** だ——UI にはアクセスすると 404 になるレコードが表示される。
+
+操作全体を **リトライに対して冪等** にすること：既に削除済みの R2 キーを削除しても何も起きず（no-op）、存在しない行に対して D1 削除を再実行しても成功する。したがって R2 成功後に D1 が失敗した場合は **HTTP 503**（「一時的に利用不可、リトライしてください」）を返す——オペレーターがリトライすると、R2 の一覧は空になっており、D1 削除が完了する。このトレードオフはストレージの整然さよりもユーザーから見た正しさを優先する。
+:::
+
+```typescript
+// 1. R2 first (best-effort — swallow per-object failures, surface a count)
+const r2 = await deletePhotoR2Objects(slug, env);
+
+// 2. D1 row last. On D1 failure, return 503 so the caller can safely retry.
+try {
+  await deletePhotoRow(slug, env.DB);
+} catch (err) {
+  return Response.json(
+    { success: false, error: "Photo store temporarily unavailable, please retry" },
+    { status: 503 },
+  );
+}
+
+return Response.json({ success: true, r2 }, { status: 200 });
+```
+
+## 注意点
+
+- **自動パブリック URL はない**: S3 のパブリックバケットとは異なり、R2 はファイルを公開配信するには Worker またはカスタムドメインが必要
+- **オブジェクトキー制限**: キーは最大1024バイト
+- **メタデータ**: 独自のキーバリューペアには `customMetadata`、HTTP ヘッダーには `httpMetadata` を使用

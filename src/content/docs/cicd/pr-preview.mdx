@@ -1,0 +1,88 @@
+---
+title: PR Preview
+description: Per-PR preview deployment workflow
+sidebar_position: 2
+---
+
+## Standard PR Workflow
+
+PR workflows run type checking, build, and preview deploy in parallel:
+
+```yaml
+name: PR Checks
+
+on:
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+```
+
+:::tip[Cancel In-Progress for PRs]
+Unlike production deploys, PR previews should cancel in-progress runs when a new push arrives (`cancel-in-progress: true`). This saves CI minutes when pushing rapid iterations.
+:::
+
+## Type Check Job
+
+Run type checking in parallel with the build:
+
+```yaml
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+```
+
+## Preview Deploy Job
+
+Deploy with a branch name based on the PR number:
+
+```yaml
+  preview:
+    name: Preview Deploy
+    needs: [build-site]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download site artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: dist-out
+          path: dist-out/
+
+      - name: Prepare and deploy
+        id: cf-deploy
+        run: |
+          mkdir -p deploy/pj/my-site
+          cp -r dist-out/. deploy/pj/my-site/
+          echo '/ /pj/my-site/ 302' > deploy/_redirects
+
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          npx wrangler@4 pages deploy deploy \
+            --project-name=my-site \
+            --branch="pr-${PR_NUMBER}" \
+            --commit-hash="${GITHUB_SHA}" \
+            --commit-message="Preview: PR #${PR_NUMBER}"
+
+          echo "deploy_url=https://pr-${PR_NUMBER}.takazudo-my-site.pages.dev" >> "$GITHUB_OUTPUT"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+```
+
+See [Preview Deploys](../pages/preview-deploys.mdx) for the full PR comment script.

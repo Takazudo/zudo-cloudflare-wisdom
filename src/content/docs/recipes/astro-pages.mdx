@@ -1,0 +1,92 @@
+---
+title: Astro + Cloudflare Pages
+description: Deploying Astro static sites to Cloudflare Pages
+sidebar_position: 1
+---
+
+## Standard Setup
+
+Astro with static output is the default stack for our Cloudflare Pages projects.
+
+### Astro Config
+
+```typescript
+// astro.config.ts
+import { defineConfig } from "astro/config";
+
+export default defineConfig({
+  output: "static",
+  base: "/pj/my-site",
+  server: { port: 4321 },
+});
+```
+
+### Build and Deploy
+
+```bash
+pnpm build
+# Astro outputs to dist/
+
+# Nest under base path for CF Pages
+mkdir -p deploy/pj/my-site
+cp -r dist/* deploy/pj/my-site/
+echo '/ /pj/my-site/ 302' > deploy/_redirects
+
+npx wrangler@4 pages deploy deploy --project-name=my-site --branch=main
+```
+
+## Astro Output Modes
+
+Astro has different output structures depending on mode:
+
+| Mode | Output Directory | Notes |
+|---|---|---|
+| `static` | `dist/` | Pure static files |
+| `server` | `dist/client/` (static) + `dist/server/` | SSR mode |
+| `hybrid` | `dist/client/` (static) + `dist/server/` | Mixed mode |
+
+For Cloudflare Pages static hosting, use `output: "static"`. Handle both output structures in CI:
+
+```bash
+if [ -d dist/client ]; then
+  cp -r dist/client/. deploy/pj/my-site/
+else
+  cp -r dist/. deploy/pj/my-site/
+fi
+```
+
+## Adding Pages Functions
+
+To add API endpoints alongside your Astro site:
+
+1. Create a `functions/` directory at the project root
+2. Create a `wrangler.toml` with any needed bindings
+3. Functions are auto-discovered and deployed with `pages deploy`
+
+```
+project-root/
+├── src/              # Astro source
+├── functions/        # Pages Functions
+│   └── pj/
+│       └── my-site/
+│           └── api/
+│               └── search.ts
+├── wrangler.toml     # Bindings config
+└── astro.config.ts
+```
+
+:::warning[Function Paths Must Match Base Path]
+If your Astro site uses `base: "/pj/my-site"`, your function files must be under `functions/pj/my-site/` to serve at the correct URLs.
+:::
+
+## Doc Site with Git History
+
+For documentation sites that show creation/update dates, ensure `fetch-depth: 0` in the checkout step:
+
+```yaml
+- uses: actions/checkout@v5
+  with:
+    fetch-depth: 0  # Full history for git-based dates
+```
+
+Without this, all pages show the CI run date as their creation date.

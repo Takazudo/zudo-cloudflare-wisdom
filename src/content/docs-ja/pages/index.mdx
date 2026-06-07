@@ -1,0 +1,26 @@
+---
+title: Cloudflare Pages
+description: エッジ関数とプレビューデプロイを備えた静的サイトホスティング
+sidebar_position: 2
+---
+
+Cloudflare Pages は、自動 HTTPS、ブランチ/PR ごとのプレビューデプロイ、オプションのサーバーレス関数を備えたエッジでの静的サイトホスティングサービスです。
+
+<Note>
+
+静的サイトと SSR を組み合わせる新規プロジェクトには、[Workers Static Assets](../workers/static-assets.mdx) の利用を検討してください。これは Cloudflare Pages の後継にあたり、Worker から直接静的ファイルを配信しながら SSR にも対応できます。別途 Pages プロジェクトは不要です。
+
+</Note>
+
+## 主要コンセプト
+
+- **プロジェクト** -- Pages プロジェクトは1つのドメインに対応します。ダッシュボードまたは `wrangler pages project create` で作成します。
+- **デプロイメント** -- 各デプロイはイミュータブルなスナップショットです。本番デプロイはメイン URL に反映され、ブランチデプロイにはプレビュー URL が割り当てられます。
+- **Pages Functions** -- 静的サイトと一緒にデプロイされるサーバーレス関数です。`functions/` ディレクトリでファイルベースのルーティングを使用します。
+
+## このセクションの内容
+
+- [デプロイ](./deployment.mdx) -- Wrangler CLI でのデプロイ方法
+- [ベースパスパターン](./base-path-pattern.mdx) -- `_redirects` を使ったサブパスでのサイト配信
+- [プレビューデプロイ](./preview-deploys.mdx) -- PR ごとのプレビューデプロイ
+- [Pages Functions](./pages-functions.mdx) -- 静的サイトと併用するサーバーレス API エンドポイント
