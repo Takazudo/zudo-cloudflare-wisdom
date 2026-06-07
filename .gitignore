@@ -1,15 +1,37 @@
+# Build output
 node_modules
 dist
-.astro
-.playwright-mcp/
-__inbox/
-{logdir}/
+.zfb
+.zfb-build
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Cloudflare Wrangler
+.wrangler/
+
+# Worktrees
 worktrees/
-# Generated skill files (contain machine-specific absolute paths)
+
+# Claude skill generated files (contain machine-specific absolute paths)
 .claude/skills/cloudflare-wisdom/SKILL.md
 .claude/skills/cloudflare-wisdom/docs
 .claude/skills/cloudflare-wisdom/docs-ja
+
+# Other
+.playwright-mcp/
+__inbox/
+{logdir}/
 *.tgz
-.env
-.env.*
-!.env.example
