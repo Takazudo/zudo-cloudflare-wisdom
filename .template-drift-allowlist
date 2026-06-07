@@ -71,6 +71,22 @@ src/components/image-enlarge.tsx
 # search input's onChange handler.
 src/components/sidebar-tree.tsx
 
+# Mobile-drawer drift fix — the base template ships the OLD children-based
+# sidebar-toggle.tsx, but _header-with-defaults.tsx (template + production)
+# passes SidebarTree data props (nodes/currentSlug/rootMenuItems/...) to
+# <SidebarToggle>. The old component ignored them and rendered `{children}`
+# (undefined) → empty mobile drawer. Production ships the data-props version
+# that forwards the props to <SidebarTree>. zudolab/zudo-doc#1355 wave 13.5.
+src/components/sidebar-toggle.tsx
+
+# Theme-toggle island-collision fix — the host ThemeToggle and the package's
+# ThemeToggle (pulled into the SSR graph via @takazudo/zudo-doc/header) share
+# the name "ThemeToggle"; esbuild renames one to "ThemeToggle2", so the SSG
+# emitted data-zfb-island="ThemeToggle2" with no matching client registry key
+# → dead toggle. Production pins `ThemeToggle.displayName = "ThemeToggle"` so
+# the island marker always matches the registered key. zudolab/zudo-doc#1446.
+src/components/theme-toggle.tsx
+
 # zfb migration — color-scheme-utils.ts: minor array destructuring style
 # difference (`lightPair[0]` vs const destructuring with null-guard).
 src/config/color-scheme-utils.ts
@@ -113,3 +129,10 @@ scripts/tags-audit.ts
 # scripts/run-b4push.sh is intentionally customized for this consuming site
 # (zfb gate set: format + drift + pin + check + build + html + links; cloudflare-specific).
 scripts/run-b4push.sh
+
+# search-widget i18n — _header-with-defaults.tsx calls t("search.placeholder")
+# and t("search.shortcutHint") for the SSR SearchWidget, but the create-zudo-doc
+# template ships only search.label/search.resultCount. We add the placeholder /
+# shortcutHint keys (EN/JA/DE) so the SSR search dialog renders real copy instead
+# of the literal key fallback. zudolab/zudo-doc#1973-adjacent.
+src/config/i18n.ts

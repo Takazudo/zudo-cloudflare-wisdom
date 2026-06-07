@@ -91,3 +91,15 @@ export default function ThemeToggle({ defaultMode = "dark" }: ThemeToggleProps) 
     </button>
   );
 }
+
+// Pin the island marker name to "ThemeToggle" regardless of esbuild's
+// identifier deduplication. This host component and the zudo-doc package's
+// ThemeToggle share the plain name "ThemeToggle"; when both land in the same
+// SSR bundle (the package's is pulled into the graph via
+// @takazudo/zudo-doc/header) esbuild renames one to "ThemeToggle2", making
+// Island's captureComponentName() emit data-zfb-island="ThemeToggle2" — a name
+// with no entry in the client island registry, so the toggle never hydrates.
+// Setting displayName explicitly makes Island() read the attribute-level name
+// (displayName takes precedence over .name) and emit the correct
+// data-zfb-island="ThemeToggle" marker. zudolab/zudo-doc#1446.
+ThemeToggle.displayName = "ThemeToggle";
