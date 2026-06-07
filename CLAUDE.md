@@ -1,16 +1,17 @@
 # zudo-cloudflare-wisdom
 
-Takazudo's Cloudflare dev notes, built with zudo-doc (Astro, MDX, Tailwind CSS v4).
+Takazudo's Cloudflare dev notes, built with zfb (zudo-front-builder, Preact, MDX, Tailwind CSS v4).
 
 ## Commands
 
 ```bash
-pnpm dev          # Start Astro dev server (port 4821)
+pnpm dev          # Start zfb dev server (port 3000)
 pnpm build        # Build static site to dist/
 pnpm preview      # Preview built site
-pnpm check        # Astro type checking
+pnpm check        # zfb type checking
 pnpm format:md    # Format MDX files
 pnpm b4push       # Pre-push validation (format + typecheck + build)
+pnpm setup:doc-skill  # Regenerate the gitignored cloudflare-wisdom Claude skill
 ```
 
 ## Content Structure
@@ -46,7 +47,7 @@ All documentation files use `.mdx` format with YAML frontmatter.
 
 ### Frontmatter Fields
 
-Schema defined in `src/content.config.ts`:
+Schema defined in `zfb.config.ts`:
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -59,6 +60,7 @@ Schema defined in `src/content.config.ts`:
 | `unlisted` | boolean | No | Built but noindexed, hidden from sidebar/nav |
 | `hide_sidebar` | boolean | No | Hide the left sidebar, center content |
 | `hide_toc` | boolean | No | Hide the right-side table of contents |
+| `doc_history` | boolean | No | Show doc history (git log) for this page |
 | `standalone` | boolean | No | Hidden from sidebar nav but still indexed |
 | `slug` | string | No | Custom URL slug override |
 | `generated` | boolean | No | Build-time generated content (skip translation) |
@@ -204,7 +206,8 @@ The `cloudflare-wisdom` skill (`/.claude/skills/cloudflare-wisdom/SKILL.md`) is 
 
 ## Site Config
 
-- Base path: `/pj/zudo-cloudflare`
+- Site URL: `https://zudo-cloudflare.takazudomodular.com/`
+- Base path: `/`
 - Settings: `src/config/settings.ts`
 
 ## CI/CD
