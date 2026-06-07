@@ -17,7 +17,7 @@ Written for personal reference and AI-assisted coding.
 
 ```bash
 pnpm install
-pnpm dev        # http://localhost:4821/pj/zudo-cloudflare/
+pnpm dev        # http://localhost:3000/
 pnpm build
 pnpm b4push     # pre-push validation
 ```
