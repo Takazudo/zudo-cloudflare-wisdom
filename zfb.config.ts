@@ -183,5 +183,6 @@ export default defineConfig({
       linkValidation: { failOnBroken: false },
     },
   },
+  adapter: "@takazudo/zfb-adapter-cloudflare",
   plugins: integrationPlugins,
 });
