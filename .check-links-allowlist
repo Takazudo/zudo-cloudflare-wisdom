@@ -24,6 +24,9 @@
 # The JA /docs/claude/ page is served via i18n fallback from the EN page, so
 # the CategoryNav still fires with the JA prefix. This is a known structural
 # limitation of the generated/i18n interaction — not a fixable broken link.
+# Same root cause for claude-skills: the generated EN claude landing also lists
+# claude-skills, which has no JA mirror and fires under the JA i18n fallback.
 dist/ja/docs/claude/index.html:240:/ja/docs/claude-md/
+dist/ja/docs/claude/index.html:240:/ja/docs/claude-skills/
 
 # ----- Absolute Links Bypassing Base Path (0 entries) -------------
