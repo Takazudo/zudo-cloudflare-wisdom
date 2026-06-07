@@ -15,13 +15,19 @@
  * silently breaks). See Takazudo/zudo-front-builder#884/#885 and the upstream
  * Tailwind-v4-node_modules issue zudolab/zudo-doc#1971.
  *
- * The one mechanism PROVEN to work in this build is `@source inline(...)`.
- * This script reads the installed package dist, extracts every class token,
- * and writes them as `@source inline("…")` lines into a generated partial
- * that global.css imports. It is dep-bump-safe: it derives from the installed
- * dist, not a frozen hand list. Re-run on every build (prebuild/predev hooks)
- * and whenever @takazudo/zudo-doc is bumped. Output is byte-deterministic
- * (locale-independent sort) so re-running on a pinned dep never dirties git.
+ * The one mechanism PROVEN to work here is `@source inline(...)`. This script
+ * extracts every class token from the installed package dist and writes them as
+ * `@source inline("…")` lines into the generated partial src/styles/
+ * _package-safelist.css, which global.css imports. It is dep-bump-safe (derives
+ * from the installed dist, not a frozen hand list). It runs as the first step of
+ * `pnpm dev` / `pnpm build` (and `pnpm gen:safelist`), and should be re-run on
+ * each @takazudo/zudo-doc bump. Output is byte-deterministic (locale-independent
+ * sort), so a pinned dep produces identical bytes and never dirties git.
+ *
+ * Over-capture is safe: an `@source inline()` candidate that is not a real
+ * utility produces no CSS. The token filter rejects obvious non-classes (CSS
+ * property names, attribute strings) but a few harmless non-utility tokens may
+ * remain in the generated partial — they emit nothing.
  */
 
 import { readdirSync, readFileSync, writeFileSync, statSync } from "node:fs";
@@ -48,60 +54,72 @@ function collectFiles(dir) {
 }
 
 const balanced = (s, open, close) =>
-  (s.split(open).length === s.split(close).length);
+  s.split(open).length === s.split(close).length;
 
-/**
- * Is `tok` an unambiguous COMPOUND Tailwind class — one carrying a `-`, `:`,
- * or `[` marker? These are the package-specific utilities Tailwind's
- * node_modules scan drops (`top-[3.5rem]`, `lg:block`, `border-muted`,
- * `lg:grid-cols-[repeat(auto-fit,minmax(12rem,1fr))]`, the arbitrary variant
- * `[&::-webkit-details-marker]:hidden`, …). They are extracted PER-TOKEN from
- * any string, so a class list that mixes bare words with compound ones (e.g.
- * `cx("sticky top-[3.5rem] z-10")`, or a `class: cond ? "…" : "…"` ternary)
- * still yields its compound tokens. Bare-word utilities (`flex`, `block`,
- * `sticky`, `hidden`) are recovered separately from explicit class: literals,
- * and in any case are generated already by our own pages/components scan.
- *
- * Guards reject the non-class strings that share punctuation with classes:
- * lowercase/negative/arbitrary start drops `Content-Type` and time/number
- * fragments; balanced brackets+parens drops transform fragments like `-50%)`;
- * the `//` reject drops URLs (`https://…`).
- */
-function isCompoundClassToken(tok) {
-  if (!/^(-?[a-z]|\[)/.test(tok)) return false;
-  if (!/^[-a-z0-9:/_.,%#&()[\]+*~<>=!?]+$/.test(tok)) return false;
-  if (!/[-:[]/.test(tok)) return false;
+// A token is class-LEGAL when it starts lowercase / negative / arbitrary-variant
+// and uses only class characters, with balanced brackets/parens. Rejects, with
+// certainty, the non-class strings that share punctuation with classes:
+//   - a class never ENDS in `:` (a variant must be followed by a utility) → cuts
+//     CSS property names and object keys (`color:`, `border-collapse:`, `class:`)
+//   - `=` only ever appears inside an arbitrary `[...]` value → a bare `=` cuts
+//     things like `charset=utf-8`
+//   - uppercase/`//` starts cut `Content-Type` and URLs; balance cuts `-50%)`
+const CLASS_LEGAL = /^-?[a-z[][-a-z0-9:/_.,%#&()[\]+*~<>=!?]*$/;
+function isClassToken(tok) {
+  if (!CLASS_LEGAL.test(tok)) return false;
+  if (tok.endsWith(":")) return false;
   if (tok.includes("//")) return false;
-  if (!balanced(tok, "[", "]") || !balanced(tok, "(", ")")) return false;
-  return true;
+  if (tok.replace(/\[[^\]]*\]/g, "").includes("=")) return false;
+  return balanced(tok, "[", "]") && balanced(tok, "(", ")");
 }
+// COMPOUND tokens additionally carry a `-`, `:`, or `[` marker. Used for the
+// broad string scan (cx() args, any string literal) so a bare English word in
+// prose is not mistaken for a class; bare-word utilities are recovered from
+// explicit class:/className: literals instead.
+function isCompoundClassToken(tok) {
+  return /[-:[]/.test(tok) && isClassToken(tok);
+}
+
+// Drop `${…}` interpolations from a template-literal body so the static class
+// tokens around them are still scanned (e.g. `border-l-[3px] …${cond?…}`). The
+// closing `}` is optional: when a nested backtick truncates the captured segment
+// the interpolation is unterminated, and a glued token like `italic${cond?…`
+// must still yield `italic`.
+const stripInterp = (s) => s.replace(/\$\{[^}]*\}?/g, " ");
 
 const tokens = new Set();
 const files = collectFiles(DIST);
 
-// Per-token compound scan over every double-quoted / backtick string literal.
-const ANY_STRING = /"([^"\\]*)"|`([^`\\$]*)`/g;
-// Bare-word recall from explicit class: / className: literals only.
-const CLASS_PROP = /\b(?:class|className)\s*:\s*"([^"]*)"/g;
+// Explicit class context — keep EVERY token (bare words too). Both quote forms.
+const CLASS_DQ = /\b(?:class|className)\s*:\s*"([^"]*)"/g;
+const CLASS_BT = /\b(?:class|className)\s*:\s*`([^`\\]*)`/g;
+// Any string literal — keep only compound tokens (catches cx() fragments etc.).
+const ANY_DQ = /"([^"\\]*)"/g;
+const ANY_BT = /`([^`\\]*)`/g;
+
+function addTokens(str, predicate) {
+  for (const tok of str.split(/\s+/)) {
+    if (tok && predicate(tok)) tokens.add(tok);
+  }
+}
 
 for (const file of files) {
   const src = readFileSync(file, "utf8");
-
   let m;
-  ANY_STRING.lastIndex = 0;
-  while ((m = ANY_STRING.exec(src)) !== null) {
-    const str = m[1] ?? m[2] ?? "";
-    for (const tok of str.split(/\s+/)) {
-      if (tok && isCompoundClassToken(tok)) tokens.add(tok);
-    }
-  }
 
-  CLASS_PROP.lastIndex = 0;
-  while ((m = CLASS_PROP.exec(src)) !== null) {
-    for (const tok of m[1].split(/\s+/)) {
-      if (tok) tokens.add(tok);
-    }
-  }
+  CLASS_DQ.lastIndex = 0;
+  while ((m = CLASS_DQ.exec(src)) !== null) addTokens(m[1], isClassToken);
+
+  CLASS_BT.lastIndex = 0;
+  while ((m = CLASS_BT.exec(src)) !== null)
+    addTokens(stripInterp(m[1]), isClassToken);
+
+  ANY_DQ.lastIndex = 0;
+  while ((m = ANY_DQ.exec(src)) !== null) addTokens(m[1], isCompoundClassToken);
+
+  ANY_BT.lastIndex = 0;
+  while ((m = ANY_BT.exec(src)) !== null)
+    addTokens(stripInterp(m[1]), isCompoundClassToken);
 }
 
 // Deterministic, locale-independent ordering (UTF-16 code-unit comparison).
@@ -114,7 +132,7 @@ const lines = [
   " * Complete @source inline() safelist for @takazudo/zudo-doc's component",
   " * utility classes. Tailwind v4's node_modules content scan does not emit",
   " * these reliably, so we safelist every class the package dist declares.",
-  " * Regenerated on every build (prebuild/predev) and on each dep bump;",
+  " * Regenerated on every build (dev/build scripts) and on each dep bump;",
   " * output is deterministic so a pinned dep produces identical bytes.",
   ` * ${sorted.length} class tokens. */`,
   ...sorted.map((tok) => `@source inline("${tok}");`),
