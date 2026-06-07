@@ -1,0 +1,276 @@
+---
+title: Wrangler Config
+description: wrangler.toml configuration for Workers and Pages
+sidebar_position: 1
+---
+
+## Basic Structure
+
+The `wrangler.toml` file configures your Cloudflare project. For Pages projects, it primarily defines bindings and compatibility settings:
+
+```toml
+# Cloudflare Pages project configuration
+compatibility_date = "2024-12-01"
+```
+
+For standalone Workers, it also includes the entry point and routing:
+
+```toml
+name = "my-worker"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+```
+
+## Bindings
+
+Bindings connect your code to Cloudflare services.
+
+### KV Namespaces
+
+```toml
+[[kv_namespaces]]
+binding = "MY_KV"
+id = "abc123def456ghi789"
+```
+
+### D1 Databases
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "my-database"
+database_id = "abc123-def456-ghi789"
+```
+
+### R2 Buckets
+
+```toml
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "my-files"
+```
+
+### Environment Variables
+
+```toml
+[vars]
+API_ENDPOINT = "https://api.example.com"
+```
+
+For secrets (API keys, tokens), use `wrangler secret put`:
+
+```bash
+npx wrangler secret put MY_SECRET
+```
+
+:::danger[Never Put Secrets in wrangler.toml]
+The `[vars]` section is for non-sensitive configuration only. Secrets should be set via `wrangler secret put` or the Cloudflare dashboard. `wrangler.toml` is committed to git.
+:::
+
+## Pages-Specific Options
+
+For Pages projects, you can specify the build output directory:
+
+```toml
+pages_build_output_dir = "./dist"
+```
+
+## Multiple Bindings Example
+
+A real-world `wrangler.toml` from a project using KV, D1, and R2:
+
+```toml
+# Cloudflare Pages project configuration
+compatibility_date = "2024-12-01"
+pages_build_output_dir = "./dist"
+
+[vars]
+AUTH0_DOMAIN = "placeholder.us.auth0.com"
+AUTH0_CLIENT_ID = "placeholder"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "my-app"
+database_id = "placeholder"
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "my-app-files"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "placeholder"
+```
+
+:::tip[Placeholder IDs]
+Use placeholder values in `wrangler.toml` for database IDs and KV namespace IDs in source control. The actual IDs are environment-specific and should be managed per environment.
+:::
+
+## Named Environments & Service Bindings
+
+Real projects rarely run with a single set of bindings. You typically want a `preview` deploy that points at throwaway data, a `production` deploy that points at the real data, and sometimes a `staging` deploy in between. Wrangler models this with **named environments**: `[env.preview]`, `[env.production]`, `[env.staging]`. You deploy a specific environment with `--env`:
+
+```bash
+npx wrangler deploy --env preview
+npx wrangler deploy --env production
+```
+
+### The #1 Silent Bug: bindings and `[vars]` Are NOT Inherited
+
+This is the single most common way a multi-environment Worker breaks. **Bindings (D1, R2, KV, AI, services) and `[vars]` declared at the top level do NOT carry into a named environment.** When you deploy `--env preview`, the Worker sees only what is declared under `[env.preview.*]` — the top-level `[vars]` and bindings are silently dropped.
+
+The Worker then runs in preview with no D1 connection, no KV, and an undefined `API_ENDPOINT`, often failing only at request time. Wrangler does emit a warning at deploy:
+
+```
+Processing wrangler.toml configuration:
+  - "vars" exists at the top level, but not on "env.preview".
+    This is not what you probably want, since "vars" is not inherited by environments.
+    Please add "vars" to "env.preview".
+```
+
+The fix is to **re-declare every binding and var inside each environment**:
+
+```toml
+name = "my-worker"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+# Top-level [vars] is NOT inherited by named environments below.
+# Re-declare it under each [env.*] or the Worker runs without it.
+[vars]
+API_ENDPOINT = "https://api.example.com"
+
+[env.preview]
+# Wrangler does NOT copy the top-level [vars] here. Without this block the
+# preview Worker runs with API_ENDPOINT undefined.
+[env.preview.vars]
+API_ENDPOINT = "https://api-preview.example.com"
+
+[[env.preview.kv_namespaces]]
+binding = "CACHE"
+id = "placeholder-preview-kv-id"
+
+[env.production]
+[env.production.vars]
+API_ENDPOINT = "https://api.example.com"
+
+[[env.production.kv_namespaces]]
+binding = "CACHE"
+id = "placeholder-production-kv-id"
+```
+
+:::warning[Re-declare everything per environment]
+There is no partial inheritance for bindings or vars. If `[env.preview]` exists, it must list its own D1, R2, KV, AI, services, and `[env.preview.vars]`. A missing binding does not error at deploy — it surfaces as a runtime `undefined` inside the Worker.
+:::
+
+<Note>
+
+Non-binding *settings* such as `workers_dev` and `preview_urls` DO inherit from the top level into named environments. The non-inheritance rule applies specifically to bindings and `[vars]`. Setting them explicitly per environment is still common for legibility.
+
+</Note>
+
+### Per-Environment Data Isolation
+
+Giving each environment its own `database_id` and `bucket_name` is what keeps staging traffic from touching production data. The bindings keep the same name (`DB`, `BUCKET`) so the Worker code is environment-agnostic — only the underlying resource changes:
+
+```toml
+name = "sync-server"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sync-db"
+database_id = "placeholder-prod-d1-id"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "sync-blobs"
+
+[ai]
+binding = "AI"
+
+# Staging points the SAME bindings (DB, BUCKET, AI) at SEPARATE resources,
+# so staging never reads or writes production data.
+[env.staging]
+name = "sync-server-staging"
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "sync-db-staging"
+database_id = "placeholder-staging-d1-id"
+
+[[env.staging.r2_buckets]]
+binding = "BUCKET"
+bucket_name = "sync-blobs-staging"
+
+[env.staging.ai]
+binding = "AI"
+```
+
+To create the staging resources before referencing them:
+
+```bash
+npx wrangler d1 create sync-db-staging
+npx wrangler r2 bucket create sync-blobs-staging
+```
+
+Then paste the returned `database_id` into `[[env.staging.d1_databases]]`.
+
+### Service Bindings: One Worker Calling Another
+
+A **service binding** lets one Worker invoke another Worker directly over Cloudflare's internal edge — no public internet hop, no DNS lookup, and no CORS, because the call never leaves Cloudflare's network. You bind a logical name to a deployed Worker's name:
+
+```toml
+[env.preview]
+
+# Service binding: this preview Worker → the "image-resizer-preview" Worker.
+# The caller reaches it via env.IMAGE_RESIZER without a public request.
+[[env.preview.services]]
+binding = "IMAGE_RESIZER"
+service = "image-resizer-preview"
+
+[[env.preview.services]]
+binding = "NOTIFY_WORKER"
+service = "notify-worker-preview"
+
+[env.production]
+
+# Same logical bindings, wired to the production target Workers.
+[[env.production.services]]
+binding = "IMAGE_RESIZER"
+service = "image-resizer-prod"
+
+[[env.production.services]]
+binding = "NOTIFY_WORKER"
+service = "notify-worker-prod"
+```
+
+Note that the binding name (`IMAGE_RESIZER`) is stable across environments while the `service` target swaps between `-preview` and `-prod`. Your code calls it like a `fetch`, but the request is dispatched internally:
+
+```ts
+// env.IMAGE_RESIZER is the service binding; this never hits the public internet.
+const res = await env.IMAGE_RESIZER.fetch("https://internal/resize", {
+  method: "POST",
+  body: imageBytes,
+});
+```
+
+### Custom-Domain Routes on Production Only
+
+Attach the apex and `www` domains only to the production environment with `custom_domain = true`, so preview deploys stay on their generated `*.workers.dev` URLs and never serve the real domain:
+
+```toml
+[env.production]
+
+# Custom-domain routes — production environment only.
+[[env.production.routes]]
+pattern = "example.com"
+custom_domain = true
+
+[[env.production.routes]]
+pattern = "www.example.com"
+custom_domain = true
+```
+
+`custom_domain = true` tells Cloudflare to create and manage the DNS record and TLS cert for that hostname automatically, rather than matching an existing zone route pattern.

@@ -1,0 +1,33 @@
+---
+title: Workers
+description: スタンドアロン Cloudflare Workers と Wrangler 設定
+sidebar_position: 3
+---
+
+Cloudflare Workers はエッジで実行されるサーバーレス関数。スタンドアロンのサービスとしても、Pages プロジェクトの一部（Pages Functions として）としても使用できる。
+
+## Workers と Pages Functions の比較
+
+| | Workers | Pages Functions |
+|---|---|---|
+| **デプロイ** | `wrangler deploy` | `wrangler pages deploy`（静的サイトと一緒） |
+| **ルーティング** | カスタムルートまたは `*.workers.dev` | `functions/` ディレクトリからのファイルベース |
+| **ユースケース** | スタンドアロン API、Webhook、プロキシ | 静的サイトに付随する API エンドポイント |
+| **設定** | フル `wrangler.toml` | バインディング用の `wrangler.toml` のみ |
+
+## スタンドアロン Workers を使うべき場合
+
+以下のような場合にスタンドアロン Workers を使用する：
+
+- 関数が独立したサービスの場合（例：検索ワーカー、AI チャットワーカー）
+- カスタムドメインやルーティングが必要な場合
+- 静的サイトとは独立したリリースサイクルが必要な場合
+- Pages Functions では利用できない機能が必要な場合
+
+## このセクションの内容
+
+- [Wrangler 設定](./wrangler-config.mdx) -- 設定ファイルのフォーマットとオプション
+- [スタンドアロン Workers](./standalone-workers.mdx) -- 独立した Workers のデプロイ
+- [互換性日付](./compatibility-dates.mdx) -- 互換性日付の理解と管理
+- [Durable Objects](./durable-objects.mdx) -- WebSocket Hibernation と SQLite バックの Durable Objects
+- [静的アセット](./static-assets.mdx) -- [assets] バインディング、run_worker_first、プレビュー URL の落とし穴

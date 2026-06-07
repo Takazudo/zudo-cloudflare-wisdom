@@ -1,0 +1,26 @@
+---
+title: Cloudflare Pages
+description: Static site hosting with edge functions and preview deploys
+sidebar_position: 2
+---
+
+Cloudflare Pages hosts static sites at the edge with automatic HTTPS, preview deploys per branch/PR, and optional serverless functions.
+
+<Note>
+
+For new static + SSR projects, consider [Workers Static Assets](../workers/static-assets.mdx) — the successor to Cloudflare Pages that serves static files directly from a Worker, with full SSR support and no separate Pages project required.
+
+</Note>
+
+## Key Concepts
+
+- **Project** -- A Pages project maps to a single domain. Created via the dashboard or `wrangler pages project create`.
+- **Deployment** -- Each deploy is an immutable snapshot. Production deploys go to the main URL; branch deploys get preview URLs.
+- **Pages Functions** -- Serverless functions co-deployed with your static site, using file-based routing in a `functions/` directory.
+
+## In This Section
+
+- [Deployment](./deployment.mdx) -- How to deploy with Wrangler CLI
+- [Base Path Pattern](./base-path-pattern.mdx) -- Serving sites under a subpath with `_redirects`
+- [Preview Deploys](./preview-deploys.mdx) -- Per-PR preview deployments
+- [Pages Functions](./pages-functions.mdx) -- Serverless API endpoints alongside your static site

@@ -1,0 +1,70 @@
+---
+title: D1（SQL データベース）
+description: Cloudflare D1 SQLite データベースの使用
+sidebar_position: 2
+---
+
+## 概要
+
+D1 は SQLite 上に構築されたサーバーレス SQL データベース。強整合性を提供し、複雑なクエリをサポートする。
+
+## セットアップ
+
+### データベースの作成
+
+```bash
+npx wrangler d1 create my-database
+```
+
+`wrangler.toml` に追加：
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "my-database"
+database_id = "abc123-def456-ghi789"
+```
+
+### マイグレーションの実行
+
+```bash
+# マイグレーションの作成
+npx wrangler d1 migrations create my-database "create-users-table"
+
+# ローカルでマイグレーションを適用
+npx wrangler d1 migrations apply my-database --local
+
+# 本番環境に適用
+npx wrangler d1 migrations apply my-database --remote
+```
+
+## 関数での使用
+
+```typescript
+interface Env {
+  DB: D1Database;
+}
+
+// クエリ
+const { results } = await env.DB.prepare(
+  "SELECT * FROM users WHERE id = ?"
+).bind(userId).all();
+
+// 挿入
+await env.DB.prepare(
+  "INSERT INTO users (name, email) VALUES (?, ?)"
+).bind(name, email).run();
+
+// バッチ操作
+const batch = [
+  env.DB.prepare("INSERT INTO logs (msg) VALUES (?)").bind("log1"),
+  env.DB.prepare("INSERT INTO logs (msg) VALUES (?)").bind("log2"),
+];
+await env.DB.batch(batch);
+```
+
+## 注意点
+
+- **SQLite 構文**: D1 は PostgreSQL や MySQL ではなく SQLite を使用。一部の SQL 機能が異なる。
+- **サイズ制限**: 無料プランでは各データベースに 10 GB の制限がある。
+- **マイグレーション**: 本番環境（`--remote`）に適用する前に、必ずローカル（`--local`）でテストする。

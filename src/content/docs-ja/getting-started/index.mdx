@@ -1,8 +1,28 @@
 ---
-title: ようこそ
+title: はじめに
+description: このサイトの内容と、Cloudflare のプロジェクト向けセットアップ方法
 sidebar_position: 1
 ---
 
-# ようこそ
+このサイトは、Cloudflare を使った開発パターンに関する個人的なナレッジベースです。Astro による静的サイトのデプロイ、Pages Functions による API 構築、Cloudflare ストレージサービス（KV、D1、R2）の活用を通じて得た実践的な知見をまとめています。
 
-このドキュメントサイトは [zudo-doc](https://github.com/zudolab/zudo-doc) で作成されました。
+## 対象範囲
+
+- **Cloudflare Pages** -- プレビューデプロイやエッジ関数を備えた静的サイトホスティング
+- **Workers** -- Wrangler でデプロイするスタンドアロンのサーバーレス関数
+- **Storage** -- KV、D1、R2 によるキーバリュー、SQL、オブジェクトストレージ
+- **CI/CD** -- GitHub Actions による自動デプロイパイプライン
+- **Recipes** -- 本番プロジェクトから抽出した実践パターン集
+
+## 想定する技術スタック
+
+すべての例は以下を前提としています：
+
+- **Astro** を静的サイトジェネレーターとして使用（他のフレームワークにも応用可能）
+- **pnpm** をパッケージマネージャーとして使用
+- **GitHub Actions** で CI/CD を構築
+- **Wrangler v4** を Cloudflare CLI ツールとして使用
+
+## 前提条件
+
+Cloudflare アカウントと、適切な権限を持つ API トークンが必要です。詳細は [Cloudflare セットアップ](./cloudflare-setup.mdx) を参照してください。

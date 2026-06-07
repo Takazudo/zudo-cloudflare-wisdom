@@ -1,0 +1,320 @@
+---
+title: Auth with Pages Functions
+description: Authentication patterns using Cloudflare Pages Functions
+sidebar_position: 3
+---
+
+## Overview
+
+Pages Functions can handle authentication by integrating with external auth providers (Auth0, etc.) or implementing custom token validation.
+
+The key decision is **what kind of token you are checking**, because that determines which verification strategy you need. Read **Two jobs, two tools** below before copying any code.
+
+## Two jobs, two tools
+
+Authentication in a Worker/Pages Function usually involves one of two distinct jobs. They use different algorithms and different verification mechanics -- do not mix them up.
+
+| Job | Who issued the token | Algorithm | How you verify |
+|---|---|---|---|
+| Verify a **third-party IdP** token (Auth0, Google, etc.) | An external identity provider you do not control | **RS256** (asymmetric) | Fetch the provider's public keys (JWKS) and verify the signature locally with Web Crypto |
+| Issue / verify **your own session** token | Your own backend | **HS256** (symmetric) | Sign and verify with a shared secret you keep in `wrangler secret` |
+
+The reason they differ: with a third-party IdP you never possess the signing key -- only the provider does. It publishes the matching **public** key set (JWKS), and you verify against that. With your own session tokens you control both ends, so a single shared secret (HS256) is simpler and faster.
+
+The rest of this page covers the third-party case (RS256 + JWKS) in depth, then shows the first-party case (HS256) briefly.
+
+## Verifying a third-party IdP token (RS256 + JWKS)
+
+### Wrangler Config
+
+```toml
+[vars]
+AUTH0_DOMAIN = "your-tenant.us.auth0.com"
+AUTH0_CLIENT_ID = "your-client-id"
+AUTH0_AUDIENCE = "https://your-api.example.com"
+```
+
+:::danger[Secrets vs Vars]
+`AUTH0_CLIENT_ID` is safe in `[vars]` (it's public). But `AUTH0_CLIENT_SECRET` must be set via `wrangler secret put AUTH0_CLIENT_SECRET` -- never in `wrangler.toml`.
+:::
+
+### Verify locally -- do not call `/userinfo` per request
+
+A tempting but wrong approach is to validate every request by calling the IdP's `/userinfo` endpoint with the bearer token. That turns each request into a **network round-trip to Auth0**: it adds latency, couples your app's availability to the IdP's, and burns through the IdP's rate limits.
+
+The token is a **signed JWT**. You can verify it offline using only the Web Crypto API -- no Node `jsonwebtoken`, no Node `crypto`, no per-request egress. You fetch the IdP's public keys **once**, cache them, and verify signatures locally.
+
+A JWT has three base64url parts: `header.payload.signature`. Verification means:
+
+1. Read the `kid` (key id) from the header.
+2. Look up the matching public key in the IdP's JWKS.
+3. Verify the signature over `header.payload` with that key.
+4. Validate the `iss`, `aud`, and `exp` claims.
+
+### JWKS fetch with a module-level cache
+
+Define the cache at module scope so it **survives across requests in the same isolate**. It refetches only when the 1-hour TTL expires or when a token references a `kid` not in the cache (key rotation).
+
+```typescript
+// functions/auth/jwks.ts
+interface JwksKey {
+  kty: string;
+  kid: string;
+  use: string;
+  alg: string;
+  n: string;
+  e: string;
+}
+
+interface JwksResponse {
+  keys: JwksKey[];
+}
+
+// Module-level cache: survives across requests in the same isolate.
+let jwksCache: { keys: JwksKey[]; fetchedAt: number } | null = null;
+const JWKS_CACHE_TTL = 3600_000; // 1 hour
+
+export async function fetchJwks(
+  domain: string,
+  forceRefresh = false,
+): Promise<JwksKey[]> {
+  const now = Date.now();
+  if (!forceRefresh && jwksCache && now - jwksCache.fetchedAt < JWKS_CACHE_TTL) {
+    return jwksCache.keys;
+  }
+
+  const url = `https://${domain}/.well-known/jwks.json`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch JWKS: ${res.status}`);
+  }
+
+  const data = (await res.json()) as JwksResponse;
+  jwksCache = { keys: data.keys, fetchedAt: now };
+  return data.keys;
+}
+```
+
+### RS256 verification with Web Crypto
+
+Decode base64url by hand (JWTs use the URL-safe alphabet, no padding), import the JWK as an `RSASSA-PKCS1-v1_5` key, and verify. If the `kid` is not found in the cache, refetch the JWKS once to handle key rotation.
+
+```typescript
+// functions/auth/verify.ts
+import { fetchJwks } from "./jwks";
+
+export interface Auth0Claims {
+  sub: string;
+  email?: string;
+  name?: string;
+  exp: number;
+  iat: number;
+  iss: string;
+  aud: string | string[];
+}
+
+function base64urlDecode(str: string): Uint8Array {
+  const base64 = str.replace(/-/g, "+").replace(/_/g, "/");
+  const paddingNeeded = (4 - (base64.length % 4)) % 4;
+  const binary = atob(base64 + "=".repeat(paddingNeeded));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function decodeJwtPart(part: string): Record<string, unknown> {
+  return JSON.parse(new TextDecoder().decode(base64urlDecode(part)));
+}
+
+export async function verifyAuth0Token(
+  token: string,
+  domain: string,
+  audience: string,
+): Promise<Auth0Claims> {
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Error("Invalid token format");
+  const [headerB64, payloadB64, sigB64] = parts;
+
+  // 1. Read kid + alg from the header.
+  const header = decodeJwtPart(headerB64) as { alg: string; kid: string };
+  if (header.alg !== "RS256") throw new Error("Unsupported algorithm");
+  if (!header.kid) throw new Error("Missing kid in token header");
+
+  // 2. Find the matching key; refetch JWKS once on a kid miss (rotation).
+  let keys = await fetchJwks(domain);
+  let jwk = keys.find((k) => k.kid === header.kid);
+  if (!jwk) {
+    keys = await fetchJwks(domain, true);
+    jwk = keys.find((k) => k.kid === header.kid);
+  }
+  if (!jwk) throw new Error("No matching key found in JWKS");
+
+  // 3. Import the RSA public key.
+  const cryptoKey = await crypto.subtle.importKey(
+    "jwk",
+    { kty: jwk.kty, n: jwk.n, e: jwk.e },
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["verify"],
+  );
+
+  // 4. Verify the signature over `header.payload`.
+  const signingInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+  const signature = base64urlDecode(sigB64);
+  const valid = await crypto.subtle.verify(
+    "RSASSA-PKCS1-v1_5",
+    cryptoKey,
+    signature,
+    signingInput,
+  );
+  if (!valid) throw new Error("Invalid signature");
+
+  // 5. Validate claims.
+  const payload = decodeJwtPart(payloadB64) as unknown as Auth0Claims;
+
+  const expectedIss = `https://${domain}/`;
+  if (payload.iss !== expectedIss) {
+    throw new Error(`Invalid issuer: expected ${expectedIss}`);
+  }
+
+  const aud = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+  if (!aud.includes(audience)) {
+    throw new Error("Token audience does not match");
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (payload.exp && payload.exp < now) {
+    throw new Error("Token expired");
+  }
+
+  return payload;
+}
+```
+
+### Auth Middleware Function
+
+The middleware now verifies the token **locally** -- no per-request fetch to the IdP. The only network call is the JWKS fetch, which happens at most once per hour per isolate.
+
+```typescript
+// functions/auth/_middleware.ts
+import { verifyAuth0Token } from "./verify";
+
+interface Env {
+  AUTH0_DOMAIN: string;
+  AUTH0_CLIENT_ID: string;
+  AUTH0_AUDIENCE: string;
+}
+
+export const onRequest: PagesFunction<Env> = async (context) => {
+  const authHeader = context.request.headers.get("Authorization");
+
+  if (!authHeader?.startsWith("Bearer ")) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  const token = authHeader.slice(7);
+
+  try {
+    const claims = await verifyAuth0Token(
+      token,
+      context.env.AUTH0_DOMAIN,
+      context.env.AUTH0_AUDIENCE,
+    );
+    // Pass verified claims to downstream functions.
+    context.data.user = claims;
+    return context.next();
+  } catch {
+    return new Response("Unauthorized", { status: 401 });
+  }
+};
+```
+
+### File-Based Middleware Routing
+
+Pages Functions support `_middleware.ts` files that run before the actual function:
+
+```
+functions/
+├── auth/
+│   ├── _middleware.ts    # Auth check for all /auth/* routes
+│   └── callback.ts
+├── api/
+│   ├── _middleware.ts    # Auth check for all /api/* routes
+│   └── data.ts
+└── public/
+    └── health.ts         # No auth needed
+```
+
+## Issuing / verifying your own session token (HS256 + `jose`)
+
+When the token is **yours** -- a session token your backend mints after a login -- you do not need JWKS. You hold a single shared secret and use it for both signing and verification (HS256). The [`jose`](https://github.com/panva/jose) library works on the Workers runtime and keeps this concise.
+
+Keep the secret out of `wrangler.toml`: set it with `wrangler secret put SESSION_SECRET`.
+
+```typescript
+// functions/lib/session.ts
+import { SignJWT, jwtVerify } from "jose";
+
+export interface SessionPayload {
+  sub: string;
+  type: "access" | "refresh";
+  [key: string]: unknown;
+}
+
+export async function createToken(
+  payload: SessionPayload,
+  secret: string,
+  expiresIn: string,
+): Promise<string> {
+  const secretKey = new TextEncoder().encode(secret);
+  return new SignJWT({ ...payload })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime(expiresIn)
+    .sign(secretKey);
+}
+
+export async function verifyToken(
+  token: string,
+  secret: string,
+  expectedType: "access" | "refresh",
+): Promise<SessionPayload> {
+  const secretKey = new TextEncoder().encode(secret);
+  const { payload } = await jwtVerify(token, secretKey);
+  const result = payload as unknown as SessionPayload;
+  if (result.type !== expectedType) {
+    throw new Error(`Expected token type "${expectedType}" but got "${result.type}"`);
+  }
+  return result;
+}
+```
+
+`jwtVerify` checks the signature **and** the `exp` claim for you, so first-party verification is also fully local -- no network call at all.
+
+## CORS Headers
+
+For API functions called from a different domain:
+
+```typescript
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
+export const onRequestOptions: PagesFunction = async () => {
+  return new Response(null, { headers: corsHeaders });
+};
+
+export const onRequestGet: PagesFunction<Env> = async (context) => {
+  // ... your logic
+  return new Response(JSON.stringify(data), {
+    headers: {
+      "Content-Type": "application/json",
+      ...corsHeaders,
+    },
+  });
+};
+```

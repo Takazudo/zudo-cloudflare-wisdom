@@ -1,0 +1,148 @@
+---
+title: KV (Key-Value)
+description: Cloudflare KV namespace usage patterns
+sidebar_position: 1
+---
+
+## Overview
+
+KV is a global, low-latency key-value store. It is **eventually consistent** -- writes propagate globally within ~60 seconds, but reads may return stale data during that window.
+
+## Setup
+
+### Create a Namespace
+
+```bash
+npx wrangler kv namespace create "MY_KV"
+```
+
+This outputs the namespace ID. Add it to `wrangler.toml`:
+
+```toml
+[[kv_namespaces]]
+binding = "MY_KV"
+id = "abc123def456ghi789"
+```
+
+## Usage in Functions
+
+```typescript
+interface Env {
+  MY_KV: KVNamespace;
+}
+
+// Read
+const value = await env.MY_KV.get("key");
+const json = await env.MY_KV.get("key", { type: "json" });
+
+// Write
+await env.MY_KV.put("key", "value");
+await env.MY_KV.put("key", JSON.stringify(data));
+
+// Write with expiration (TTL in seconds)
+await env.MY_KV.put("key", "value", { expirationTtl: 3600 });
+
+// Delete
+await env.MY_KV.delete("key");
+
+// List keys
+const list = await env.MY_KV.list({ prefix: "logs:" });
+```
+
+## Real-World Pattern: Keyword Logs
+
+From our zpaper project -- logging search keywords to KV:
+
+```typescript
+interface Env {
+  KEYWORD_LOGS: KVNamespace;
+}
+
+export const onRequestGet: PagesFunction<Env> = async (context) => {
+  const url = new URL(context.request.url);
+  const query = url.searchParams.get("q")?.trim();
+
+  if (query) {
+    // Log the keyword asynchronously (don't block the response)
+    const key = `search:${Date.now()}:${crypto.randomUUID()}`;
+    context.waitUntil(
+      context.env.KEYWORD_LOGS.put(key, JSON.stringify({
+        query,
+        timestamp: new Date().toISOString(),
+      }), { expirationTtl: 86400 * 30 }) // 30 days
+    );
+  }
+
+  // ... return search results
+};
+```
+
+:::tip[Use `waitUntil` for Non-Critical Writes]
+`context.waitUntil()` lets you perform async work after the response is sent. Use it for logging, analytics, and other non-critical writes.
+:::
+
+## Pattern: Conversation State
+
+Store multi-turn conversation history per thread with automatic TTL-based cleanup:
+
+```typescript
+const CONVERSATION_TTL = 86400; // 24 hours
+
+interface ConversationHistory {
+  messages: Array<{ role: string; content: string }>;
+}
+
+// Load with typed JSON deserialization
+const key = `conv:${threadId}`;
+const stored = await env.KV.get<ConversationHistory>(key, "json");
+const history = stored ?? { messages: [] };
+
+// Append new message
+history.messages.push({ role: "user", content: userMessage });
+
+// Save with TTL -- old conversations auto-expire
+await env.KV.put(key, JSON.stringify(history), {
+  expirationTtl: CONVERSATION_TTL,
+});
+```
+
+Key design points:
+
+- Use a structured key like `conv:{threadId}` for easy identification
+- The `"json"` type parameter on `get()` handles deserialization automatically
+- TTL ensures conversations don't accumulate forever
+
+## Pattern: Rate Limiting
+
+Per-user rate limiting using KV counters with TTL expiration:
+
+```typescript
+const RATE_LIMIT = 30;
+const RATE_WINDOW = 86400; // 24 hours
+
+async function checkRateLimit(
+  env: Env,
+  userId: string,
+): Promise<boolean> {
+  const key = `rate:${userId}`;
+  const count = await env.KV.get<number>(key, "json") ?? 0;
+
+  if (count >= RATE_LIMIT) return false;
+
+  await env.KV.put(key, JSON.stringify(count + 1), {
+    expirationTtl: RATE_WINDOW,
+  });
+  return true;
+}
+```
+
+:::warning[KV rate limiting is approximate]
+KV is eventually consistent, so under high concurrency a few extra requests may pass through. This is fine for bot/API rate limiting. For precise counting, use [Durable Objects](../workers/durable-objects.mdx).
+:::
+
+## Gotchas
+
+- **Eventually consistent**: Reads immediately after writes may return stale data
+- **512-byte key limit**: Keys cannot exceed 512 bytes
+- **25 MiB value limit**: Values cannot exceed 25 MiB
+- **List pagination**: `list()` returns up to 1000 keys per call; use the `cursor` for pagination

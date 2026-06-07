@@ -1,0 +1,34 @@
+---
+title: Storage
+description: KV, D1, and R2 storage services
+sidebar_position: 4
+---
+
+Cloudflare offers three storage services, each optimized for different access patterns.
+
+## Overview
+
+| Service | Type | Best For | Consistency |
+|---|---|---|---|
+| **KV** | Key-value store | Read-heavy, eventually consistent data | Eventual |
+| **D1** | SQL database (SQLite) | Relational data, complex queries | Strong |
+| **R2** | Object storage (S3-compatible) | Files, images, large blobs | Strong |
+
+## Choosing the Right Service
+
+```mermaid
+graph TD
+  A[What kind of data?] --> B{Structured/relational?}
+  B -->|Yes| C[D1 - SQL database]
+  B -->|No| D{Large files/blobs?}
+  D -->|Yes| E[R2 - Object storage]
+  D -->|No| F{Read-heavy, ok with eventual consistency?}
+  F -->|Yes| G[KV - Key-value store]
+  F -->|No| C
+```
+
+## In This Section
+
+- [KV](./kv.mdx) -- Key-value namespace usage patterns
+- [D1](./d1.mdx) -- SQL database with SQLite
+- [R2](./r2.mdx) -- Object storage for files

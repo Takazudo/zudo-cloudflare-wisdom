@@ -1,0 +1,68 @@
+---
+title: IFTTT 通知
+description: IFTTT Webhook によるデプロイ状況通知
+sidebar_position: 3
+---
+
+## 概要
+
+IFTTT Webhook を使ってデプロイの成功/失敗時にモバイルプッシュ通知を送信します。
+
+## セットアップ
+
+1. **Webhooks** トリガーで IFTTT アプレットを作成
+2. イベント名を設定（例: `deploy_notify`）
+3. **Notifications** アクションに接続
+4. Webhook URL をコピーし、GitHub リポジトリのシークレットに `IFTTT_PROD_NOTIFY` として保存
+
+## 通知ジョブ
+
+`if: always()` で実行される最終ジョブとして追加します：
+
+```yaml
+  notify:
+    name: Deploy Notification
+    needs: [build-site, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Notify via IFTTT
+        if: env.IFTTT_PROD_NOTIFY != ''
+        env:
+          IFTTT_PROD_NOTIFY: ${{ secrets.IFTTT_PROD_NOTIFY }}
+          RAW_COMMIT_MSG: ${{ github.event.head_commit.message }}
+          BUILD_RESULT: ${{ needs.build-site.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+        run: |
+          if [ "$DEPLOY_RESULT" = "success" ]; then
+            STATUS="my-site deploy succeeded!"
+          elif [ "$BUILD_RESULT" = "failure" ]; then
+            STATUS="my-site deploy failed (build)"
+          elif [ "$DEPLOY_RESULT" = "failure" ]; then
+            STATUS="my-site deploy failed (deploy)"
+          else
+            STATUS="my-site deploy cancelled"
+          fi
+
+          COMMIT_MSG=$(echo "$RAW_COMMIT_MSG" | head -1 | sed 's/"/\\"/g')
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          curl -sSf --max-time 10 -X POST "$IFTTT_PROD_NOTIFY" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"value1\": \"${STATUS}\",
+              \"value2\": \"${SHORT_SHA} ${COMMIT_MSG}\",
+              \"value3\": \"${RUN_URL}\"
+            }" || echo "::warning::IFTTT notification failed"
+```
+
+## 重要なポイント
+
+- **`if: always()`**: 通知ジョブは前のジョブの成否に関係なく実行される
+- **`if: env.IFTTT_PROD_NOTIFY != ''`**: シークレットが未設定の場合はステップがスキップされる（フォークで便利）
+- **`--max-time 10`**: curl リクエストのタイムアウトを設定し、ワークフローのハングを防ぐ
+- **`|| echo "::warning::"`**: IFTTT が到達不能な場合、ジョブを失敗させる代わりに警告をログに記録
+- **3つの値**: IFTTT Webhook は `value1`、`value2`、`value3` をサポート -- ステータス、コミット情報、実行 URL に使用
