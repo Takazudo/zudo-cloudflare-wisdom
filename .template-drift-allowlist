@@ -1,0 +1,111 @@
+# Template drift allowlist for zudo-cloudflare-wisdom.
+# Generated projects start from create-zudo-doc templates; this file lists
+# intentional divergences so `pnpm check:template-drift` exits 0.
+#
+# Format: one repo-relative path per line (no leading slash).
+# Blank lines and `#` comments are ignored.
+
+# .zfb/ directory is gitignored; doc-history-meta.json is written at build
+# time by the doc-history plugin. It does not exist in the working tree.
+.zfb/doc-history-meta.json
+
+# zfb migration (Wave 4–5) — pages/_data.ts was updated to use a newer zfb
+# collection API shape. The template still ships the pre-migration form;
+# the production file uses the updated `getCollection` call pattern plus
+# improved type comments on `bridgeEntries`/`bridgeDocsEntries`.
+pages/_data.ts
+
+# zfb migration — _mdx-components.ts has the imageEnlarge paragraph override
+# installed unconditionally. The template ships @slot: injection anchors so
+# the compose framework can inject the block; production has it inlined.
+pages/_mdx-components.ts
+
+# zfb migration — both doc route entry points were heavily reworked:
+# DocPageShell/_doc-route-paths removed; DocLayoutWithDefaults, Breadcrumb,
+# NavCardGrid, SidebarPrepaint, DocBodyEnd, DocPager added; buildNavTree
+# call sites updated with explicit casts at the ZfbDocsEntry boundary.
+pages/docs/[[...slug]].tsx
+pages/[locale]/docs/[[...slug]].tsx
+
+# zfb migration — _doc-metainfo-area.tsx has updated comments (S1 cleanup
+# reference removed from the template; wording simplified).
+pages/lib/_doc-metainfo-area.tsx
+
+# zfb migration — _doc-page-shell.tsx and _doc-route-paths.ts were replaced
+# by the new DocLayoutWithDefaults + SidebarPrepaint + DocBodyEnd pattern.
+# These files no longer exist in this repo.
+pages/lib/_doc-page-shell.tsx
+pages/lib/_doc-route-paths.ts
+
+# zfb migration — _extract-headings.ts has expanded doc-comments in template
+# vs. the shorter version shipped in this repo.
+pages/lib/_extract-headings.ts
+
+# zfb migration — _head-with-defaults.tsx: `absoluteUrl` helper was added to
+# the template; production uses the version without it (absoluteUrl was later
+# added directly to @/utils/base in the migration wave).
+pages/lib/_head-with-defaults.tsx
+
+# zfb migration — _nav-source-cache.ts and _nav-source-docs.ts: updated to
+# use `bridgeDocsEntries`/`bridgeEntries` and generic type parameters added
+# to `stableNavDocs` and `mergeLocaleDocs` in the template.
+pages/lib/_nav-source-cache.ts
+pages/lib/_nav-source-docs.ts
+
+# zfb migration — locale-merge.ts: template added a generic `<T>` parameter
+# to `MergeLocaleDocsOptions` and `mergeLocaleDocs` to eliminate `as unknown
+# as` casts at call sites. Production retains the non-generic form.
+pages/lib/locale-merge.ts
+
+# Component stubs vs. real implementations — the base template ships no-op
+# stubs for these components (so imports resolve at typecheck on scaffold
+# without any features). Features sidebarToggle, docHistory were enabled,
+# so production ships real island implementations that differ from the stubs.
+# imageEnlarge is also enabled (image-enlarge feature) and ships a real island.
+src/components/desktop-sidebar-toggle.tsx
+src/components/doc-history.tsx
+src/components/image-enlarge.tsx
+
+# zfb migration — sidebar-tree.tsx has a minor type cast difference:
+# `e.target.value` vs `(e.target as HTMLInputElement).value` for the
+# search input's onChange handler.
+src/components/sidebar-tree.tsx
+
+# zfb migration — color-scheme-utils.ts: minor array destructuring style
+# difference (`lightPair[0]` vs const destructuring with null-guard).
+src/config/color-scheme-utils.ts
+
+# @slot: anchors — global.css in the template ships two @slot: injection
+# markers (`@slot:global-css:theme-tokens` and `@slot:global-css:feature-styles`)
+# so the compose framework can inject feature CSS. Production has these slots
+# resolved and removed (they are not needed in a fully composed scaffold).
+src/styles/global.css
+
+# zfb migration — base.ts: `absoluteUrl()` helper was added to the template
+# (joins siteUrl + base-prefixed page path). Also a minor `?? ""` vs `|| ""`
+# style difference in `parseVersionPrefix`. Production does not have
+# `absoluteUrl` exported from this file.
+src/utils/base.ts
+
+# zfb migration — dedent.ts, docs.ts, smart-break.tsx: minor nullish
+# coalescing style differences (`?.[1] ?? 0` vs `?.[1].length ?? 0`,
+# `parts[i] ?? ""` vs `parts[i]`, null-guard patterns). Template versions
+# add defensive `?? ""` / optional chaining patterns; production keeps the
+# original more concise form (TypeScript strict mode catches any issues).
+src/utils/dedent.ts
+src/utils/docs.ts
+src/utils/smart-break.tsx
+
+# docTags feature — tags pages are present in the docTags feature template
+# but this site has `docTags: false` in settings.ts (tags UI disabled).
+# The tag data model and frontmatter field are kept for future use, but
+# the tags index/detail pages are intentionally absent.
+pages/[locale]/docs/tags/[tag].tsx
+pages/[locale]/docs/tags/index.tsx
+pages/docs/tags/[tag].tsx
+pages/docs/tags/index.tsx
+
+# tagGovernance — tags-audit.ts has minor array destructuring style difference
+# (`fmMatch[0] ?? ""` vs `const [whole, ...] = fmMatch`). Both are correct;
+# the template uses more defensive nullish coalescing.
+scripts/tags-audit.ts
