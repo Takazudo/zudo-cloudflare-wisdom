@@ -5,8 +5,10 @@
   "type": "module",
   "scripts": {
     "// ── Doc site ────────────────────────────────────": "",
-    "dev": "zfb dev",
-    "build": "zfb build",
+    "// gen:safelist runs before dev/build — see scripts/gen-package-safelist.mjs": "",
+    "dev": "node scripts/gen-package-safelist.mjs && zfb dev",
+    "build": "node scripts/gen-package-safelist.mjs && zfb build",
+    "gen:safelist": "node scripts/gen-package-safelist.mjs",
     "preview": "zfb preview",
     "check": "zfb check",
     "check:html": "html-validate \"dist/**/*.html\"",

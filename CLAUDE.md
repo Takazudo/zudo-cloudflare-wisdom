@@ -200,6 +200,10 @@ Available globally in MDX without imports:
 - Noto Sans JP for body text
 - Headings use font-weight 400 (normal), not bold
 
+## Package CSS (Tailwind safelist)
+
+`@takazudo/zudo-doc` ships no precompiled CSS — its component styles are static Tailwind class literals in the dist JS, and Tailwind v4's `@source` scan of `node_modules` does not reliably generate them (so package-only classes like the sticky-header `top-0`/`z-50` go missing). `scripts/gen-package-safelist.mjs` reads the installed package dist and writes every class token as `@source inline(...)` into `src/styles/_package-safelist.css`, which `src/styles/global.css` imports. It runs automatically as the first step of `pnpm dev` and `pnpm build` (and via `pnpm gen:safelist`). It is **dep-bump-safe** (derives from the installed dist, not a frozen list) and deterministic — **re-run / re-commit the generated partial whenever `@takazudo/zudo-doc` is bumped**. See `Takazudo/zudo-front-builder#884`.
+
 ## Doc Skill (cloudflare-wisdom)
 
 The `cloudflare-wisdom` skill (`/.claude/skills/cloudflare-wisdom/SKILL.md`) is **generated** by `pnpm setup:doc-skill` (runs `scripts/setup-doc-skill.sh`). It is gitignored -- do NOT track it in git or edit it directly. To update the skill content, edit the generator script and re-run `pnpm setup:doc-skill`.
