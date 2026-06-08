@@ -136,3 +136,46 @@ scripts/run-b4push.sh
 # shortcutHint keys (EN/JA/DE) so the SSR search dialog renders real copy instead
 # of the literal key fallback. zudolab/zudo-doc#1973-adjacent.
 src/config/i18n.ts
+
+# ── next.9 template evolution surfaced by the create-zudo-doc 0.2.0-next.7 →
+#    next.9 bump (the package-CSS safelist-mechanism upgrade). DEFERRED, not
+#    adopted: unrelated to the CSS fix that motivated the bump, and the old
+#    (pre-next.9) form shipped here is build-verified against the next.9 packages
+#    (the 74-page `pnpm build` is green). Adopt deliberately in a dedicated
+#    migration wave, not as collateral of a dep bump. (NOTE: the one next.9 change
+#    that WAS adopted — the real client-router bootstrap, zudolab/zudo-doc#1991 —
+#    is not listed here; it matches the template and is off this list.)
+
+# `category_no_page` / `category_sort_order` frontmatter feature
+# (zudolab/zudo-doc#1997 scaffold-parity). A coherent cross-cutting unit:
+# declares two new frontmatter fields, threads noPage filtering through the doc
+# engine (src/utils/docs.ts — already allowlisted), CategoryNav, sitemap route
+# enumeration, tag counts and the footer taglist, and switches the
+# claude-resources auto-generated category dirs from `_category_.json` to a
+# frontmatter `index.mdx`. Adopting it requires adding the two fields to the
+# zfb.config.ts frontmatter schema (or the build rejects them), and it is mostly
+# inert for this site anyway — our categories use `_category_.json` `noPage`, not
+# the frontmatter form. Deferred as a unit.
+pages/index.tsx
+pages/[locale]/index.tsx
+pages/lib/_category-nav.tsx
+pages/lib/_footer-with-defaults.tsx
+pages/lib/route-enumerators.ts
+src/config/frontmatter-preview-defaults.ts
+src/types/docs-entry.ts
+src/integrations/claude-resources/generate.ts
+src/integrations/claude-resources/__tests__/generate.test.ts
+
+# _doc-history-area.tsx — next.9 adds an optional `isFallback` prop so EN-fallback
+# locale pages fetch doc-history JSON from the bare (non-locale-prefixed) path.
+# Backward-compatible (defaults to current behavior) but inert here: it only
+# activates if the doc route shell passes `isFallback`, and our shells are
+# customized (allowlisted) and don't. Deferred with the doc-history wave.
+pages/lib/_doc-history-area.tsx
+
+# doc-history-plugin.mjs — next.9 makes postBuild doc-history generation opt-in
+# locally via GEN_DOC_HISTORY=1 (always on in CI), gated in shouldGeneratePostBuild
+# (zudolab/zudo-doc#1986). Our current plugin generates by default and honors
+# SKIP_DOC_HISTORY=1. Kept to preserve the existing local/CI doc-history behavior
+# through the cutover; adopt with the doc-history wave.
+plugins/doc-history-plugin.mjs

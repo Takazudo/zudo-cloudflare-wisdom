@@ -26,29 +26,22 @@
 @source "src/utils/**/*.{tsx,ts,jsx,js}";
 @source "pages/**/*.{tsx,ts,jsx,js}";
 
-/* Consumed framework package: the header/sidebar/doclayout components ship
- * their own utility classes (`lg:block`, etc.) as static class literals in the
- * compiled dist JS. In the zudo-doc monorepo these are covered by
- * `@source "packages/zudo-doc/src"`; a CONSUMER would point at node_modules
- * instead — but Tailwind v4 does NOT reliably scan node_modules (it generates
- * zero package utilities here; see zudolab/zudo-doc#1971). Kept as a best-effort
- * catch-all for any dynamic class forms; the real generation happens via the
- * generated @source inline() block below. */
-@source "../../node_modules/@takazudo/zudo-doc/dist/**/*.{js,mjs}";
-
-/* Complete, dep-bump-safe safelist for the package's component utility classes.
- * The node_modules @source scan above generates ZERO package utilities here
- * (Tailwind v4 node_modules handling — zudolab/zudo-doc#1971; consumer-side root
- * cause Takazudo/zudo-front-builder#884/#885). `scripts/gen-package-safelist.mjs`
- * extracts every class token from the installed @takazudo/zudo-doc dist into the
- * generated partial below as @source inline() directives — the one mechanism
- * proven to generate them in this build. It runs as the first step of
- * `pnpm dev`/`pnpm build` (and `pnpm gen:safelist`); re-run on each
- * @takazudo/zudo-doc bump. NOTE: zfb's Tailwind pipeline resolves this @import
- * relative to the build CWD (repo root), NOT to this file — hence the
- * `./src/styles/` prefix. A wrong/missing path fails the build LOUDLY
- * ("Can't resolve …"), so the safelist can never be silently dropped. */
-@import "./src/styles/_package-safelist.css";
+/* @takazudo/zudo-doc package safelist.
+ *
+ * The package ships a build-generated safelist at `dist/safelist.css` — a
+ * single `@source inline(...)` of every class token its compiled dist
+ * declares — and exports it as `./safelist.css`. Importing it via the module
+ * resolver pulls in the complete package utility set (`top-0`, `z-50`,
+ * `shadow-lg`, arbitrary values, …) with no consumer-side extraction; it
+ * auto-syncs on every @takazudo/zudo-doc bump.
+ *
+ * Why not `@source` the node_modules dist glob directly? Tailwind v4's content
+ * scanner does not reliably traverse pnpm's symlinked node_modules, so package
+ * utilities were silently dropped from the built CSS (zudolab/zudo-doc#1971;
+ * consumer-side root cause Takazudo/zudo-front-builder#884/#885). The
+ * package-generated `@source inline()` carries the full set, extracted at
+ * package build time — no symlink traversal, no drift. (zudolab/zudo-doc#1993/#1994.) */
+@import "@takazudo/zudo-doc/safelist.css";
 
 /* ========================================
  * Design Token System
@@ -137,7 +130,8 @@
   --spacing-hsp-xl: 1.5rem;     /* 24px — generous padding */
   --spacing-hsp-2xl: 2rem;      /* 32px — large padding */
 
-  /* Vertical spacing (7 steps) */
+  /* Vertical spacing (8 steps) */
+  --spacing-vsp-3xs: 0.25rem;     /* 4px — hairline gap */
   --spacing-vsp-2xs: 0.4375rem;   /* 7px — tight gap */
   --spacing-vsp-xs: 0.875rem;    /* 14px — small gap */
   --spacing-vsp-sm: 1.25rem;     /* 20px — compact gap */
@@ -156,6 +150,16 @@
 
   /* Image overlay button chrome */
   --spacing-image-overlay-inset: 0.5rem;  /* 8px — overlay button corner inset + internal padding */
+
+  /* ========================================
+   * Elevation — the tight `@import "tailwindcss/utilities"` (no default
+   * @theme) drops Tailwind's default shadow scale, so `shadow-*` utilities
+   * generate nothing. Re-add the one elevation the components use: header
+   * and version-switcher dropdown panels apply `shadow-lg`. Value is
+   * Tailwind v4's default shadow-lg; the black is intentionally
+   * theme-independent (a drop shadow is absence of light, not a themed color).
+   * ======================================== */
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
 
   /* ========================================
    * Typography
