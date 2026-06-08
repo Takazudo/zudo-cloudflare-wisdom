@@ -12,6 +12,7 @@
     "check:html": "html-validate \"dist/**/*.html\"",
     "check:links": "node scripts/check-links.js --strict-broken --allowlist=.check-links-allowlist",
     "check:pin-parity": "node scripts/check-pin-parity.mjs",
+    "check:wrangler-pin": "node scripts/check-wrangler-pin.mjs",
     "check:template-drift": "bash scripts/check-template-drift.sh",
     "// ── Skill ───────────────────────────────────────": "",
     "setup:doc-skill": "bash scripts/setup-doc-skill.sh",
