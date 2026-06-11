@@ -66,9 +66,11 @@ src/components/desktop-sidebar-toggle.tsx
 src/components/doc-history.tsx
 src/components/image-enlarge.tsx
 
-# zfb migration — sidebar-tree.tsx has a minor type cast difference:
-# `e.target.value` vs `(e.target as HTMLInputElement).value` for the
-# search input's onChange handler.
+# sidebar-tree.tsx — template evolved past the original minor-cast diff: it now
+# imports the BARE package ThemeToggle (zudolab/zudo-doc#2012 E2), fixes the
+# root-index slug truthiness check (#1891), and uses `e.currentTarget.value` in
+# the filter input (0.2.2 dd281916). Production keeps the pre-0.2.1 form;
+# adoption is interlocked with the deferred wave below (issue #48).
 src/components/sidebar-tree.tsx
 
 # Mobile-drawer drift fix — the base template ships the OLD children-based
@@ -79,12 +81,15 @@ src/components/sidebar-tree.tsx
 # that forwards the props to <SidebarTree>. zudolab/zudo-doc#1355 wave 13.5.
 src/components/sidebar-toggle.tsx
 
-# Theme-toggle island-collision fix — the host ThemeToggle and the package's
-# ThemeToggle (pulled into the SSR graph via @takazudo/zudo-doc/header) share
-# the name "ThemeToggle"; esbuild renames one to "ThemeToggle2", so the SSG
-# emitted data-zfb-island="ThemeToggle2" with no matching client registry key
-# → dead toggle. Production pins `ThemeToggle.displayName = "ThemeToggle"` so
-# the island marker always matches the registered key. zudolab/zudo-doc#1446.
+# theme-toggle.tsx — production ships the legacy full local implementation
+# (with the #1446 `displayName = "ThemeToggle"` island-collision pin). The
+# 0.2.2 template replaced this file entirely with a thin scanner-visible shim
+# re-exporting the package ThemeToggle (zudolab/zudo-doc#2048): zfb's island
+# scanner does not register "use client" modules under node_modules
+# (Takazudo/zudo-front-builder#999), so the shim gives it a local binding to
+# register. Adopting the shim requires the matching _header-with-defaults.tsx
+# rewiring (deferred below) — switch both together in the issue #48 wave;
+# until then the header ThemeToggle stays SSR-only (known hydration gap).
 src/components/theme-toggle.tsx
 
 # zfb migration — color-scheme-utils.ts: minor array destructuring style
@@ -196,6 +201,14 @@ plugins/doc-history-plugin.mjs
 #    the pre-existing island-hydration gap (7 unregistered islands, exposed by
 #    zfb next.38's new registry warning) has the 0.2.1 templates as its
 #    known-good reference wiring.
+#    UPDATE (0.2.2 bump, PR #52): the 0.2.2 templates rode further on these
+#    same deferred files — the scanner-visible ThemeToggle shim
+#    (zudolab/zudo-doc#2048 + Takazudo/zudo-front-builder#999) and the
+#    matching _header-with-defaults.tsx rewiring are upstream's fix for the
+#    #48 hydration gap. The #48 wave should adopt at >= 0.2.2, not 0.2.1.
+#    The two 0.2.2 drifts OUTSIDE this deferred set (body-end-islands @slot
+#    markers; ai-chat-modal "use client") were adopted in PR #52 directly —
+#    AiChatModal now registers and hydrates, shrinking the gap to 6 islands.
 pages/lib/_doc-content-header.tsx
 pages/lib/_doc-page-renderer.tsx
 pages/lib/_doc-route-entries.ts
