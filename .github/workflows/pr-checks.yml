@@ -275,11 +275,16 @@ jobs:
         run: |
           PR_NUMBER="${{ github.event.pull_request.number }}"
           ALIAS="pr-${PR_NUMBER}"
+          # This job has no node_modules (dist-cache restore only), so wrangler
+          # runs via npx — but pinned to the package.json devDependency version
+          # so deploys use the same wrangler the check:wrangler-pin gate
+          # validates, instead of floating to latest 4.x (#49).
+          WRANGLER_VERSION=$(node -p "require('./package.json').devDependencies.wrangler")
           # wrangler versions upload prints the stable preview-alias URL
           # (on *.workers.dev — requires preview_urls = true in wrangler.toml)
           # to stdout/stderr. Capture both via tee and grep the alias URL line.
           DEPLOY_LOG=$(mktemp)
-          npx wrangler@4 versions upload \
+          npx "wrangler@${WRANGLER_VERSION}" versions upload \
             --preview-alias "$ALIAS" \
             2>&1 | tee "$DEPLOY_LOG"
           DEPLOY_URL=$(grep -oE "https://${ALIAS}-[a-z0-9.-]+\.workers\.dev" "$DEPLOY_LOG" | head -1)

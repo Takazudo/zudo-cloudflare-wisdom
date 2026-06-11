@@ -190,7 +190,12 @@ jobs:
           printf '%s\n' '_worker.js' '_zfb_inner.mjs' > dist/.assetsignore
 
       - name: Deploy to Cloudflare Workers (production)
-        run: npx wrangler@4 deploy
+        # No node_modules in this job (dist-cache restore only) — npx, but
+        # pinned to the package.json devDependency version so production
+        # deploys use the wrangler the check:wrangler-pin gate validates (#49).
+        run: |
+          WRANGLER_VERSION=$(node -p "require('./package.json').devDependencies.wrangler")
+          npx "wrangler@${WRANGLER_VERSION}" deploy
         env:
           # CLOUDFLARE_API_TOKEN requires Workers: Edit scope (NOT Pages: Edit)
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
