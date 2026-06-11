@@ -179,3 +179,42 @@ pages/lib/_doc-history-area.tsx
 # SKIP_DOC_HISTORY=1. Kept to preserve the existing local/CI doc-history behavior
 # through the cutover; adopt with the doc-history wave.
 plugins/doc-history-plugin.mjs
+
+# ── 0.2.1 template evolution surfaced by the create-zudo-doc 0.2.0 → 0.2.1
+#    bump (PR #47: zudo-doc 0.2.1 / zfb next.36 → next.38). DEFERRED as a
+#    unit, not adopted — same policy as the next.9 deferral above: the drift
+#    is upstream host evolution unrelated to the bump's motivation, and the
+#    pre-0.2.1 form shipped here is build-verified against the 0.2.1 packages
+#    (74-page `pnpm build` green, tsc clean). The drifted files are interlocked
+#    upstream units (zudolab/zudo-doc#2010 route consolidation via the new
+#    _doc-page-renderer/_doc-route-entries, #2030 nav-tree dedupe via the new
+#    _nav-data-prep, #2012 bare theme-toggle subpath import, #2016 docs-schema
+#    extraction, #2022 versioned-page metadata correctness, #2024 search-index/
+#    llms-txt dedupe + slug overrides, #2037 per-scheme shikiTheme) — partial
+#    adoption would leave dead glue, so adopt deliberately in a dedicated
+#    migration wave: tracked in issue #48, which the wave ALSO needs to fix —
+#    the pre-existing island-hydration gap (7 unregistered islands, exposed by
+#    zfb next.38's new registry warning) has the 0.2.1 templates as its
+#    known-good reference wiring.
+pages/lib/_doc-content-header.tsx
+pages/lib/_doc-page-renderer.tsx
+pages/lib/_doc-route-entries.ts
+pages/lib/_doc-tags-area.tsx
+pages/lib/_header-with-defaults.tsx
+pages/lib/_inline-version-switcher.tsx
+pages/lib/_nav-data-prep.ts
+pages/lib/_search-widget-script.ts
+pages/lib/_sidebar-with-defaults.tsx
+plugins/connect-adapter.mjs
+plugins/copy-public-plugin.mjs
+plugins/search-index-plugin.mjs
+src/config/color-schemes.ts
+src/config/docs-schema.ts
+plugins/llms-txt-plugin.mjs
+plugins/claude-resources-plugin.mjs
+
+# docTags feature — _tag-pages.tsx is the 0.2.1-extracted shared module for
+# the tags index/detail pages. This site has `docTags: false` and the four
+# tag page files are already intentionally absent (allowlisted above);
+# the shared module is absent for the same reason.
+pages/lib/_tag-pages.tsx
