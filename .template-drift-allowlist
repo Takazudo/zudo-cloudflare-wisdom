@@ -69,10 +69,12 @@ pages/lib/locale-merge.ts
 # without any features). Features sidebarToggle, docHistory were enabled,
 # so production ships real island implementations that differ from the stubs.
 # imageEnlarge is also enabled (image-enlarge feature) and ships a real island.
-# As of the 0.2.3 bump (PR #54), doc-history.tsx and image-enlarge.tsx are
-# byte-identical to the 0.2.3 FEATURE templates ("use client" + lazy diff
-# import adopted); the entries stay only because the gate diffs each prod
-# path against the BASE stub first and the allowlist is per-path.
+# As of the 0.2.3 bump (PR #54), image-enlarge.tsx is byte-identical to the
+# 0.2.3 FEATURE template and doc-history.tsx differs from it only by a
+# one-line stale-render fix (setChanges(null) reset; upstream template bug
+# zudolab/zudo-doc#2068 — drop the local delta once a fixed template ships).
+# The entries stay regardless because the gate diffs each prod path against
+# the BASE stub first and the allowlist is per-path.
 src/components/desktop-sidebar-toggle.tsx
 src/components/doc-history.tsx
 src/components/image-enlarge.tsx

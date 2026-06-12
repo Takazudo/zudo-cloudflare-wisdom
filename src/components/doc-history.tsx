@@ -185,6 +185,12 @@ function DiffViewer({
 
   useEffect(() => {
     let cancelled = false;
+    // Clear first: on desktop the revisions list stays visible next to an open
+    // DiffViewer, so a new Compare updates `selection` without remounting —
+    // without the reset the old diff renders under the new hashes until the
+    // lazy import resolves. (Local fix; upstream template bug, see
+    // zudolab/zudo-doc#2068.)
+    setChanges(null);
     // Lazy-load diff — only needed after History → Compare. This keeps the
     // module out of the eager islands bundle.
     import("diff").then(({ diffLines }) => {
