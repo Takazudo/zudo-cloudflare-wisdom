@@ -37,6 +37,13 @@ pages/lib/_doc-metainfo-area.tsx
 pages/lib/_doc-page-shell.tsx
 pages/lib/_doc-route-paths.ts
 
+# _toc-title.ts — 0.2.3 template helper consumed only by the template's
+# _doc-page-shell.tsx (Toc/MobileToc override labels). That shell does not
+# exist in this repo (allowlisted above), so the helper would be dead code
+# here. zudo-doc >= 0.2.3 exports getTocTitle from "@takazudo/zudo-doc/toc"
+# for when the #48 wave adopts the shell architecture.
+pages/lib/_toc-title.ts
+
 # zfb migration — _extract-headings.ts has expanded doc-comments in template
 # vs. the shorter version shipped in this repo.
 pages/lib/_extract-headings.ts
@@ -62,6 +69,12 @@ pages/lib/locale-merge.ts
 # without any features). Features sidebarToggle, docHistory were enabled,
 # so production ships real island implementations that differ from the stubs.
 # imageEnlarge is also enabled (image-enlarge feature) and ships a real island.
+# As of the 0.2.3 bump (PR #54), image-enlarge.tsx is byte-identical to the
+# 0.2.3 FEATURE template and doc-history.tsx differs from it only by a
+# one-line stale-render fix (setChanges(null) reset; upstream template bug
+# zudolab/zudo-doc#2068 — drop the local delta once a fixed template ships).
+# The entries stay regardless because the gate diffs each prod path against
+# the BASE stub first and the allowlist is per-path.
 src/components/desktop-sidebar-toggle.tsx
 src/components/doc-history.tsx
 src/components/image-enlarge.tsx
@@ -83,13 +96,13 @@ src/components/sidebar-toggle.tsx
 
 # theme-toggle.tsx — production ships the legacy full local implementation
 # (with the #1446 `displayName = "ThemeToggle"` island-collision pin). The
-# 0.2.2 template replaced this file entirely with a thin scanner-visible shim
-# re-exporting the package ThemeToggle (zudolab/zudo-doc#2048): zfb's island
-# scanner does not register "use client" modules under node_modules
-# (Takazudo/zudo-front-builder#999), so the shim gives it a local binding to
-# register. Adopting the shim requires the matching _header-with-defaults.tsx
-# rewiring (deferred below) — switch both together in the issue #48 wave;
-# until then the header ThemeToggle stays SSR-only (known hydration gap).
+# 0.2.2 template's scanner-visible shim was RETIRED in 0.2.3
+# (zudolab/zudo-doc#2064): zfb next.39+ scans npm-dist "use client" modules
+# (Takazudo/zudo-front-builder#1001 fixing #999), so templates now import the
+# bare package ThemeToggle in _header-with-defaults.tsx with no local file at
+# all. The #48 wave should DELETE this local file and adopt the 0.2.3
+# _header-with-defaults.tsx wiring (deferred below) together. As of the
+# next.40 bump (PR #54) the header ThemeToggle hydrates engine-side either way.
 src/components/theme-toggle.tsx
 
 # zfb migration — color-scheme-utils.ts: minor array destructuring style
