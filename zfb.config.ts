@@ -167,5 +167,6 @@ export default defineConfig({
       headingIds: { strategy: settings.headingIdStrategy },
     },
   },
+  adapter: "@takazudo/zfb-adapter-cloudflare",
   plugins: integrationPlugins,
 });
