@@ -1,16 +1,30 @@
 # zudo-cloudflare-wisdom
 
-Takazudo's Cloudflare dev notes, built with zudo-doc (Astro, MDX, Tailwind CSS v4).
+Takazudo's Cloudflare dev notes, built with zudo-doc (zfb stack, MDX, Tailwind CSS v4).
 
 ## Commands
 
 ```bash
-pnpm dev          # Start Astro dev server (port 4821)
-pnpm build        # Build static site to dist/
-pnpm preview      # Preview built site
-pnpm check        # Astro type checking
-pnpm format:md    # Format MDX files
-pnpm b4push       # Pre-push validation (format + typecheck + build)
+pnpm dev              # Start zfb dev server (port 4321)
+pnpm build            # Build static site via zfb build
+pnpm preview          # Preview built site
+pnpm check            # zfb type checking
+pnpm format:md        # Format MDX files
+pnpm b4push           # Pre-push validation (format + typecheck + build)
+pnpm setup:doc-skill  # Generate cloudflare-wisdom skill + symlink all skills
+```
+
+## Project Layout
+
+```
+pages/          # Host-app routing layer (zfb entry points)
+src/
+  components/   # Shared UI components
+  config/       # settings.ts — site-wide config, docs-schema.ts — frontmatter schema
+  content/      # MDX doc pages (docs/ + docs-ja/)
+  utils/        # Shared utilities
+plugins/        # zfb integration plugins (.mjs)
+zfb.config.ts   # Build config (framework, collections, plugins, adapter)
 ```
 
 ## Content Structure
@@ -46,7 +60,7 @@ All documentation files use `.mdx` format with YAML frontmatter.
 
 ### Frontmatter Fields
 
-Schema defined in `src/content.config.ts`:
+Schema defined in `src/config/docs-schema.ts` (validated by `zfb check`):
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -200,15 +214,17 @@ Available globally in MDX without imports:
 
 ## Doc Skill (cloudflare-wisdom)
 
-The `cloudflare-wisdom` skill (`/.claude/skills/cloudflare-wisdom/SKILL.md`) is **generated** by `pnpm setup:doc-skill` (runs `scripts/setup-doc-skill.sh`). It is gitignored -- do NOT track it in git or edit it directly. To update the skill content, edit the generator script and re-run `pnpm setup:doc-skill`.
+The `cloudflare-wisdom` skill (`.claude/skills/cloudflare-wisdom/SKILL.md`) is **generated** by `pnpm setup:doc-skill` (runs `scripts/setup-doc-skill.sh`). It is gitignored -- do NOT track it in git or edit it directly. To update the skill content, edit the generator script and re-run `pnpm setup:doc-skill`.
 
 ## Site Config
 
-- Base path: `/pj/zudo-cloudflare`
+- Base path: `/`
+- Live URL: `https://zudo-cloudflare-wisdom.takazudomodular.com/`
 - Settings: `src/config/settings.ts`
 
-## CI/CD
+## Hosting & CI/CD
 
-- PR checks: typecheck + build + Cloudflare Pages preview
-- Main deploy: build + Cloudflare Pages production + IFTTT notification
-- Secrets: CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, IFTTT_PROD_NOTIFY
+- **Hosting**: Cloudflare Workers static assets
+- **PR checks**: typecheck + build + Cloudflare Workers preview
+- **Main deploy**: build → Workers production + IFTTT notification
+- **Secrets**: `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `IFTTT_PROD_NOTIFY`
