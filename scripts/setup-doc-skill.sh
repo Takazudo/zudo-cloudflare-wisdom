@@ -2,20 +2,22 @@
 set -euo pipefail
 
 # ── setup-doc-skill.sh ─────────────────────────────────
-# Creates a Claude Code skill that exposes your
+# Creates a Claude Code skill that exposes your zudo-doc
 # documentation as a knowledge base, then symlinks it into
 # the user-scope skills directory (~/.claude/skills/).
 # ────────────────────────────────────────────────────────
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Read project name from package.json
+# Read project name from package.json (used in the generated SKILL.md description/title text)
 PROJECT_NAME=$(node -e "console.log(require('$ROOT_DIR/package.json').name || 'my-project')")
+# Skill name is pinned (not "${PROJECT_NAME}-wisdom") so it stays in lockstep with the .gitignore
+# entry and CLAUDE.md, which both reference `cloudflare-wisdom`. See issue #78.
 DEFAULT_SKILL_NAME="cloudflare-wisdom"
 
 # Prompt for skill name
 echo ""
-echo "=== Doc Skill Setup ==="
+echo "=== zudo-doc Skill Setup ==="
 echo ""
 read -rp "Skill name [$DEFAULT_SKILL_NAME]: " SKILL_NAME
 SKILL_NAME="${SKILL_NAME:-$DEFAULT_SKILL_NAME}"
@@ -110,8 +112,7 @@ Strip the flag from the remaining argument to get the topic keyword.
 
 ## Update Mode (\`-u\` / \`--update\`)
 
-The user has new information about Cloudflare and wants to add or update
-documentation in this repo.
+The user has new information and wants to add or update documentation in this repo.
 
 ### Workflow
 
@@ -161,9 +162,10 @@ fi
 
 echo "  Generated SKILL.md"
 
-# Symlink into global skills directory
+# Symlink into global skills directory.
+# Point at the main-worktree path so the global link survives worktree removal.
 mkdir -p "$GLOBAL_SKILLS_DIR"
-ensure_symlink "$GLOBAL_SKILLS_DIR/$SKILL_NAME" "$SKILL_DIR"
+ensure_symlink "$GLOBAL_SKILLS_DIR/$SKILL_NAME" "$REPO_ROOT/.claude/skills/$SKILL_NAME"
 
 echo ""
 echo "Done! Skill '$SKILL_NAME' is ready."
