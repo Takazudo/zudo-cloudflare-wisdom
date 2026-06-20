@@ -131,6 +131,18 @@ export function HeadWithDefaults({
         />
       )}
       <ColorSchemeProvider cssText={cssText} colorMode={colorMode} />
+      {/* Noto Sans JP — body font; loaded asynchronously (media="print" → onload trick)
+          to avoid blocking first paint. Mirrors the original Astro layout's font
+          loading strategy (src/layouts/doc-layout.astro). */}
+      <link rel="preconnect" href="https://fonts.googleapis.com" />
+      <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
+      <link
+        rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700&display=swap"
+        media="print"
+        // @ts-ignore — onload is a valid HTMLLinkElement attribute at runtime
+        onload="this.media='all'"
+      />
       {/* Pre-paint inline script: restore persisted sidebar width to
           --zd-sidebar-w on :root before first paint, so a reload after
           drag-resizing the sidebar doesn't snap back to the CSS default

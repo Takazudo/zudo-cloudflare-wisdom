@@ -90,7 +90,7 @@ export default function IndexPage(): JSX.Element {
             aria-hidden="true"
           />
           <div>
-            <h1 class="text-heading font-bold mb-vsp-2xs">{settings.siteName}</h1>
+            <h1 class="text-heading font-normal font-futura mb-vsp-2xs">{settings.siteName}</h1>
             <p class="text-muted text-small mb-vsp-sm">{settings.siteDescription}</p>
             <div class="flex items-center justify-center lg:justify-start gap-hsp-md text-small">
               {overview && (
