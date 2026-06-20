@@ -80,3 +80,11 @@ pages/index.tsx
 pages/[locale]/index.tsx
 pages/lib/_doc-content-header.tsx
 pages/lib/_doc-page-shell.tsx
+
+# pages/lib/_head-with-defaults.tsx — Noto Sans JP font loading added.
+# This bilingual site uses Noto Sans JP for body text (Japanese content);
+# the font is loaded asynchronously in the <head> via the media="print" → onload
+# trick. The base template does not ship this font-loading block (it is
+# site-specific typography). Intentional divergence; matches the original
+# Astro layout's font loading strategy (src/layouts/doc-layout.astro).
+pages/lib/_head-with-defaults.tsx
