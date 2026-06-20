@@ -1,4 +1,4 @@
-# Template drift allowlist for zudo-test-wisdom.
+# Template drift allowlist for zudo-cloudflare-wisdom.
 # Generated projects start from create-zudo-doc templates; this file lists
 # intentional divergences so `pnpm check:template-drift` exits 0.
 #
