@@ -20,7 +20,8 @@
     "b4push": "bash scripts/run-b4push.sh",
     "gen:z-index": "node scripts/gen-z-index.mjs",
     "check:z-index": "node scripts/gen-z-index.mjs --check",
-    "setup:doc-skill": "bash scripts/setup-doc-skill.sh"
+    "setup:doc-skill": "bash scripts/setup-doc-skill.sh",
+    "setup:doc-skill-silent": "bash scripts/setup-doc-skill.sh --silent"
   },
   "dependencies": {
     "@takazudo/zfb": "0.1.0-next.51",
