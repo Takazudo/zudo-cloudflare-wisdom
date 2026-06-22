@@ -180,12 +180,15 @@ jobs:
         run: pnpm check:links
 
       - name: Upload site build output
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-${{ github.run_id }}
           path: dist/
           retention-days: 1
           if-no-files-found: error
+          # A re-run reuses github.run_id, but v4 rejects re-uploading an
+          # existing artifact name; overwrite lets manual re-runs succeed.
+          overwrite: true
 
   # ---------------------------------------------------------------------------
   # Job: HTML validate
@@ -214,7 +217,7 @@ jobs:
         run: pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Download dist artifact (built by build-site)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist-${{ github.run_id }}
           path: dist/
@@ -259,12 +262,15 @@ jobs:
             --out-dir doc-history-out
 
       - name: Upload doc history output
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: doc-history-${{ github.run_id }}
           path: doc-history-out/
           retention-days: 1
           if-no-files-found: error
+          # A re-run reuses github.run_id, but v4 rejects re-uploading an
+          # existing artifact name; overwrite lets manual re-runs succeed.
+          overwrite: true
 
   # ---------------------------------------------------------------------------
   # Job 4: Deploy preview and comment on PR
@@ -280,13 +286,13 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Download site build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist-${{ github.run_id }}
           path: dist/
 
       - name: Download doc history artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: doc-history-${{ github.run_id }}
           path: doc-history-out/
