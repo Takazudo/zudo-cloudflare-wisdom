@@ -65,7 +65,7 @@ export function DocContentHeader({
 }: DocContentHeaderProps): JSX.Element {
   return (
     <>
-      <h1 class="text-heading font-bold mb-vsp-xs">{entry.data.title}</h1>
+      <h1 class="text-heading font-normal font-futura mb-vsp-xs">{entry.data.title}</h1>
 
       {/* Build-time date block (Created / Updated / Author).
           doc-metainfo placement — between <h1> and description.

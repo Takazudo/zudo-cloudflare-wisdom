@@ -28,7 +28,9 @@
 # the generated/i18n interaction — not a fixable broken link.
 # Both the claude-md and claude-skills first-child links are emitted (the
 # claude-skills card points at this project's cloudflare-wisdom skill page).
-dist/ja/docs/claude/index.html:791:/ja/docs/claude-md/root
-dist/ja/docs/claude/index.html:791:/ja/docs/claude-skills/cloudflare-wisdom
+# (Line number bumped 791→800 by the zudo-doc 1.x migration — the 1.x layout
+# emits a slightly taller <head>, shifting the CategoryNav cards down.)
+dist/ja/docs/claude/index.html:800:/ja/docs/claude-md/root
+dist/ja/docs/claude/index.html:800:/ja/docs/claude-skills/cloudflare-wisdom
 
 # ----- Absolute Links Bypassing Base Path (0 entries) -------------
