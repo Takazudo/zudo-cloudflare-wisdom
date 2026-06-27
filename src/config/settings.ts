@@ -116,4 +116,9 @@ export const settings = {
     { type: "component", component: "search" },
     { type: "component", component: "language-switcher" },
   ] satisfies HeaderRightItem[] as HeaderRightItem[],
+  // Enable the package-owned route-injection plugin (@takazudo/zudo-doc/plugins/routes):
+  // the 1.x package supplies the docs / 404 / sitemap / robots / tags / versions routes
+  // at build time, so the host no longer ships those page stubs. zudoDocPreset() does NO
+  // defaulting — omitting this field is treated as off (routes would not be injected).
+  packageOwnedRoutes: true,
 };

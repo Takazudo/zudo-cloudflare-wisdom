@@ -227,7 +227,7 @@ export function DocPageShell(props: DocPageShellProps): JSX.Element {
            Wrapping in <div> would make h1/description p children-of-children
            and the flow gap (~24px) would never apply — see #1460. */
         <>
-          <h1 class="text-heading font-bold mb-vsp-xs">{autoIndexLabel}</h1>
+          <h1 class="text-heading font-normal font-futura mb-vsp-xs">{autoIndexLabel}</h1>
 
           {/* Build-time date block — chrome parity (#1461). Threaded in via
               metainfoSlot so each route controls whether it renders. */}
