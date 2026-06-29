@@ -8,7 +8,9 @@
 #
 # Every entry below maps to one of three reasons: a host customization, a
 # feature intentionally left off, or a generated/runtime artifact. Reconciled
-# for the zudo-doc 1.x package-first ("1 package style") baseline.
+# for the zudo-doc 2.0.x "Collapse Wiring Shells" baseline (the per-component
+# chrome shells + pages/_mdx-components.ts are gone; page chrome is wired via
+# pages/lib/_chrome.ts, byte-identical to the template, so it is NOT listed).
 
 # ── Generated / runtime artifact ──────────────────────────────────────────
 # .zfb/ is gitignored; doc-history-meta.json is written at build time by the
@@ -25,7 +27,6 @@ scripts/run-b4push.sh
 # inject feature-specific code at scaffold time. Production has these slots
 # resolved (removed) and the real implementations inlined for this site's
 # enabled features (imageEnlarge, docHistory, etc.).
-pages/_mdx-components.ts
 pages/lib/_body-end-islands.tsx
 src/config/settings-types.ts
 src/styles/global.css
@@ -41,23 +42,14 @@ src/components/doc-history.tsx
 src/components/image-enlarge.tsx
 
 # ── Host customization: brand typography (Futura) ─────────────────────────
-# The page-title <h1> elements carry the `font-futura` utility + `font-normal`
+# The homepage title <h1> elements carry the `font-futura` utility + `font-normal`
 # to restore the pre-zfb site's normal-weight Futura titles (the base template
 # ships `font-bold`). The `--font-futura` token + the header `[data-header-logo]`
-# rule live in the already-allowlisted src/styles/global.css.
+# rule live in the already-allowlisted src/styles/global.css. (The doc-page title
+# h1 now lives in package-owned chrome — its former host shells
+# _doc-content-header / _doc-page-shell were removed in the 2.0.x collapse.)
 pages/index.tsx
 pages/[locale]/index.tsx
-pages/lib/_doc-content-header.tsx
-pages/lib/_doc-page-shell.tsx
-
-# ── Host customization: Noto Sans JP body font ────────────────────────────
-# This bilingual (EN+JA) site loads Noto Sans JP for body text via the async
-# media="print" → onload trick in the <head>. The 1.x base template ships a thin
-# package-factory stub (createHeadWithDefaults) that does not load this font, so
-# the host keeps a full hand-rolled _head-with-defaults.tsx (built on the public
-# @takazudo/zudo-doc head / theme / sidebar-resizer subpaths) to retain the font.
-# Mirrors the original Astro layout's font loading strategy.
-pages/lib/_head-with-defaults.tsx
 
 # ── Feature intentionally OFF: docTags / tagGovernance ────────────────────
 # docTags is `false` and tagGovernance is `off` in settings.ts. The docTags /
