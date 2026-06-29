@@ -306,6 +306,18 @@ body {
   }
 }
 
+/* ── Brand typography ──
+ * Futura on the header site name. Page-title <h1> elements carry the
+ * `font-futura` utility directly in the page components; the header site-name
+ * anchor is rendered by the @takazudo/zudo-doc package (no className hook), so
+ * it is targeted here via its stable `data-header-logo` attribute. Normal
+ * weight matches the pre-zfb site (the package defaults it to font-bold).
+ * Unlayered, so it overrides Tailwind's layered `font-bold` utility. */
+[data-header-logo] {
+  font-family: var(--font-futura);
+  font-weight: var(--font-weight-normal);
+}
+
 /* ========================================
  * Code block buttons (copy + word wrap)
  * ======================================== */
