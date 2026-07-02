@@ -1,0 +1,144 @@
+---
+title: Deploy from Zero
+description: Provisioning a repo-based Worker from scratch -- the dashboard-wizard trap, wrangler deploy, .assetsignore, and CI token permissions
+sidebar_position: 6
+---
+
+Standing up a Worker from an existing repo on a fresh Cloudflare account looks straightforward, but the from-zero path is littered with gotchas that aren't captured in one place anywhere. This page walks the lifecycle in order -- create and deploy the Worker, provision bindings, ship framework build output, then automate deploys with CI -- and flags the trap at each step.
+
+The notes come from provisioning a two-Worker project (an app Worker + a separate docs Worker) from zero. Everything here is general Workers knowledge, not specific to that stack.
+
+## Don't Create the Worker from the Dashboard
+
+This is the #1 trap. When your code already lives in a repo, people instinctively reach for the dashboard's **"Create a Worker" wizard** ("Ship something new" -- import a git repo, pick a template, Hello World, or upload). For a repo-based Worker, every one of those paths is wrong:
+
+- The template / Hello World / upload paths create a **separate blank Worker** that has nothing to do with your repo.
+- The "import a git repo" path wires up a **competing Cloudflare git-build pipeline** that fights the CI you actually want to run.
+
+The right path is `wrangler deploy` from the repo. It is **create-and-update in one**:
+
+```bash
+npx wrangler deploy
+```
+
+- **First deploy**: the Worker is born, named after the `name` field in your wrangler config. No dashboard step needed -- deploying a name that doesn't exist yet *is* how you create the Worker.
+- **Later deploys**: the same command updates it.
+
+:::warning[Skip the dashboard wizard entirely]
+There is no "register the Worker first, then connect the repo" step. The dashboard wizard only produces orphan Workers or a competing build pipeline. `wrangler deploy` from the repo is the whole provisioning story.
+:::
+
+Best long-term setup: let CI run `wrangler deploy` on push to `main`, so the committed config is the single source of truth. See [Production Deploy](../cicd/production-deploy.mdx) for the workflow.
+
+## workers.dev URLs Have a Fixed Format
+
+Every Worker gets a free URL of exactly this shape:
+
+```
+<worker-name>.<account-subdomain>.workers.dev
+```
+
+You cannot fabricate arbitrary subdomains of it -- `doc.app.<account-subdomain>.workers.dev` is not a thing. The way to get distinct URLs for an app and its docs is simply **two Workers**: each gets its own `<name>.<account-subdomain>.workers.dev` automatically.
+
+Pretty subdomains like `app.example.com` / `doc.example.com` require a real **custom domain** -- a zone in your Cloudflare account -- wired up via `routes` in the wrangler config (or the dashboard):
+
+```jsonc
+{
+  "routes": [{ "pattern": "app.example.com", "custom_domain": true }]
+}
+```
+
+## Decline Wrangler's "Add It on Your Behalf?" Prompt
+
+Provisioning storage from the CLI (`wrangler d1 create`, `wrangler kv namespace create`) ends with an interactive offer:
+
+```
+Would you like Wrangler to add it on your behalf?
+```
+
+**Decline (N).** Saying yes does two bad things to your wrangler config:
+
+- It **appends a duplicate binding entry under the wrong binding name**, leaving the binding your code actually uses (`DB`, `STATE`, ...) stuck on its placeholder id.
+- It **reformats the whole file** -- 2-space indent becomes tabs, arrays get expanded, the trailing newline is stripped.
+
+Instead, copy the `id` / `database_id` that the command printed and paste it into the **existing** binding by hand:
+
+```jsonc
+{
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "my-app-db",
+      "database_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    }
+  ]
+}
+```
+
+The follow-up prompt "For local dev, connect to the remote resource?" should also be **N** -- local development against local storage is what you want by default.
+
+## Adapters That Emit `_worker.js` into the Assets Dir
+
+Framework adapters (e.g. `@takazudo/zfb-adapter-cloudflare`) often write the Worker entry `dist/_worker.js` into the *same* `dist/` directory that is served as static assets. `wrangler deploy` then hard-errors:
+
+```
+Uploading a Pages _worker.js file as an asset
+```
+
+The fix is a `.assetsignore` file at the **asset-directory root as Wrangler sees it**, listing the Worker entry and any statically-imported server modules that land alongside the assets:
+
+```
+_worker.js
+_zfb_inner.mjs
+```
+
+If the framework copies a `public/` directory into `dist/` on every build, put `.assetsignore` in `public/` -- it lands in the deployed assets root automatically, so the fix is durable for both local deploys and CI (instead of being wiped by the next build).
+
+:::info[Only adapter-in-assets-dir builds hit this]
+An app Worker whose `main` lives **outside** the assets directory never triggers this error. It's specific to adapters that emit the server entry into the directory registered as `assets.directory`.
+:::
+
+## CI Token: "Edit Cloudflare Workers" Is Not Enough
+
+For CI deploys you create an API token, and the dashboard offers an **"Edit Cloudflare Workers"** token template. The trap: that template does **not** include **D1:Edit**. Without it, `wrangler d1 migrations apply --remote` fails with an authorization error (`code: 7403`, *given account is not valid or is not authorized to access this service*).
+
+Diagnostic rule of thumb (exact codes can drift -- treat the message as the signal):
+
+- **Authorization error on a D1 command** (e.g. `7403`) -> the token is missing a D1 permission.
+- **"Account not found"-style error** (e.g. `7404`) -> the account id is wrong, not the token.
+
+A working permission set for a Workers + D1 + KV + Workers AI stack (trim to what you actually use):
+
+| Scope | Permission |
+| --- | --- |
+| Account -- Workers Scripts | Edit |
+| Account -- D1 | Edit |
+| Account -- Workers KV Storage | Edit |
+| Account -- Workers AI | Read |
+| Account -- Account Settings | Read |
+| Zone -- Workers Routes | Edit (only when using custom domains) |
+
+Store the token and account id as GitHub Actions secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
+
+## CI Deploys from the Committed Config
+
+CI redeploys on push to `main` using the **committed** `wrangler.jsonc` / `wrangler.toml` -- editing the file locally is not enough. If the committed config still contains `REPLACE_WITH_*` placeholders, CI keeps failing no matter how correct your local file is.
+
+:::warning[Commit the real ids -- but never secrets]
+What belongs in the committed config: binding ids (D1 `database_id`, KV namespace `id`), public `vars` (e.g. a Firebase Web API key -- it's public by design), the Worker `name`, the `compatibility_date`.
+
+What must never be committed: real secrets, API tokens, environment-specific credentials. Those go through `wrangler secret put` or GitHub Actions secrets.
+:::
+
+## Known-Good Checklist
+
+Before calling the provisioning done, verify:
+
+- [ ] The Worker was created by `wrangler deploy` (no orphan dashboard Worker, no competing git-build pipeline)
+- [ ] `wrangler.jsonc` / `wrangler.toml` has the final Worker `name` and real binding ids -- no `REPLACE_WITH_*` placeholders -- and is **committed**
+- [ ] `.assetsignore` sits in the emitted assets root (via `public/` if the framework copies it into the build output)
+- [ ] D1 migrations run with the same `CLOUDFLARE_ACCOUNT_ID` the deploy uses
+- [ ] The CI token includes **D1:Edit** (and KV / AI / Routes permissions as needed), not just the "Edit Cloudflare Workers" template
+- [ ] Secrets are set via `wrangler secret put` / GitHub secrets -- none of them live in the committed config
+
+Related pages: [Wrangler Config](./wrangler-config.mdx) for the config format, [Workers Static Assets](./static-assets.mdx) for the assets model, and [Production Deploy](../cicd/production-deploy.mdx) for the CI workflow.

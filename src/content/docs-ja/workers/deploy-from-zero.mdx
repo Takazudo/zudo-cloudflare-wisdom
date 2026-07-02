@@ -1,0 +1,144 @@
+---
+title: ゼロからのデプロイ
+description: リポジトリベースの Worker をゼロからプロビジョニングする -- ダッシュボードウィザードの罠、wrangler deploy、.assetsignore、CI トークン権限
+sidebar_position: 6
+---
+
+既存のリポジトリから新しい Cloudflare アカウントに Worker を立ち上げるのは一見単純だが、ゼロから始める道のりには、どこにもまとまって書かれていない落とし穴が点在している。このページではライフサイクルを順に辿り -- Worker の作成とデプロイ、バインディングのプロビジョニング、フレームワークのビルド出力の配信、そして CI によるデプロイ自動化 -- 各ステップの罠を指摘する。
+
+このメモは 2 つの Worker（アプリ Worker + 別個のドキュメント Worker）をゼロからプロビジョニングした経験に基づく。内容はすべて一般的な Workers の知識であり、特定のスタック固有のものではない。
+
+## ダッシュボードから Worker を作らない
+
+これが最大の罠。コードがすでにリポジトリにある場合でも、人は反射的にダッシュボードの **「Create a Worker」ウィザード**（"Ship something new" -- git リポジトリのインポート、テンプレート、Hello World、アップロード）に手を伸ばす。リポジトリベースの Worker にとって、これらの経路はすべて間違いだ：
+
+- テンプレート / Hello World / アップロードの経路は、リポジトリとは無関係の**空の別 Worker** を作ってしまう。
+- 「git リポジトリのインポート」経路は、本来動かしたい CI と競合する **Cloudflare の git ビルドパイプライン**を配線してしまう。
+
+正しい経路はリポジトリからの `wrangler deploy`。これは**作成と更新が一体**になっている：
+
+```bash
+npx wrangler deploy
+```
+
+- **初回デプロイ**：Worker が誕生する。名前は wrangler 設定の `name` フィールドから取られる。ダッシュボードでの手順は不要 -- まだ存在しない名前をデプロイすること*こそが* Worker の作成方法だ。
+- **以降のデプロイ**：同じコマンドが更新になる。
+
+:::warning[ダッシュボードウィザードは完全にスキップする]
+「先に Worker を登録してからリポジトリを接続する」というステップは存在しない。ダッシュボードウィザードが生むのは孤児 Worker か競合するビルドパイプラインだけ。リポジトリからの `wrangler deploy` がプロビジョニングのすべてだ。
+:::
+
+長期的なベストセットアップは、`main` への push で CI に `wrangler deploy` を実行させること。コミット済みの設定が唯一の真実になる。ワークフローは[本番デプロイ](../cicd/production-deploy.mdx)を参照。
+
+## workers.dev の URL フォーマットは固定
+
+すべての Worker には、正確にこの形の無料 URL が付与される：
+
+```
+<worker-name>.<account-subdomain>.workers.dev
+```
+
+その配下に任意のサブドメインをでっち上げることはできない -- `doc.app.<account-subdomain>.workers.dev` のような URL は存在しえない。アプリとドキュメントに別々の URL を持たせる方法は、単純に **Worker を 2 つ**にすること：それぞれが自動的に自分の `<name>.<account-subdomain>.workers.dev` を得る。
+
+`app.example.com` / `doc.example.com` のようなきれいなサブドメインには、本物の**カスタムドメイン** -- アカウント内のゾーン -- が必要で、wrangler 設定の `routes`（またはダッシュボード）で配線する：
+
+```jsonc
+{
+  "routes": [{ "pattern": "app.example.com", "custom_domain": true }]
+}
+```
+
+## Wrangler の「Add It on Your Behalf?」プロンプトは断る
+
+CLI からのストレージのプロビジョニング（`wrangler d1 create`、`wrangler kv namespace create`）は、対話的な申し出で終わる：
+
+```
+Would you like Wrangler to add it on your behalf?
+```
+
+**断る（N）。** yes と答えると、wrangler 設定に対して 2 つの悪いことが起きる：
+
+- **間違ったバインディング名で重複したバインディングエントリを追記**し、コードが実際に使うバインディング（`DB`、`STATE` など）はプレースホルダーの id のまま放置される。
+- **ファイル全体を再フォーマット**する -- 2 スペースインデントがタブになり、配列が展開され、末尾の改行が削られる。
+
+代わりに、コマンドが出力した `id` / `database_id` をコピーして、**既存の**バインディングに手で貼り付ける：
+
+```jsonc
+{
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "my-app-db",
+      "database_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    }
+  ]
+}
+```
+
+続くプロンプト「For local dev, connect to the remote resource?」も **N** にする -- ローカル開発はローカルストレージに対して行うのがデフォルトとして正しい。
+
+## アセットディレクトリに `_worker.js` を出力するアダプター
+
+フレームワークのアダプター（例：`@takazudo/zfb-adapter-cloudflare`）は、Worker エントリ `dist/_worker.js` を、静的アセットとして配信されるのと*同じ* `dist/` ディレクトリに書き出すことがある。すると `wrangler deploy` はハードエラーになる：
+
+```
+Uploading a Pages _worker.js file as an asset
+```
+
+修正は、**Wrangler から見たアセットディレクトリのルート**に `.assetsignore` ファイルを置き、Worker エントリと、アセットと同じ場所に出力される静的インポートされたサーバーモジュールを列挙すること：
+
+```
+_worker.js
+_zfb_inner.mjs
+```
+
+フレームワークがビルドのたびに `public/` ディレクトリを `dist/` にコピーするなら、`.assetsignore` は `public/` に置く -- 自動的にデプロイされるアセットルートに配置されるので、ローカルデプロイと CI の両方で修正が永続する（次のビルドで消されることがない）。
+
+:::info[これに当たるのはアダプターがアセットディレクトリに出力するビルドだけ]
+`main` がアセットディレクトリの**外**にあるアプリ Worker は、このエラーを決して踏まない。`assets.directory` として登録されたディレクトリにサーバーエントリを出力するアダプター特有の問題だ。
+:::
+
+## CI トークン：「Edit Cloudflare Workers」では足りない
+
+CI デプロイ用に API トークンを作る際、ダッシュボードは **「Edit Cloudflare Workers」** トークンテンプレートを提示する。罠：このテンプレートには **D1:Edit** が含まれて**いない**。それがないと `wrangler d1 migrations apply --remote` が認可エラーで失敗する（`code: 7403`、*given account is not valid or is not authorized to access this service*）。
+
+診断の経験則（正確なコードは変わりうる -- シグナルとして扱うのはメッセージの方）：
+
+- **D1 コマンドでの認可エラー**（例：`7403`）→ トークンに D1 権限が欠けている。
+- **「アカウントが見つからない」系のエラー**（例：`7404`）→ 間違っているのはアカウント id であって、トークンではない。
+
+Workers + D1 + KV + Workers AI スタックで動作する権限セット（実際に使うものに絞ってよい）：
+
+| Scope | Permission |
+| --- | --- |
+| Account -- Workers Scripts | Edit |
+| Account -- D1 | Edit |
+| Account -- Workers KV Storage | Edit |
+| Account -- Workers AI | Read |
+| Account -- Account Settings | Read |
+| Zone -- Workers Routes | Edit（カスタムドメイン使用時のみ） |
+
+トークンとアカウント id は GitHub Actions のシークレット `CLOUDFLARE_API_TOKEN` と `CLOUDFLARE_ACCOUNT_ID` として保存する。
+
+## CI はコミット済みの設定からデプロイする
+
+CI は `main` への push で、**コミット済み**の `wrangler.jsonc` / `wrangler.toml` を使って再デプロイする -- ファイルをローカルで編集するだけでは足りない。コミット済みの設定に `REPLACE_WITH_*` プレースホルダーが残っていれば、ローカルのファイルがどれだけ正しくても CI は失敗し続ける。
+
+:::warning[本物の id はコミットする -- ただしシークレットは絶対にしない]
+コミット済み設定に属するもの：バインディング id（D1 の `database_id`、KV ネームスペースの `id`）、公開してよい `vars`（例：Firebase Web API キー -- 設計上公開情報）、Worker の `name`、`compatibility_date`。
+
+絶対にコミットしてはいけないもの：本物のシークレット、API トークン、環境固有のクレデンシャル。これらは `wrangler secret put` か GitHub Actions のシークレットを通す。
+:::
+
+## 動作確認チェックリスト
+
+プロビジョニング完了と呼ぶ前に確認する：
+
+- [ ] Worker は `wrangler deploy` で作成された（孤児のダッシュボード Worker も、競合する git ビルドパイプラインもない）
+- [ ] `wrangler.jsonc` / `wrangler.toml` に最終的な Worker `name` と本物のバインディング id が入っていて -- `REPLACE_WITH_*` プレースホルダーがなく -- **コミット済み**である
+- [ ] `.assetsignore` が出力されるアセットルートに存在する（フレームワークがビルド出力にコピーするなら `public/` 経由で）
+- [ ] D1 マイグレーションがデプロイと同じ `CLOUDFLARE_ACCOUNT_ID` で実行される
+- [ ] CI トークンに **D1:Edit**（および必要に応じて KV / AI / Routes 権限）が含まれている -- 「Edit Cloudflare Workers」テンプレートのままではない
+- [ ] シークレットは `wrangler secret put` / GitHub シークレットで設定されている -- コミット済み設定の中には 1 つもない
+
+関連ページ：設定フォーマットは [Wrangler 設定](./wrangler-config.mdx)、アセットモデルは [Workers Static Assets](./static-assets.mdx)、CI ワークフローは[本番デプロイ](../cicd/production-deploy.mdx)。
