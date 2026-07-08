@@ -192,6 +192,7 @@ const stream = new ReadableStream<Uint8Array>({
       controller.enqueue(encodeSseEvent(event, data));
     };
 
+    const aiStream = await env.AI.run(MODEL_ID, { messages, stream: true });
     const reader = aiStream.getReader();
     while (true) {
       if (aborter.signal.aborted) break; // stop reading from Workers AI
