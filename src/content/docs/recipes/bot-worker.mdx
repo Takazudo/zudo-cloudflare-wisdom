@@ -6,7 +6,9 @@ sidebar_position: 4
 
 ## Architecture
 
-A bot that receives webhooks (e.g., from Slack), processes them with an external AI API, and replies -- all running on a Cloudflare Worker with KV for state.
+A bot that receives webhooks (e.g., from Slack), processes them with an
+external AI API, and replies -- all running on a Cloudflare Worker with KV for
+short-lived bot-thread state.
 
 ```mermaid
 sequenceDiagram
@@ -20,10 +22,10 @@ sequenceDiagram
   W-->>S: 200 OK (immediate)
   Note over W: ctx.waitUntil() handles the rest
   W->>KV: Check rate limit
-  W->>KV: Load conversation history
+  W->>KV: Load short-lived thread state
   W->>AI: Send message + tools
   AI-->>W: Response (may include tool calls)
-  W->>KV: Save conversation history
+  W->>KV: Save short-lived thread state
   W->>S: Post reply in thread
 ```
 
@@ -31,7 +33,13 @@ Key design decisions:
 
 - **Immediate response**: Return `200 OK` before doing any work. Slack requires a response within 3 seconds.
 - **Deferred processing**: Use `ctx.waitUntil()` for the actual processing that may take 10+ seconds.
-- **KV for state**: Conversation history and rate limits stored in KV with TTL-based expiration.
+- **KV for TTL state**: Rate limits and small bot-thread state are stored in KV
+  with explicit expiration.
+
+For durable web chat history, browser request boundaries, prompt assembly, and
+RAG, use [Chat Memory and RAG](../ai/chat-memory-rag.mdx). This recipe keeps
+state server-side in the Worker and does not ask the browser or webhook client to
+own chat history.
 
 ## Wrangler Config
 
@@ -196,39 +204,45 @@ async function checkRateLimit(
 KV is eventually consistent. Under high concurrency, a few extra requests may slip through. This is acceptable for bot rate limiting -- use [Durable Objects](../workers/durable-objects.mdx) if you need precise counting.
 :::
 
-## Conversation State in KV
+## Short-Lived Bot Thread State in KV
 
-Store multi-turn conversation history with automatic expiration:
+Store a small bot-thread state snapshot with automatic expiration. This is useful
+for webhook replies that need recent turns, but it is not a durable chat history
+or audit log.
 
 ```typescript
-const CONVERSATION_TTL = 86400; // 24 hours
+const THREAD_STATE_TTL = 86400; // 24 hours
 
-interface ConversationHistory {
+interface BotThreadState {
   messages: Array<{ role: string; content: string }>;
 }
 
 async function loadHistory(
   env: Env,
   threadId: string,
-): Promise<ConversationHistory> {
-  const key = `conv:${threadId}`;
-  const stored = await env.KV.get<ConversationHistory>(key, "json");
+): Promise<BotThreadState> {
+  const key = `bot-thread:${threadId}`;
+  const stored = await env.KV.get<BotThreadState>(key, "json");
   return stored ?? { messages: [] };
 }
 
 async function saveHistory(
   env: Env,
   threadId: string,
-  history: ConversationHistory,
+  history: BotThreadState,
 ): Promise<void> {
-  const key = `conv:${threadId}`;
+  const key = `bot-thread:${threadId}`;
   await env.KV.put(key, JSON.stringify(history), {
-    expirationTtl: CONVERSATION_TTL,
+    expirationTtl: THREAD_STATE_TTL,
   });
 }
 ```
 
-Use `"json"` type parameter with `KV.get()` for automatic deserialization. The TTL ensures old conversations are cleaned up automatically.
+Use `"json"` type parameter with `KV.get()` for automatic deserialization. The
+TTL ensures old bot-thread snapshots are cleaned up automatically. If you need
+durable multi-user chat, authorization-aware reads, prompt assembly, or RAG over
+past messages, model the canonical history in D1/R2/Vectorize as described in
+[Chat Memory and RAG](../ai/chat-memory-rag.mdx).
 
 ## AI Tool Use Loop
 
@@ -319,3 +333,8 @@ npx wrangler@4 deploy
 ```
 
 For monorepo setups with path-triggered CI, see [Standalone Workers](../workers/standalone-workers.mdx#path-triggered-deploys).
+
+## Related
+
+- [Chat Memory and RAG](../ai/chat-memory-rag.mdx)
+- [Workers AI Streaming SSE Proxy](./workers-ai-streaming.mdx)

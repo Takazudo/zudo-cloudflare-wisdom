@@ -81,9 +81,17 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
 `context.waitUntil()` lets you perform async work after the response is sent. Use it for logging, analytics, and other non-critical writes.
 :::
 
-## Pattern: Conversation State
+## Pattern: Short-Lived Conversation State
 
-Store multi-turn conversation history per thread with automatic TTL-based cleanup:
+Store small bot, session, or cache state per thread with automatic TTL-based
+cleanup:
+
+:::warning[Do not use KV as the default durable chat database]
+KV is fine for short-lived TTL bot/session/cache state. For durable chat history,
+authorization-aware reads, and auditability, [D1](./d1.mdx) is usually a better
+default. See [Chat Memory and RAG](../ai/chat-memory-rag.mdx) for the broader
+chat storage architecture.
+:::
 
 ```typescript
 const CONVERSATION_TTL = 86400; // 24 hours
@@ -110,7 +118,7 @@ Key design points:
 
 - Use a structured key like `conv:{threadId}` for easy identification
 - The `"json"` type parameter on `get()` handles deserialization automatically
-- TTL ensures conversations don't accumulate forever
+- TTL keeps this pattern focused on short-lived state instead of durable history
 
 ## Pattern: Rate Limiting
 

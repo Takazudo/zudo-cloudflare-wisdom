@@ -18,6 +18,13 @@ production concerns that the basic "call `env.AI.run`" examples skip:
 
 It is grounded in the `POST /api/v1/chat` handler from the zudo-text sync server.
 
+:::note[Before you choose a model]
+This page focuses on stream handling. For model selection, dated pricing notes,
+and when to use JSON Mode, read [Workers AI Models and Pricing](../ai/workers-ai-models-pricing.mdx).
+For durable web chat history, prompt assembly, and RAG architecture, read
+[Chat Memory and RAG](../ai/chat-memory-rag.mdx).
+:::
+
 ## Binding the AI model
 
 Workers AI is exposed through an `[ai]` binding in `wrangler.toml`:
@@ -51,9 +58,9 @@ Pass the model ID in `@cf/...` form and set `stream: true`. With streaming on,
 `run()` resolves to a `ReadableStream` rather than a finished JSON object:
 
 ```typescript
-const KIMI_MODEL = "@cf/moonshotai/kimi-k2.6";
+const MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
-const kimiStream = await env.AI.run(KIMI_MODEL, {
+const aiStream = await env.AI.run(MODEL_ID, {
   messages,
   stream: true,
 });
@@ -61,6 +68,13 @@ const kimiStream = await env.AI.run(KIMI_MODEL, {
 
 The stream emits SSE-style frames: `data: {...}\n\n` lines, ending with a
 terminal `data: [DONE]\n\n`.
+
+:::warning[Keep JSON Mode separate from streaming]
+JSON Mode is for non-streaming structured calls such as extraction,
+classification, or routing. Do not combine `response_format` with this streaming
+SSE proxy; make a separate non-streaming `env.AI.run()` call when you need a
+schema-constrained response.
+:::
 
 ## Re-framing the AI stream into SSE
 
@@ -84,8 +98,8 @@ const stream = new ReadableStream<Uint8Array>({
       controller.enqueue(encodeSseEvent(event, data));
     };
 
-    const kimiStream = await env.AI.run(KIMI_MODEL, { messages, stream: true });
-    const reader = kimiStream.getReader();
+    const aiStream = await env.AI.run(MODEL_ID, { messages, stream: true });
+    const reader = aiStream.getReader();
     const dec = new TextDecoder();
     let buf = "";
     let index = 0;
@@ -178,7 +192,7 @@ const stream = new ReadableStream<Uint8Array>({
       controller.enqueue(encodeSseEvent(event, data));
     };
 
-    const reader = kimiStream.getReader();
+    const reader = aiStream.getReader();
     while (true) {
       if (aborter.signal.aborted) break; // stop reading from Workers AI
       const { value, done } = await reader.read();
@@ -241,5 +255,7 @@ Even though the value lives in the dashboard, leave a commented note in
 
 ## Related
 
+- [Workers AI Models and Pricing](../ai/workers-ai-models-pricing.mdx)
+- [Chat Memory and RAG](../ai/chat-memory-rag.mdx)
 - [Standalone bot Worker](./bot-worker.mdx)
 - [Auth with Pages Functions](./auth-functions.mdx)
