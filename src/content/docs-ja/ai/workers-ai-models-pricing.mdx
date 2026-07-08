@@ -1,0 +1,159 @@
+---
+title: Workers AI のモデルと料金
+description: Workers AI のモデル選定、バインディング利用、費用計算の実務メモ
+sidebar_position: 1
+---
+
+Workers AI は、Worker コードのすぐ近くで使える Cloudflare ホストの推論経路である。
+Cloudflare ホストのモデルでアプリケーション要件を満たせ、呼び出しを Worker のリクエスト
+処理に置きたい場合に使う。外部プロバイダー、プロバイダー横断の可観測性、複数
+プロバイダーにまたがる制御が必要になったら AI Gateway を経由する。
+
+## バインディングの基本
+
+Workers AI は `AI` バインディングとして Worker に公開する。
+
+```jsonc
+{
+  "ai": {
+    "binding": "AI"
+  }
+}
+```
+
+そのうえで `env.AI.run(modelId, input)` によりモデルを呼び出す。`input` の形はモデルに
+よって異なるが、テキスト生成では通常 `messages` を使う。
+
+```typescript
+export interface Env {
+  AI: Ai;
+}
+
+const modelId = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+
+export default {
+  async fetch(_request, env): Promise<Response> {
+    const input = {
+      messages: [{ role: "user", content: "Summarize Workers AI in one sentence." }],
+    };
+
+    const result = await env.AI.run(modelId, input);
+    return Response.json(result);
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+ローカル開発で実際のモデル呼び出しを確認する場合は、remote Workers 実行を使う。
+`wrangler dev` の中にローカル GPU 推論が隠れているわけではない。
+
+## モデルカテゴリ
+
+モデルカタログを長い一覧として扱わない。まずタスクで選び、その品質基準を満たす最小の
+モデルを選ぶ。
+
+- **Text Generation**: チャット、要約、抽出、コード、ツール利用、構造化された判断。
+- **Text Embeddings**: テキストをベクトルに変換し、Vectorize、セマンティック検索、推薦、
+  重複排除、RAG に使う。
+- **Text-to-Image**: プロンプトや画像参照から画像を生成または編集する。
+- **Image-to-Text / vision**: 画像へのキャプション付け、スクリーンショットや写真への質問、
+  画像入力の分類を行う。
+- **Automatic Speech Recognition**: 音声を文字起こしし、音声エージェントの入力を準備する。
+- **Text-to-Speech**: アプリケーションのテキストを生成音声に変換する。
+- **Text Classification / reranking**: 感情、安全性、関連度スコア、クエリと文書の再ランキング。
+- **Translation**: 対応する言語ペア間でテキストを翻訳する。
+
+## 実用的なテキスト生成候補
+
+2026-07-08 に公式 Workers AI モデルページと料金ページで確認した。これは短い出発点であり、
+ランキングでも完全なカタログでもない。本番の費用前提を固定する前に、必ず公式ドキュメントを
+再確認する。
+
+| Model | Practical fit | Input $/M | Cached input $/M | Output $/M |
+|---|---|---:|---:|---:|
+| [`@cf/meta/llama-3.3-70b-instruct-fp8-fast`](https://developers.cloudflare.com/workers-ai/models/llama-3.3-70b-instruct-fp8-fast/) | High-quality structured judgement/summarization | $0.293 | n/a | $2.253 |
+| [`@cf/qwen/qwen3-30b-a3b-fp8`](https://developers.cloudflare.com/workers-ai/models/qwen3-30b-a3b-fp8/) | Cheaper multilingual/reasoning-capable candidate | $0.051 | n/a | $0.335 |
+| [`@cf/openai/gpt-oss-120b`](https://developers.cloudflare.com/workers-ai/models/gpt-oss-120b/) | Strong reasoning/agentic candidate | $0.350 | n/a | $0.750 |
+| [`@cf/google/gemma-4-26b-a4b-it`](https://developers.cloudflare.com/workers-ai/models/gemma-4-26b-a4b-it/) | Long-context, cheaper-output candidate | $0.100 | n/a | $0.300 |
+| [`@cf/moonshotai/kimi-k2.6`](https://developers.cloudflare.com/workers-ai/models/kimi-k2.6/) | Frontier/agentic model; use deliberately, not casual default | $0.950 | $0.160 | $4.000 |
+
+実務上のデフォルトは、たいてい最大モデルではない。まず対象タスクに対して安い候補から始め、
+失敗を測定し、より強い推論、長いコンテキスト、ツール利用、vision が必要なリクエストだけを
+上位モデルへ上げる。
+
+## 費用計算
+
+Cloudflare は Workers AI を Neurons で課金する。料金ページには通常の LLM 費用計算でモデルを
+比較しやすいよう、トークン価格も等価な見方として表示されている。
+
+テキスト生成の見積もりには次を使う。
+
+```text
+input_tokens / 1_000_000 * input_price + output_tokens / 1_000_000 * output_price
+```
+
+たとえば、あるモデルが入力 100 万トークンあたり `$0.051`、出力 100 万トークンあたり
+`$0.335` で、リクエストが `20_000` 入力トークンと `2_000` 出力トークンを使う場合、
+おおよそ次のようになる。
+
+```text
+20_000 / 1_000_000 * 0.051 + 2_000 / 1_000_000 * 0.335
+```
+
+このトークン表示は計画用である。請求されるバックエンド単位は引き続き Neurons である。
+Workers Free と Workers Paid には Workers AI が含まれ、日次の無料割り当ては `10,000`
+Neurons/day である。Workers Paid では、その割り当てを超えた利用が現在の neuron レートで
+課金される。2026-07-08 に確認した時点では、そのレートは `$0.011 / 1,000` Neurons だった。
+価格とモデル提供状況は変わるため、コピーした価格は長期的な定数ではなく、日付付きメモとして
+扱う。
+
+## 判断出力の JSON Mode
+
+分類、抽出、モデレーション、ルーティングなど、自動処理につながる判断出力では、対応モデルの
+JSON Mode を優先する。`response_format` に JSON Schema を渡し、スキーマは狭く保ち、返ってきた
+オブジェクトは自分のコードでも検証してから利用する。
+
+```typescript
+const response = await env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
+  messages: [
+    {
+      role: "user",
+      content: "Classify this support ticket: I cannot log in after resetting my password.",
+    },
+  ],
+  response_format: {
+    type: "json_schema",
+    json_schema: {
+      type: "object",
+      properties: {
+        label: { type: "string", enum: ["billing", "auth", "bug", "other"] },
+        confidence: { type: "number" },
+        rationale: { type: "string" },
+      },
+      required: ["label", "confidence", "rationale"],
+    },
+  },
+});
+```
+
+スキーマ失敗は通常の実行時ケースとして扱う。要求されたスキーマを満たせない場合、Workers AI は
+`JSON Mode couldn't be met` を返すことがあるため、リトライ、フォールバック、人間レビュー状態の
+いずれかへ進める。JSON Mode は現在ストリーミングに対応していない。
+
+## AI Gateway を足す場面
+
+Cloudflare ホストのモデルと単純なリクエスト処理だけで十分なら、Workers AI バインディングを
+直接使う。次のいずれかが必要になったら AI Gateway を追加する。
+
+- OpenAI、Anthropic、Google AI Studio、Google Vertex AI、Azure OpenAI、Amazon Bedrock、
+  Deepgram などの対応済み外部プロバイダー。
+- プロバイダーの可観測性: ログ、分析、カスタムメタデータ、費用追跡。
+- プロバイダー横断の制御: キャッシュ、レート制限、フォールバック、ルーティング、ポリシー。
+- Worker アーキテクチャの残りを動かさずに、モデルプロバイダーを比較または切り替えるための
+  共通の場所。
+
+## 再確認する公式ドキュメント
+
+- [Workers AI Models](https://developers.cloudflare.com/workers-ai/models/)
+- [Workers AI Pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)
+- [Workers AI JSON Mode](https://developers.cloudflare.com/workers-ai/features/json-mode/)
+- [AI Gateway providers](https://developers.cloudflare.com/ai-gateway/usage/providers/)

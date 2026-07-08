@@ -6,7 +6,8 @@ sidebar_position: 4
 
 ## アーキテクチャ
 
-Webhook（Slack など）を受信し、外部 AI API で処理して返信するボット。Cloudflare Worker 上で動作し、KV で状態を管理する。
+Webhook（Slack など）を受信し、外部 AI API で処理して返信するボット。Cloudflare Worker 上で
+動作し、KV には短命な bot スレッド状態を保存する。
 
 ```mermaid
 sequenceDiagram
@@ -20,10 +21,10 @@ sequenceDiagram
   W-->>S: 200 OK (immediate)
   Note over W: ctx.waitUntil() handles the rest
   W->>KV: Check rate limit
-  W->>KV: Load conversation history
+  W->>KV: Load short-lived thread state
   W->>AI: Send message + tools
   AI-->>W: Response (may include tool calls)
-  W->>KV: Save conversation history
+  W->>KV: Save short-lived thread state
   W->>S: Post reply in thread
 ```
 
@@ -31,7 +32,12 @@ sequenceDiagram
 
 - **即時レスポンス**: 処理を始める前に `200 OK` を返す。Slack は 3 秒以内のレスポンスを要求する。
 - **遅延処理**: `ctx.waitUntil()` で 10 秒以上かかる実際の処理を実行する。
-- **KV で状態管理**: 会話履歴とレート制限を TTL 付きで KV に保存。
+- **TTL 付き状態を KV に保存**: レート制限と小さな bot スレッド状態を、明示的な有効期限付きで
+  KV に保存する。
+
+永続的な Web チャット履歴、ブラウザとのリクエスト境界、プロンプト組み立て、RAG については
+[チャットメモリと RAG](../ai/chat-memory-rag.mdx) を使ってください。このレシピでは状態を
+Worker 側に置き、ブラウザや Webhook クライアントにチャット履歴を所有させません。
 
 ## Wrangler 設定
 
@@ -196,39 +202,44 @@ async function checkRateLimit(
 KV は結果整合性。高い同時実行数では、数件の余分なリクエストが通過する可能性がある。ボットのレート制限としては許容範囲だが、正確なカウントが必要な場合は [Durable Objects](../workers/durable-objects.mdx) を使う。
 :::
 
-## KV での会話状態管理
+## KV での短命な bot スレッド状態
 
-自動有効期限付きのマルチターン会話履歴の保存：
+自動有効期限付きの小さな bot スレッド状態スナップショットを保存する。これは直近ターンが必要な
+Webhook 返信には有用だが、永続的なチャット履歴や監査ログではない。
 
 ```typescript
-const CONVERSATION_TTL = 86400; // 24 時間
+const THREAD_STATE_TTL = 86400; // 24 時間
 
-interface ConversationHistory {
+interface BotThreadState {
   messages: Array<{ role: string; content: string }>;
 }
 
 async function loadHistory(
   env: Env,
   threadId: string,
-): Promise<ConversationHistory> {
-  const key = `conv:${threadId}`;
-  const stored = await env.KV.get<ConversationHistory>(key, "json");
+): Promise<BotThreadState> {
+  const key = `bot-thread:${threadId}`;
+  const stored = await env.KV.get<BotThreadState>(key, "json");
   return stored ?? { messages: [] };
 }
 
 async function saveHistory(
   env: Env,
   threadId: string,
-  history: ConversationHistory,
+  history: BotThreadState,
 ): Promise<void> {
-  const key = `conv:${threadId}`;
+  const key = `bot-thread:${threadId}`;
   await env.KV.put(key, JSON.stringify(history), {
-    expirationTtl: CONVERSATION_TTL,
+    expirationTtl: THREAD_STATE_TTL,
   });
 }
 ```
 
-`KV.get()` の `"json"` 型パラメータで自動デシリアライズが行われる。TTL により古い会話は自動的にクリーンアップされる。
+`KV.get()` の `"json"` 型パラメータで自動デシリアライズが行われる。TTL により古い bot スレッド
+スナップショットは自動的にクリーンアップされる。永続的な複数ユーザーのチャット、認可を考慮した
+読み取り、プロンプト組み立て、過去メッセージに対する RAG が必要なら、
+[チャットメモリと RAG](../ai/chat-memory-rag.mdx) にあるように D1/R2/Vectorize で正本の履歴を
+モデル化する。
 
 ## AI ツール使用ループ
 
@@ -319,3 +330,8 @@ npx wrangler@4 deploy
 ```
 
 パストリガー CI を使ったモノレポでの設定は [スタンドアロン Workers](../workers/standalone-workers.mdx#パストリガーデプロイ) を参照。
+
+## 関連
+
+- [チャットメモリと RAG](../ai/chat-memory-rag.mdx)
+- [Workers AI ストリーミング SSE プロキシ](./workers-ai-streaming.mdx)
