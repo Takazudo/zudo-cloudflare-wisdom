@@ -39,14 +39,16 @@ D1、R2、KV、Durable Objects は AI システム周辺のアプリデータレ
 | RAG 回答 | Worker がストレージから元コンテンツを読み込み、Vectorize で埋め込みまたは検索を行い、取得したコンテキストをモデルへ渡す。 |
 | Webhook ボット | Worker が Webhook にすばやく応答し、長い処理は `ctx.waitUntil()` で行い、D1/KV/Durable Objects に状態を保存し、ボットの振る舞いに必要な場合だけ AI を呼び出す。 |
 
+## ガイド
+
+- [Workers AI のモデルと料金](./workers-ai-models-pricing.mdx) -- 実用的なモデルカテゴリ、厳選したテキスト生成テーブル、費用計算メモ。
+- [チャットメモリと RAG](./chat-memory-rag.mdx) -- チャット履歴、プロンプト組み立て、検索のためのリクエスト境界とストレージガイド。
+
 ## レシピ
 
-- [チャットメモリと RAG](./chat-memory-rag.mdx) -- チャット履歴、プロンプト組み立て、検索のためのリクエスト境界とストレージガイド。
 - [Workers AI Streaming SSE Proxy](../recipes/workers-ai-streaming.mdx) -- 中断処理と実行時キルスイッチを含む、Workers AI ストリーミングの具体的なパターン。
 - [Bot Worker パターン](../recipes/bot-worker.mdx) -- AI 呼び出しや状態保存と組み合わせやすい、Webhook 駆動の Worker パターン。
 
 ## このページを安定させる
 
 ここには価格表や完全なモデルカタログをコピーしない。このページは長く使えるプロダクトマップとして扱い、正確なモデル、プロバイダー、制限、価格を選ぶときは Cloudflare 公式ドキュメントを確認する。
-
-- [Workers AI のモデルと料金](./workers-ai-models-pricing.mdx) -- 実用的なモデルカテゴリ、厳選したテキスト生成テーブル、費用計算メモ。

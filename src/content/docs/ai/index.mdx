@@ -39,14 +39,16 @@ D1, R2, KV, and Durable Objects are the app data layer around the AI system:
 | RAG answer | Worker loads source content from storage, embeds or queries with Vectorize, then sends retrieved context to a model. |
 | Webhook bot | Worker acknowledges the webhook quickly, does longer work with `ctx.waitUntil()`, stores state in D1/KV/Durable Objects, and calls AI only when the bot behavior needs it. |
 
+## Guides
+
+- [Workers AI Models and Pricing](./workers-ai-models-pricing.mdx) -- practical model categories, a curated text-generation table, and cost calculation notes.
+- [Chat Memory and RAG](./chat-memory-rag.mdx) -- a request-boundary and storage guide for chat history, prompt assembly, and retrieval.
+
 ## Recipes
 
-- [Chat Memory and RAG](./chat-memory-rag.mdx) -- a request-boundary and storage guide for chat history, prompt assembly, and retrieval.
 - [Workers AI Streaming SSE Proxy](../recipes/workers-ai-streaming.mdx) -- a concrete Workers AI streaming pattern with abort handling and a runtime kill switch.
 - [Bot Worker Pattern](../recipes/bot-worker.mdx) -- a webhook-driven Worker pattern that composes well with AI calls and state storage.
 
 ## Keep This Page Stable
 
 Do not copy pricing tables or the full model catalog here. Treat this page as the durable product map, then check the official Cloudflare docs when choosing exact models, providers, limits, or pricing.
-
-- [Workers AI Models and Pricing](./workers-ai-models-pricing.mdx) -- practical model categories, a curated text-generation table, and cost calculation notes.
