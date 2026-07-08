@@ -11,9 +11,9 @@ Patterns extracted from production projects using Cloudflare Pages, Workers, and
 - [Astro + Pages](./astro-pages.mdx) -- Deploying Astro static sites to Cloudflare Pages
 - [Search API](./search-api.mdx) -- Full-text search with Pages Functions and KV logging
 - [Auth with Pages Functions](./auth-functions.mdx) -- Authentication patterns using Pages Functions
-- [Bot Worker](./bot-worker.mdx) -- Building a webhook-driven bot on Cloudflare Workers
+- [Bot Worker](./bot-worker.mdx) -- webhook bot with immediate ack, bounded tool loop, and TTL KV thread state; see [Chat Memory and RAG](../ai/chat-memory-rag.mdx) for durable chat architecture
 - [SSR Bindings Adapter](./ssr-bindings-adapter.mdx) -- per-request Cloudflare bindings via AsyncLocalStorage in an advanced-mode _worker.js
-- [Workers AI Streaming](./workers-ai-streaming.mdx) -- streaming SSE proxy with client-disconnect abort and a kill switch
+- [Workers AI Streaming](./workers-ai-streaming.mdx) -- streaming SSE proxy with client-disconnect abort and a kill switch; see [Workers AI Models and Pricing](../ai/workers-ai-models-pricing.mdx) for model choice
 - [Cron + D1 Queue](./cron-d1-queue.mdx) -- cron-triggered D1 work-queue with backoff and dead-lettering
 - [Cookie Sessions](./cookie-sessions.mdx) -- HttpOnly cookie sessions with refresh-token rotation
 - [Webhook Signing](./webhook-signing.mdx) -- HMAC-SHA256 request signing with Web Crypto

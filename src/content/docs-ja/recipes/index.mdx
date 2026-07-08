@@ -11,9 +11,9 @@ Cloudflare Pages、Workers、ストレージサービスを使った本番プロ
 - [Astro + Pages](./astro-pages.mdx) -- Astro 静的サイトを Cloudflare Pages にデプロイ
 - [検索 API](./search-api.mdx) -- Pages Functions と KV ロギングによる全文検索
 - [Pages Functions での認証](./auth-functions.mdx) -- Pages Functions を使った認証パターン
-- [Bot Worker](./bot-worker.mdx) -- Cloudflare Workers で Webhook 駆動のボットを構築
+- [Bot Worker](./bot-worker.mdx) -- 即時 ack、上限付きツールループ、TTL 付き KV スレッド状態を使う Webhook ボット。永続チャット設計は [チャットメモリと RAG](../ai/chat-memory-rag.mdx) を参照
 - [SSR バインディングアダプター](./ssr-bindings-adapter.mdx) -- advanced-mode _worker.js で AsyncLocalStorage を使ったリクエスト単位の Cloudflare バインディング
-- [Workers AI ストリーミング](./workers-ai-streaming.mdx) -- クライアント切断時のアボートとキルスイッチを備えた SSE ストリーミングプロキシ
+- [Workers AI ストリーミング](./workers-ai-streaming.mdx) -- クライアント切断時のアボートとキルスイッチを備えた SSE ストリーミングプロキシ。モデル選定は [Workers AI のモデルと料金](../ai/workers-ai-models-pricing.mdx) を参照
 - [Cron + D1 キュー](./cron-d1-queue.mdx) -- バックオフとデッドレター処理を備えた cron トリガーの D1 ワークキュー
 - [Cookie セッション](./cookie-sessions.mdx) -- リフレッシュトークンローテーション付きの HttpOnly Cookie セッション
 - [Webhook 署名](./webhook-signing.mdx) -- Web Crypto を使った HMAC-SHA256 リクエスト署名
