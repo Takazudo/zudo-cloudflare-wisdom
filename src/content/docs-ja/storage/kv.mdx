@@ -49,6 +49,34 @@ await env.MY_KV.delete("key");
 const list = await env.MY_KV.list({ prefix: "logs:" });
 ```
 
+## 実践パターン: キーワードログ
+
+zpaper project から -- 検索キーワードを KV に記録する：
+
+```typescript
+interface Env {
+  KEYWORD_LOGS: KVNamespace;
+}
+
+export const onRequestGet: PagesFunction<Env> = async (context) => {
+  const url = new URL(context.request.url);
+  const query = url.searchParams.get("q")?.trim();
+
+  if (query) {
+    // Log the keyword asynchronously (don't block the response)
+    const key = `search:${Date.now()}:${crypto.randomUUID()}`;
+    context.waitUntil(
+      context.env.KEYWORD_LOGS.put(key, JSON.stringify({
+        query,
+        timestamp: new Date().toISOString(),
+      }), { expirationTtl: 86400 * 30 }) // 30 days
+    );
+  }
+
+  // ... return search results
+};
+```
+
 :::tip[重要でない書き込みには `waitUntil` を使用]
 `context.waitUntil()` はレスポンス送信後に非同期処理を実行できる。ロギング、アナリティクス、その他の重要でない書き込みに使用する。
 :::
