@@ -129,6 +129,7 @@ export const settings = {
     { label: "Overview", path: "/docs/getting-started", categoryMatch: "getting-started" },
     { label: "Pages", path: "/docs/pages", categoryMatch: "pages" },
     { label: "Workers", path: "/docs/workers", categoryMatch: "workers" },
+    { label: "AI", path: "/docs/ai", categoryMatch: "ai" },
     { label: "Storage", path: "/docs/storage", categoryMatch: "storage" },
     { label: "CI/CD", path: "/docs/cicd", categoryMatch: "cicd" },
     { label: "Recipes", path: "/docs/recipes", categoryMatch: "recipes" },
