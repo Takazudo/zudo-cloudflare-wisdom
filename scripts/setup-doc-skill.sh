@@ -1,64 +1,61 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ── setup-doc-skill.sh ─────────────────────────────────
-# Creates a Claude Code skill that exposes your zudo-doc
-# documentation as a knowledge base, then symlinks it into
-# the user-scope skills directory (~/.claude/skills/).
-# ────────────────────────────────────────────────────────
+# Creates a doc-lookup skill for Claude Code and/or Codex, then symlinks it
+# into the matching user-scope skills directory.
 
-# Parse flags. --silent (alias -y) skips the interactive skill-name prompt and
-# uses the pinned DEFAULT_SKILL_NAME directly, so the script works under
-# non-interactive automation where `read` would fail on EOF.
-SILENT=""
+TARGET_MODE="auto"
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --silent|-y) SILENT="true" ;;
-    *) echo "Error: unknown argument '$1'"; exit 1 ;;
+    --silent|-y) shift ;;
+    --target)
+      shift
+      if [ $# -eq 0 ]; then
+        echo "Error: --target requires one of: auto, claude, codex, both" >&2
+        exit 1
+      fi
+      TARGET_MODE="$1"
+      shift
+      ;;
+    --target=*)
+      TARGET_MODE="${1#--target=}"
+      shift
+      ;;
+    --) shift; break ;;
+    -*) echo "Error: unknown flag '$1'" >&2; exit 1 ;;
+    *) break ;;
   esac
-  shift
 done
+
+case "$TARGET_MODE" in
+  auto|claude|codex|both) ;;
+  *)
+    echo "Error: --target must be one of: auto, claude, codex, both" >&2
+    exit 1
+    ;;
+esac
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Read project name from package.json (used in the generated SKILL.md description/title text)
 PROJECT_NAME=$(node -e "console.log(require('$ROOT_DIR/package.json').name || 'my-project')")
-# Skill name is pinned (not "${PROJECT_NAME}-wisdom") so it stays in lockstep with the .gitignore
-# entry and CLAUDE.md, which both reference `cloudflare-wisdom`. See issue #78.
+# Pinned to match CLAUDE.md, .gitignore, and existing global skill naming.
 DEFAULT_SKILL_NAME="cloudflare-wisdom"
+SKILL_NAME="${1:-${SKILL_NAME:-$DEFAULT_SKILL_NAME}}"
 
-# Prompt for skill name (skipped entirely under --silent)
-if [ -n "$SILENT" ]; then
-  SKILL_NAME="$DEFAULT_SKILL_NAME"
-else
-  echo ""
-  echo "=== zudo-doc Skill Setup ==="
-  echo ""
-  read -rp "Skill name [$DEFAULT_SKILL_NAME]: " SKILL_NAME
-  SKILL_NAME="${SKILL_NAME:-$DEFAULT_SKILL_NAME}"
-fi
-
-# Validate skill name (allow only alphanumeric, hyphens, underscores)
 if [[ ! "$SKILL_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
   echo "Error: Skill name may only contain letters, numbers, hyphens, and underscores."
   exit 1
 fi
 
-# Resolve the main repo root (handles git worktrees correctly)
-# Use the main worktree path so symlinks survive worktree removal
 REPO_ROOT="$(git -C "$ROOT_DIR" worktree list | head -1 | awk '{print $1}')"
-
-SKILL_DIR="$ROOT_DIR/.claude/skills/$SKILL_NAME"
 DOCS_DIR="$ROOT_DIR/src/content/docs"
-GLOBAL_SKILLS_DIR="$HOME/.claude/skills"
 
-# Validate docs directory exists
 if [ ! -d "$DOCS_DIR" ]; then
   echo "Error: Documentation directory not found at $DOCS_DIR"
   exit 1
 fi
 
-# Helper: replace a symlink or file at the given path
 ensure_symlink() {
   local link_path="$1"
   local target="$2"
@@ -68,23 +65,12 @@ ensure_symlink() {
   ln -s "$target" "$link_path"
 }
 
-# Create skill directory
-mkdir -p "$SKILL_DIR"
-
-# Create symlink to docs directory inside the skill
-ensure_symlink "$SKILL_DIR/docs" "$REPO_ROOT/src/content/docs"
-echo "  Created docs symlink -> $REPO_ROOT/src/content/docs"
-
-# Check if Japanese docs exist and create symlink
 DOCS_JA_DIR="$ROOT_DIR/src/content/docs-ja"
 HAS_JA=""
 if [ -d "$DOCS_JA_DIR" ]; then
   HAS_JA="true"
-  ensure_symlink "$SKILL_DIR/docs-ja" "$REPO_ROOT/src/content/docs-ja"
-  echo "  Created docs-ja symlink -> $REPO_ROOT/src/content/docs-ja"
 fi
 
-# Discover top-level doc categories dynamically
 DOC_TREE=""
 for dir in "$DOCS_DIR"/*/; do
   [ -d "$dir" ] || continue
@@ -93,8 +79,52 @@ for dir in "$DOCS_DIR"/*/; do
 "
 done
 
-# Generate SKILL.md
-cat > "$SKILL_DIR/SKILL.md" << SKILLEOF
+resolve_targets() {
+  case "$TARGET_MODE" in
+    claude) echo "claude" ;;
+    codex) echo "codex" ;;
+    both) echo "claude codex" ;;
+    auto)
+      local has_claude=""
+      local has_codex=""
+      [ -d "$HOME/.claude" ] && has_claude="true"
+      [ -d "$HOME/.codex" ] && has_codex="true"
+
+      if [ "$has_claude" = "true" ] && [ "$has_codex" = "true" ]; then
+        echo "claude codex"
+      elif [ "$has_codex" = "true" ]; then
+        echo "codex"
+      else
+        echo "claude"
+      fi
+      ;;
+  esac
+}
+
+generate_skill() {
+  local target="$1"
+  local project_skills_dir="$ROOT_DIR/.$target/skills"
+  local skill_dir="$project_skills_dir/$SKILL_NAME"
+  local global_skills_dir="$HOME/.$target/skills"
+  local assistant_label
+
+  case "$target" in
+    claude) assistant_label="Claude Code" ;;
+    codex) assistant_label="Codex" ;;
+    *) echo "Error: unknown target '$target'" >&2; exit 1 ;;
+  esac
+
+  mkdir -p "$skill_dir"
+
+  ensure_symlink "$skill_dir/docs" "$REPO_ROOT/src/content/docs"
+  echo "  [$target] Created docs symlink -> $REPO_ROOT/src/content/docs"
+
+  if [ "$HAS_JA" = "true" ]; then
+    ensure_symlink "$skill_dir/docs-ja" "$REPO_ROOT/src/content/docs-ja"
+    echo "  [$target] Created docs-ja symlink -> $REPO_ROOT/src/content/docs-ja"
+  fi
+
+  cat > "$skill_dir/SKILL.md" << SKILLEOF
 ---
 name: $SKILL_NAME
 description: >-
@@ -107,7 +137,7 @@ argument-hint: "[-u|--update] [topic keyword, e.g., 'configuration', 'sidebar', 
 
 # $PROJECT_NAME Documentation Reference
 
-Look up documentation from the $PROJECT_NAME project.
+Look up documentation from the $PROJECT_NAME project for $assistant_label.
 Documentation base path: \`src/content/docs\` (relative to repo root)
 
 ## Mode Detection
@@ -122,7 +152,7 @@ Strip the flag from the remaining argument to get the topic keyword.
 ## Lookup Mode (default)
 
 1. Find the relevant article(s) from the \`docs/\` directory based on the topic
-2. Read ONLY the specific article(s) you need — do NOT load all articles at once
+2. Read ONLY the specific article(s) you need - do NOT load all articles at once
 3. Apply the information from the article when answering the user's question
 4. Mention the source article path so the user can find it for further reading
 
@@ -141,7 +171,7 @@ The user has new information and wants to add or update documentation in this re
 4. **Write the content**: Follow the doc-authoring rules in the root CLAUDE.md:
    - Required frontmatter: \`title\` (string). Always set \`sidebar_position\`.
      Optional: \`description\`, \`sidebar_label\`, \`tags\`, etc.
-   - Do NOT use \`# h1\` in content — the frontmatter \`title\` renders as h1.
+   - Do NOT use \`# h1\` in content - the frontmatter \`title\` renders as h1.
      Start with \`## h2\` headings.
    - Use available MDX components (\`<Note>\`, \`<Tip>\`, \`<Info>\`, \`<Warning>\`,
      \`<Danger>\`, \`<HtmlPreview>\`) where appropriate.
@@ -149,7 +179,7 @@ The user has new information and wants to add or update documentation in this re
    - Link to other docs using relative paths with \`.mdx\` extension.
 5. **Update Japanese docs**: Create or update the corresponding file under
    \`docs-ja/\` mirroring the English directory structure. Keep code blocks,
-   Mermaid diagrams, and \`<HtmlPreview>\` blocks identical — only translate
+   Mermaid diagrams, and \`<HtmlPreview>\` blocks identical - only translate
    surrounding prose. Exception: pages with \`generated: true\` skip translation.
 6. **Format**: Run \`pnpm format:md\` to format the new/changed MDX files.
 7. **Verify**: Run \`pnpm build\` to confirm the site builds correctly.
@@ -166,28 +196,41 @@ has YAML frontmatter with \`title\` and \`description\` fields that help identif
 the right article to read.
 SKILLEOF
 
-if [ "$HAS_JA" = "true" ]; then
-  cat >> "$SKILL_DIR/SKILL.md" << JAEOF
+  if [ "$HAS_JA" = "true" ]; then
+    cat >> "$skill_dir/SKILL.md" << JAEOF
 
 ## Japanese Documentation
 
 Japanese translations are available under \`docs-ja/\`. When the user is working
 in Japanese or asks for Japanese content, prefer articles from \`docs-ja/\`.
 JAEOF
-fi
+  fi
 
-echo "  Generated SKILL.md"
+  echo "  [$target] Generated SKILL.md"
 
-# Symlink into global skills directory.
-# Point at the main-worktree path so the global link survives worktree removal.
-mkdir -p "$GLOBAL_SKILLS_DIR"
-ensure_symlink "$GLOBAL_SKILLS_DIR/$SKILL_NAME" "$REPO_ROOT/.claude/skills/$SKILL_NAME"
+  mkdir -p "$global_skills_dir"
+  ensure_symlink "$global_skills_dir/$SKILL_NAME" "$skill_dir"
+
+  echo "  [$target] Project skill: $skill_dir"
+  echo "  [$target] Global symlink: $global_skills_dir/$SKILL_NAME"
+}
+
+echo ""
+echo "=== zudo-doc Skill Setup ==="
+echo ""
+
+read -r -a TARGETS <<< "$(resolve_targets)"
+echo "Target: $TARGET_MODE -> ${TARGETS[*]}"
+echo ""
+
+for target in "${TARGETS[@]}"; do
+  generate_skill "$target"
+done
 
 echo ""
 echo "Done! Skill '$SKILL_NAME' is ready."
 echo ""
-echo "  Project skill: $SKILL_DIR"
-echo "  Global symlink: $GLOBAL_SKILLS_DIR/$SKILL_NAME"
-echo ""
-echo "You can now use it in Claude Code with: /$SKILL_NAME <topic>"
+echo "Use --target claude, --target codex, or --target both to override auto-detection."
+echo "In Claude Code, use: /$SKILL_NAME <topic>"
+echo "In Codex, use: \$$SKILL_NAME <topic>"
 echo ""

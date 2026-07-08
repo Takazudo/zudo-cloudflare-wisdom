@@ -21,7 +21,10 @@
     "gen:z-index": "node scripts/gen-z-index.mjs",
     "check:z-index": "node scripts/gen-z-index.mjs --check",
     "setup:doc-skill": "bash scripts/setup-doc-skill.sh",
-    "setup:doc-skill-silent": "bash scripts/setup-doc-skill.sh --silent"
+    "setup:doc-skill-silent": "bash scripts/setup-doc-skill.sh --silent",
+    "setup:doc-skill:claude": "bash scripts/setup-doc-skill.sh --target claude",
+    "setup:doc-skill:codex": "bash scripts/setup-doc-skill.sh --target codex",
+    "setup:doc-skill:both": "bash scripts/setup-doc-skill.sh --target both"
   },
   "dependencies": {
     "@takazudo/zfb": "0.1.0-next.77",
