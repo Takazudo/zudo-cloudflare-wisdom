@@ -147,6 +147,26 @@ describe("generateClaudeResourcesDocs", () => {
       expect(overview).toContain('<CategoryNav categories={');
     });
 
+    it("overview body has no prose line duplicating the frontmatter description", () => {
+      // Regression test for #2568: the body used to repeat the frontmatter
+      // `description` verbatim as a standalone prose line right below `---`.
+      generateClaudeResourcesDocs({
+        claudeDir,
+        projectRoot: tmpDir,
+        docsDir,
+      });
+
+      const overview = fs.readFileSync(
+        path.join(docsDir, "claude", "index.mdx"),
+        "utf8",
+      );
+      const parsed = matter(overview);
+      const description = parsed.data.description as string;
+      const bodyLines = parsed.content.split("\n");
+
+      expect(bodyLines).not.toContain(description);
+    });
+
     it("skill page has correct frontmatter", () => {
       generateClaudeResourcesDocs({
         claudeDir,
@@ -572,6 +592,88 @@ describe("generateClaudeResourcesDocs", () => {
 
       // And must NOT contain the outside content (from tmpDir/CLAUDE.md).
       expect(rootMdx).not.toContain("Project instructions");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // excludeDirs boundary matching (#2561)
+  // ---------------------------------------------------------------------------
+
+  describe("excludeDirs boundary matching", () => {
+    it("discovers CLAUDE.md in a prefix-colliding sibling of an excluded dir (dist-extra vs dist)", () => {
+      fs.mkdirSync(path.join(tmpDir, "dist-extra"), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpDir, "dist-extra", "CLAUDE.md"),
+        "# dist-extra instructions",
+      );
+
+      const result = generateClaudeResourcesDocs({
+        claudeDir,
+        projectRoot: tmpDir,
+        docsDir,
+      });
+
+      // root/CLAUDE.md (from the fixture) + dist-extra/CLAUDE.md
+      expect(result.claudemd).toBe(2);
+      const decoyPage = path.join(docsDir, "claude-md", "dist-extra.mdx");
+      expect(fs.existsSync(decoyPage)).toBe(true);
+      expect(fs.readFileSync(decoyPage, "utf8")).toContain("dist-extra instructions");
+    });
+
+    it("still excludes CLAUDE.md directly inside the excluded dist directory", () => {
+      fs.mkdirSync(path.join(tmpDir, "dist"), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpDir, "dist", "CLAUDE.md"),
+        "# dist instructions — should be excluded",
+      );
+
+      const result = generateClaudeResourcesDocs({
+        claudeDir,
+        projectRoot: tmpDir,
+        docsDir,
+      });
+
+      // Only root/CLAUDE.md (from the fixture) — dist/CLAUDE.md is excluded.
+      expect(result.claudemd).toBe(1);
+      expect(fs.existsSync(path.join(docsDir, "claude-md", "dist.mdx"))).toBe(false);
+    });
+
+    it("still excludes nested CLAUDE.md files under the excluded dist directory (exact-match boundary holds)", () => {
+      fs.mkdirSync(path.join(tmpDir, "dist", "nested"), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpDir, "dist", "nested", "CLAUDE.md"),
+        "# nested dist instructions — should be excluded",
+      );
+
+      const result = generateClaudeResourcesDocs({
+        claudeDir,
+        projectRoot: tmpDir,
+        docsDir,
+      });
+
+      // Only root/CLAUDE.md (from the fixture) — the whole dist/ subtree,
+      // including nested dirs, is excluded once the top-level dist match hits.
+      expect(result.claudemd).toBe(1);
+      expect(fs.existsSync(path.join(docsDir, "claude-md", "dist--nested.mdx"))).toBe(false);
+    });
+
+    it("still excludes docsDir contents when docsDir carries a trailing separator", () => {
+      // path.join preserves a trailing separator on a single argument, so the
+      // docsDir exclude entry keeps it — the boundary compare must not break.
+      fs.writeFileSync(
+        path.join(docsDir, "CLAUDE.md"),
+        "# decoy inside docsDir — should be excluded",
+      );
+
+      const result = generateClaudeResourcesDocs({
+        claudeDir,
+        projectRoot: tmpDir,
+        docsDir: docsDir + path.sep,
+      });
+
+      // Only root/CLAUDE.md (from the fixture) — docs/CLAUDE.md is excluded.
+      expect(result.claudemd).toBe(1);
+      expect(fs.existsSync(path.join(docsDir, "claude-md", "docs.mdx"))).toBe(false);
     });
   });
 
