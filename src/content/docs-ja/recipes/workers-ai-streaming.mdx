@@ -19,6 +19,13 @@ Server-Sent Events (SSE) としてブラウザにストリーミングする Wor
 
 本記事は zudo-text 同期サーバの `POST /api/v1/chat` ハンドラを下敷きにしています。
 
+:::note[モデルを選ぶ前に]
+このページはストリーム処理に絞っています。モデル選定、日付付きの料金メモ、JSON Mode の
+使いどころは [Workers AI のモデルと料金](../ai/workers-ai-models-pricing.mdx) を参照して
+ください。永続的な Web チャット履歴、プロンプト組み立て、RAG アーキテクチャについては
+[チャットメモリと RAG](../ai/chat-memory-rag.mdx) を参照してください。
+:::
+
 ## AI モデルのバインディング
 
 Workers AI は `wrangler.toml` の `[ai]` バインディング経由で公開されます。
@@ -52,9 +59,9 @@ binding = "AI"
 すると、`run()` は完成した JSON オブジェクトではなく `ReadableStream` を返します。
 
 ```typescript
-const KIMI_MODEL = "@cf/moonshotai/kimi-k2.6";
+const MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
-const kimiStream = await env.AI.run(KIMI_MODEL, {
+const aiStream = await env.AI.run(MODEL_ID, {
   messages,
   stream: true,
 });
@@ -62,6 +69,13 @@ const kimiStream = await env.AI.run(KIMI_MODEL, {
 
 このストリームは SSE 形式のフレーム、すなわち `data: {...}\n\n` という行を送出し、最後に
 終端の `data: [DONE]\n\n` で終わります。
+
+:::warning[JSON Mode はストリーミングと分ける]
+JSON Mode は、抽出、分類、ルーティングなどの非ストリーミングな構造化呼び出し向けです。
+このストリーミング SSE プロキシに `response_format` を組み合わせないでください。
+スキーマ制約付きのレスポンスが必要な場合は、別の非ストリーミング `env.AI.run()` 呼び出しに
+分けます。
+:::
 
 ## AI ストリームを SSE に変換する
 
@@ -85,8 +99,8 @@ const stream = new ReadableStream<Uint8Array>({
       controller.enqueue(encodeSseEvent(event, data));
     };
 
-    const kimiStream = await env.AI.run(KIMI_MODEL, { messages, stream: true });
-    const reader = kimiStream.getReader();
+    const aiStream = await env.AI.run(MODEL_ID, { messages, stream: true });
+    const reader = aiStream.getReader();
     const dec = new TextDecoder();
     let buf = "";
     let index = 0;
@@ -178,7 +192,8 @@ const stream = new ReadableStream<Uint8Array>({
       controller.enqueue(encodeSseEvent(event, data));
     };
 
-    const reader = kimiStream.getReader();
+    const aiStream = await env.AI.run(MODEL_ID, { messages, stream: true });
+    const reader = aiStream.getReader();
     while (true) {
       if (aborter.signal.aborted) break; // stop reading from Workers AI
       const { value, done } = await reader.read();
@@ -240,5 +255,7 @@ AI_CHAT_DISABLED = "1"
 
 ## 関連
 
+- [Workers AI のモデルと料金](../ai/workers-ai-models-pricing.mdx)
+- [チャットメモリと RAG](../ai/chat-memory-rag.mdx)
 - [スタンドアロン bot Worker](./bot-worker.mdx)
 - [Pages Functions による認証](./auth-functions.mdx)

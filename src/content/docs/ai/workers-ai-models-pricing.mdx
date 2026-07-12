@@ -1,0 +1,166 @@
+---
+title: Workers AI Models and Pricing
+description: Practical Workers AI model selection, binding usage, and cost calculation
+sidebar_position: 1
+---
+
+Workers AI is the Cloudflare-hosted inference path that sits directly beside
+Worker code. Use it when the application can run on Cloudflare-hosted models and
+the call belongs in the Worker request flow. Move through AI Gateway when the app
+needs external providers, provider observability, or controls that span multiple
+providers.
+
+## Binding Basics
+
+Expose Workers AI to a Worker with an `AI` binding:
+
+```jsonc
+{
+  "ai": {
+    "binding": "AI"
+  }
+}
+```
+
+Then call a model with `env.AI.run(modelId, input)`. The input shape depends on
+the model, but text generation normally uses `messages`:
+
+```typescript
+export interface Env {
+  AI: Ai;
+}
+
+const modelId = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+
+export default {
+  async fetch(_request, env): Promise<Response> {
+    const input = {
+      messages: [{ role: "user", content: "Summarize Workers AI in one sentence." }],
+    };
+
+    const result = await env.AI.run(modelId, input);
+    return Response.json(result);
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+For local development, use remote Workers execution for real model calls. There
+is no local GPU inference hidden inside `wrangler dev`.
+
+## Model Categories
+
+Do not treat the model catalog as one long list. Pick by task first, then choose
+the smallest model that passes your quality bar.
+
+- **Text Generation**: chat, summarization, extraction, code, tool use, and
+  structured judgement.
+- **Text Embeddings**: turn text into vectors for Vectorize, semantic search,
+  recommendations, deduping, or RAG.
+- **Text-to-Image**: generate or edit images from prompts and image references.
+- **Image-to-Text / vision**: caption images, answer questions about screenshots
+  or photos, and classify visual inputs.
+- **Automatic Speech Recognition**: transcribe audio or prepare voice-agent
+  input.
+- **Text-to-Speech**: turn application text into generated speech.
+- **Text Classification / reranking**: sentiment, safety, relevance scoring, or
+  query/document reranking.
+- **Translation**: translate text between supported language pairs.
+
+## Practical Text-Generation Picks
+
+Checked on 2026-07-08 against the official Workers AI model pages and pricing
+page. This is a short starting set, not a ranking and not a catalog dump. Recheck
+the official docs before locking production cost assumptions.
+
+| Model | Practical fit | Input $/M | Cached input $/M | Output $/M |
+|---|---|---:|---:|---:|
+| [`@cf/meta/llama-3.3-70b-instruct-fp8-fast`](https://developers.cloudflare.com/workers-ai/models/llama-3.3-70b-instruct-fp8-fast/) | High-quality structured judgement/summarization | $0.293 | n/a | $2.253 |
+| [`@cf/qwen/qwen3-30b-a3b-fp8`](https://developers.cloudflare.com/workers-ai/models/qwen3-30b-a3b-fp8/) | Cheaper multilingual/reasoning-capable candidate | $0.051 | n/a | $0.335 |
+| [`@cf/openai/gpt-oss-120b`](https://developers.cloudflare.com/workers-ai/models/gpt-oss-120b/) | Strong reasoning/agentic candidate | $0.350 | n/a | $0.750 |
+| [`@cf/google/gemma-4-26b-a4b-it`](https://developers.cloudflare.com/workers-ai/models/gemma-4-26b-a4b-it/) | Long-context, cheaper-output candidate | $0.100 | n/a | $0.300 |
+| [`@cf/moonshotai/kimi-k2.6`](https://developers.cloudflare.com/workers-ai/models/kimi-k2.6/) | Frontier/agentic model; use deliberately, not casual default | $0.950 | $0.160 | $4.000 |
+
+The practical default is usually not the largest model. Start with a cheaper
+candidate for the exact task, measure failures, and escalate only the requests
+that need stronger reasoning, longer context, tool use, or vision.
+
+## Cost Calculation
+
+Cloudflare bills Workers AI in Neurons. The pricing page also shows token prices
+as an equivalent view so you can compare models with normal LLM cost math.
+
+Use this estimate for text-generation calls:
+
+```text
+input_tokens / 1_000_000 * input_price + output_tokens / 1_000_000 * output_price
+```
+
+For example, if a model costs `$0.051` per million input tokens and `$0.335` per
+million output tokens, then a request with `20_000` input tokens and `2_000`
+output tokens is roughly:
+
+```text
+20_000 / 1_000_000 * 0.051 + 2_000 / 1_000_000 * 0.335
+```
+
+That token view is for planning. The billable backend unit is still Neurons.
+Workers Free and Workers Paid include Workers AI, and the daily free allocation
+is `10,000` Neurons/day. On Workers Paid, usage above that allocation is charged
+at the current neuron rate; checked on 2026-07-08, that was `$0.011 / 1,000`
+Neurons. Pricing and model availability drift, so treat copied prices as dated
+notes, not durable constants.
+
+## JSON Mode For Judgement Outputs
+
+For classification, extraction, moderation, routing, or other judgement outputs
+that feed automation, prefer JSON Mode on a supported model. Add
+`response_format` with a JSON Schema, keep the schema narrow, and validate the
+returned object in your own code before acting on it.
+
+```typescript
+const response = await env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
+  messages: [
+    {
+      role: "user",
+      content: "Classify this support ticket: I cannot log in after resetting my password.",
+    },
+  ],
+  response_format: {
+    type: "json_schema",
+    json_schema: {
+      type: "object",
+      properties: {
+        label: { type: "string", enum: ["billing", "auth", "bug", "other"] },
+        confidence: { type: "number" },
+        rationale: { type: "string" },
+      },
+      required: ["label", "confidence", "rationale"],
+    },
+  },
+});
+```
+
+Schema failures are a normal runtime case. Workers AI can return
+`JSON Mode couldn't be met` when the requested schema cannot be satisfied, so
+handle that path with retry, fallback, or a human-review state. JSON Mode
+currently does not support streaming.
+
+## When To Add AI Gateway
+
+Use the Workers AI binding directly when the app only needs Cloudflare-hosted
+models and simple request handling. Add AI Gateway when you need any of these:
+
+- External providers such as OpenAI, Anthropic, Google AI Studio, Google Vertex
+  AI, Azure OpenAI, Amazon Bedrock, Deepgram, or other supported providers.
+- Provider observability: logs, analytics, custom metadata, and cost tracking.
+- Cross-provider controls: caching, rate limiting, fallback, routing, or
+  provider-level policy.
+- A single place to compare or switch model providers without moving the rest of
+  the Worker architecture.
+
+## Official Docs To Recheck
+
+- [Workers AI Models](https://developers.cloudflare.com/workers-ai/models/)
+- [Workers AI Pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)
+- [Workers AI JSON Mode](https://developers.cloudflare.com/workers-ai/features/json-mode/)
+- [AI Gateway providers](https://developers.cloudflare.com/ai-gateway/usage/providers/)
