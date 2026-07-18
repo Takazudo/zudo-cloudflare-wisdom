@@ -29,3 +29,9 @@ pages/[locale]/docs/[[...slug]].tsx
 # Everything else (design tokens, base rules, feature CSS) ships from
 # @takazudo/zudo-doc via theme.css / content.css / features.css.
 src/styles/global.css
+
+# ── Wide home page override (css-wisdom PR #182 parity) ──
+# pages/index.tsx is reconstructed (not the locked 1-line re-export) to render
+# HomePageView with `wide`, matching the zudo-doc showcase. zudo-doc 4.2.1 has
+# no config toggle for the wide home grid — upstream request zudolab/zudo-doc#2959.
+pages/index.tsx
