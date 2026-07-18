@@ -16,15 +16,19 @@ pnpm setup:doc-skill  # Generate cloudflare-wisdom skill + symlink all skills
 
 ## Project Layout
 
+zudo-doc 4.x is a thin host shell — all wiring (components, config types,
+utils, routes, chrome) lives inside `@takazudo/zudo-doc`, driven by the single
+`zudoDoc()` config.
+
 ```
-pages/          # Host-app routing layer (zfb entry points)
+pages/                       # Thin route stubs (package-owned routes injected at build)
+  index.tsx                  # Home: re-exports @takazudo/zudo-doc/routes/index
+  docs/[[...slug]].tsx       # EN doc route stub
+  [locale]/docs/[[...slug]].tsx  # JA doc route stub
 src/
-  components/   # Shared UI components
-  config/       # settings.ts — site-wide config, docs-schema.ts — frontmatter schema
-  content/      # MDX doc pages (docs/ + docs-ja/)
-  utils/        # Shared utilities
-plugins/        # zfb integration plugins (.mjs)
-zfb.config.ts   # Build config (framework, collections, plugins, adapter)
+  content/                   # MDX doc pages (docs/ + docs-ja/)
+  styles/global.css          # Package CSS imports + host brand overrides
+zfb.config.ts                # The single config file — zudoDoc({ ... })
 ```
 
 ## Content Structure
@@ -39,7 +43,7 @@ zfb.config.ts   # Build config (framework, collections, plugins, adapter)
 
 ## Content Categories
 
-Top-level directories under `src/content/docs/`. Directories with header nav entries are mapped via `categoryMatch` in `src/config/settings.ts`:
+Top-level directories under `src/content/docs/`. Directories with header nav entries are mapped via `categoryMatch` in the `headerNav` list in `zfb.config.ts`:
 
 - `getting-started/` - Overview, what this site covers, Cloudflare account setup
 - `pages/` - Cloudflare Pages deployment, _redirects, base paths, preview deploys, Pages Functions
@@ -60,7 +64,7 @@ All documentation files use `.mdx` format with YAML frontmatter.
 
 ### Frontmatter Fields
 
-Schema defined in `src/config/docs-schema.ts` (validated by `zfb check`):
+Schema is the zudo-doc package default (shipped by `@takazudo/zudo-doc`, validated by `zfb check`; override via `buildDocsSchema` in `zfb.config.ts` if ever needed):
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -171,13 +175,13 @@ The `noPage: true` flag means the category has no landing page (just groups item
 
 ### Header Navigation
 
-Defined in `src/config/settings.ts` via `headerNav`. Each item maps to a top-level content directory via `categoryMatch`:
+Defined in `zfb.config.ts` via the `headerNav` list in the `zudoDoc({ ... })` call. Each item maps to a top-level content directory via `categoryMatch`:
 
 ```typescript
 { label: "Overview", path: "/docs/getting-started", categoryMatch: "getting-started" }
 ```
 
-`categoryMatch` must be a single top-level directory name. Adding a new header nav item requires editing `settings.ts`.
+`categoryMatch` must be a single top-level directory name. Adding a new header nav item requires editing `zfb.config.ts`.
 
 ## Content Creation Workflow
 
@@ -195,7 +199,7 @@ Defined in `src/config/settings.ts` via `headerNav`. Each item maps to a top-lev
 
 1. Create the directory under `src/content/docs/` (kebab-case)
 2. Create `index.mdx` with `title`, `description`, and `sidebar_position`
-3. Add a `headerNav` entry in `src/config/settings.ts` with `categoryMatch` pointing to the directory name
+3. Add a `headerNav` entry in `zfb.config.ts` with `categoryMatch` pointing to the directory name
 4. Mirror the directory structure under `src/content/docs-ja/`
 5. Run `pnpm build` to verify
 
@@ -220,7 +224,7 @@ The `cloudflare-wisdom` skill (`.claude/skills/cloudflare-wisdom/SKILL.md`) is *
 
 - Base path: `/`
 - Live URL: `https://zudo-cloudflare-wisdom.takazudomodular.com/`
-- Settings: `src/config/settings.ts`
+- Settings + build config: `zfb.config.ts` (the single `zudoDoc()` config)
 
 ## Hosting & CI/CD
 
