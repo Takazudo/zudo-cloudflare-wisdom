@@ -71,21 +71,17 @@ done < <(find "$BASE_DIR" -type f -print0 | sort -z)
 echo "Checking feature template files..."
 
 # Only check features that were scaffolded for this site.
-# Features not scaffolded (e.g. tauri, designTokenPanel, versioning) are
-# intentionally absent; their template files would produce spurious
-# [MISSING IN PROD] errors if checked.
 #
-# Feature name -> template directory mapping:
-#   i18n            -> i18n           (bilingual EN+JA docs)
-#   llms-txt        -> llmsTxt        (LLM-friendly text output)
-#   doc-history     -> docHistory     (git-based doc history)
-#   body-foot-util  -> bodyFootUtil   (github.ts for footer links)
-#   claude-resources -> claudeResources (Claude CLAUDE.md + skills integration)
-#   image-enlarge   -> imageEnlarge   (image enlarge on click)
-#   sidebar-toggle  -> sidebarToggle  (collapsible sidebar toggle)
-#   doc-tags        -> docTags        (tags pages; enabled: docTags: false in settings)
-#   tag-governance  -> tagGovernance  (tags-audit / tags-suggest scripts)
-for feature in i18n llmsTxt docHistory bodyFootUtil claudeResources imageEnlarge sidebarToggle docTags tagGovernance; do
+# In zudo-doc 4.x nearly every feature (docHistory, llmsTxt, imageEnlarge,
+# sidebarToggle, bodyFootUtil, claudeResources, ...) is package-internal and
+# toggled via the `zudoDoc()` config — those features ship NO host files, so
+# they have no feature template directory. The only create-zudo-doc 4.x
+# feature dirs that inject host files are: i18n, claudeSkills, tauri, tauriDev.
+#
+# This site enables i18n (bilingual EN+JA docs → pages/[locale]/docs stub) and
+# none of claudeSkills / tauri / tauriDev, so only i18n is checked here. Adding
+# an unscaffolded feature would produce spurious [MISSING IN PROD] errors.
+for feature in i18n; do
   feature_dir="$FEATURES_DIR/$feature"
   files_dir="$feature_dir/files"
   if [[ ! -d "$files_dir" ]]; then

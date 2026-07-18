@@ -399,7 +399,12 @@ function entryKey(e) {
 
 async function main() {
   const rootDir = resolve(__dirname, "..");
-  const settingsPath = join(rootDir, "src", "config", "settings.ts");
+  // zudo-doc 4.x: site config lives in the single `zudoDoc()` call in
+  // zfb.config.ts (the old src/config/settings.ts is gone). The parse* helpers
+  // regex the same `base:` / `trailingSlash:` / `docsDir:` / `locales.*.dir`
+  // field syntax, and fall back to defaults (base "/", trailingSlash false,
+  // docsDir "src/content/docs") when a field is omitted at its default.
+  const settingsPath = join(rootDir, "zfb.config.ts");
   const basePath = await parseBasePath(settingsPath);
   const trailingSlash = await parseTrailingSlash(settingsPath);
   const distDir = join(rootDir, "dist");
