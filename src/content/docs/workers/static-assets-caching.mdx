@@ -4,7 +4,7 @@ description: Content-hashed bundles are NOT long-cached by default -- the _heade
 sidebar_position: 6
 ---
 
-[Workers Static Assets](./static-assets.mdx) serves every asset with a platform default of `max-age=0` -- including content-hashed bundles like `styles-<hash>.css` whose URLs can never serve different content. The result: in practice, every navigation pays a conditional request for files that should be free. This page covers the one-rule `_headers` fix, how to verify it, the 103 Early Hints complement for cold-cache visits, and why the Lighthouse "inline your CSS" suggestion that often surfaces this problem is the wrong fix.
+[Workers Static Assets](./static-assets.mdx) serves every asset with a platform default of `max-age=0` -- including content-hashed bundles like `styles-<hash>.css` whose URLs can never serve different content. The result: in practice, every navigation pays a conditional request for files that should be free. This page covers the one-rule `_headers` fix, how to verify it, the 103 Early Hints complement for cold-cache visits, and why answering the Lighthouse "inline your CSS" suggestion -- the audit that often surfaces this problem -- by inlining the whole bundle is the wrong fix.
 
 ## The Default: Nothing Is Long-Cached
 
@@ -90,7 +90,7 @@ This whole investigation typically starts with a Lighthouse suggestion: *"Elimin
 - **Inlining destroys cross-page caching.** An external bundle is downloaded once and reused on every page; inlined CSS is re-downloaded inside **every HTML document**. For a multi-page site with a shared bundle (~39 KB gzip in the real-world case below), that is ~39 KB added to every single page view, forever.
 - **Lighthouse models a different audience.** Its default estimates simulate slow 4G (150 ms RTT), which may not represent an edge-served site's real visitors. When the bundle comes from a Cloudflare edge a few tens of milliseconds away -- and, after the fix above, from browser cache on repeat views -- the modeled savings mostly evaporate for that audience.
 
-The correct response to that Lighthouse flag on a Workers Static Assets site is the `_headers` immutable rule, optionally plus Early Hints -- not inlining.
+To be clear about what fixes what: the `immutable` rule improves real repeat navigations, but it will **not** clear the Lighthouse warning -- Lighthouse audits a cold load with an empty cache, so browser caching is invisible to it. If the audit itself matters to you, inlining a **small critical subset** within the ~14 KB budget is the legitimate lever. What is not legitimate is inlining the whole bundle to satisfy a cold-load metric at the cost of making every real navigation heavier. For an edge-served MPA, the `_headers` immutable rule plus optional Early Hints is what actual visitors feel.
 
 ## Real-World Numbers
 
