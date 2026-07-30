@@ -6,11 +6,16 @@
 # Format: one repo-relative path per line (no leading slash).
 # Blank lines and `#` comments are ignored.
 #
-# Reconciled for the zudo-doc 4.x baseline (single-entry `zudoDoc()` config;
+# Reconciled for the zudo-doc 4.4.13 baseline (single-entry `zudoDoc()` config;
 # the ejected pages/lib + src/{config,components,utils,types,integrations}
 # shells are gone — all wiring now lives inside @takazudo/zudo-doc). Only three
 # template files diverge from the pinned baseline; everything else is either
 # byte-identical to the template or host-owned (not template-tracked).
+#
+# On the 4.2.1 -> 4.4.13 bump the only newly-flagged file was
+# scripts/setup-doc-skill.sh, which gained upstream's worktree-aware
+# MAIN_PROJECT_DIR. The host had never customized it, so the template version
+# was adopted rather than allowlisted.
 
 # ── docHistory-patched route stubs ────────────────────────────────────────
 # create-zudo-doc patches the base + i18n doc-route stubs when the docHistory
@@ -32,6 +37,19 @@ src/styles/global.css
 
 # ── Wide home page override (css-wisdom PR #182 parity) ──
 # pages/index.tsx is reconstructed (not the locked 1-line re-export) to render
-# HomePageView with `wide`, matching the zudo-doc showcase. zudo-doc 4.2.1 has
-# no config toggle for the wide home grid — upstream request zudolab/zudo-doc#2959.
+# HomePageView with `wide`, matching the zudo-doc showcase.
+#
+# RETIREMENT CANDIDATE as of the 4.4.13 bump. The reason this reconstruction
+# existed — "zudo-doc exposes no config toggle for the wide home grid",
+# upstream request zudolab/zudo-doc#2959 — no longer holds: 4.4.13 ships
+# `home.wide` (see node_modules/@takazudo/zudo-doc/dist/settings.d.ts, "Widen
+# the home content band…"). The host file can very likely be reduced back to
+# the locked 1-line re-export plus `home: { wide: true }` in zfb.config.ts,
+# dropping this entry entirely.
+#
+# Deliberately NOT done in the same PR as the next.89 -> next.99 / 4.2.1 ->
+# 4.4.13 jump: rewriting the home route concurrently would make a home-page
+# regression ambiguous between the version skew and the rewrite. Left as a
+# focused follow-up, and it is a family-wide call (all five wisdom repos carry
+# this same override).
 pages/index.tsx
