@@ -25,6 +25,12 @@ export default defineConfig(
     // points at dist/_worker.js). REQUIRED — the default is a pure static build
     // that emits no _worker.js, which would break `wrangler deploy`.
     adapter: "@takazudo/zfb-adapter-cloudflare",
+    // Widens the home content band from `max-width: 80rem` to
+    // `clamp(50rem, 92.5vw, 120rem)` so the category grid fills the viewport.
+    // Replaces the host-reconstructed pages/index.tsx + pages/[locale]/index.tsx,
+    // which existed only because zudo-doc 4.2.1 had no toggle (zudo-doc#2959);
+    // 4.4.x added `home.wide`, so the package-owned routes are used again.
+    home: { wide: true },
     locales: {
       ja: { label: "JA", dir: "src/content/docs-ja" },
     },

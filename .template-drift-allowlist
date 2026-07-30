@@ -35,21 +35,13 @@ pages/[locale]/docs/[[...slug]].tsx
 # @takazudo/zudo-doc via theme.css / content.css / features.css.
 src/styles/global.css
 
-# ── Wide home page override (css-wisdom PR #182 parity) ──
-# pages/index.tsx is reconstructed (not the locked 1-line re-export) to render
-# HomePageView with `wide`, matching the zudo-doc showcase.
-#
-# RETIREMENT CANDIDATE as of the 4.4.13 bump. The reason this reconstruction
-# existed — "zudo-doc exposes no config toggle for the wide home grid",
-# upstream request zudolab/zudo-doc#2959 — no longer holds: 4.4.13 ships
-# `home.wide` (see node_modules/@takazudo/zudo-doc/dist/settings.d.ts, "Widen
-# the home content band…"). The host file can very likely be reduced back to
-# the locked 1-line re-export plus `home: { wide: true }` in zfb.config.ts,
-# dropping this entry entirely.
-#
-# Deliberately NOT done in the same PR as the next.89 -> next.99 / 4.2.1 ->
-# 4.4.13 jump: rewriting the home route concurrently would make a home-page
-# regression ambiguous between the version skew and the rewrite. Left as a
-# focused follow-up, and it is a family-wide call (all five wisdom repos carry
-# this same override).
-pages/index.tsx
+# ── Wide home page override: RETIRED, entry removed ──────────────────────
+# pages/index.tsx used to be listed here: it was reconstructed (not the locked
+# 1-line re-export) to render HomePageView with `wide`, because zudo-doc 4.2.1
+# exposed no config toggle for the wide home grid (zudolab/zudo-doc#2959).
+# 4.4.x added `home.wide`, so zfb.config.ts now carries `home: { wide: true }`
+# and pages/index.tsx is back to the stock 1-line re-export — byte-identical to
+# the template, hence no allowlist entry. Its `pages/[locale]/index.tsx`
+# sibling (same workaround for the JA home, never template-tracked so never
+# listed here) was deleted for the same reason; the package-owned `/[locale]`
+# route it shadowed now serves that page again.
