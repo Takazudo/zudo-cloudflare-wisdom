@@ -19,6 +19,7 @@
     "check:html": "html-validate \"dist/**/*.html\"",
     "check:pin-parity": "node scripts/check-pin-parity.mjs",
     "check:wrangler-pin": "node scripts/check-wrangler-pin.mjs",
+    "check:category-meta": "node scripts/check-category-meta.mjs",
     "check:links": "node scripts/check-links.js --strict-broken --allowlist=.check-links-allowlist",
     "check:template-drift": "bash scripts/check-template-drift.sh",
     "format:md": "pnpm dlx @takazudo/mdx-formatter --write \"src/content/**/*.{md,mdx}\"",
