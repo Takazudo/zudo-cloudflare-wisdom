@@ -25,6 +25,11 @@ export default defineConfig(
     // points at dist/_worker.js). REQUIRED — the default is a pure static build
     // that emits no _worker.js, which would break `wrangler deploy`.
     adapter: "@takazudo/zfb-adapter-cloudflare",
+    // Home-hero brand mark, rendered as a theme-adaptive CSS mask. REQUIRED —
+    // zudo-doc 4.4.0 added this setting with a default of "auto", which renders
+    // a generated placeholder SVG seeded by `siteName` in place of the host's
+    // own artwork. Leaving it unset silently discards this site's logo.
+    logo: "/img/logo.svg",
     // Widens the home content band from `max-width: 80rem` to
     // `clamp(50rem, 92.5vw, 120rem)` so the category grid fills the viewport.
     // Replaces the host-reconstructed pages/index.tsx + pages/[locale]/index.tsx,
