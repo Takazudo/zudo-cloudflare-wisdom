@@ -25,8 +25,14 @@ permissions:
 ```
 
 :::warning[Do NOT Cancel In-Progress Deploys]
-Set `cancel-in-progress: false` for production deploys. If two pushes happen quickly, you want both to complete in order, not cancel the first one mid-deploy.
+Set `cancel-in-progress: false` for the job that actually deploys to production. If two pushes land quickly, you want both to complete in order, not have the first one killed mid-deploy.
 :::
+
+### Why Cancellation Mid-Deploy Is Risky
+
+Cancelling a workflow run doesn't just skip the remaining steps — GitHub Actions interrupts whatever step is currently executing too. If that happens while `wrangler deploy` is mid-upload, Cloudflare can end up serving a deployment assembled from two different builds: some assets from the run that got killed, some from whichever run completes next. This has shown up as a real incident more than once, not just a theoretical risk — a rapid second push cancels the first deploy job partway through the upload step, and the site serves a broken mix of old and new assets until the next deploy fixes it.
+
+This is specifically a concern for the **deploy** job. `cancel-in-progress: true` is fine — even desirable — for build or preview-deploy jobs, where the worst outcome of a cancellation is a wasted build that reruns cleanly next time. Keep production deploy on its own `concurrency.group`, separate from any build/preview jobs that use `true`.
 
 ## Build Job
 
@@ -69,14 +75,94 @@ jobs:
 Use `fetch-depth: 0` if your build needs git history (e.g., for doc metainfo showing creation/update dates).
 :::
 
+## Verifying Secrets Before Deploy
+
+:::tip[Scope Secrets to the Step, Not the Job]
+The deploy step later on this page sets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` in its own `env:` block, not at the job level. A job-level `env:` hands those secrets to every step in the job — checkout, install, any `postinstall` script a dependency happens to run — which is far more surface than the one step that actually needs them. Keep secrets scoped to the step that calls `wrangler`.
+:::
+
+Before anything tries to deploy with the Cloudflare secrets, it's worth confirming they're actually set. The obvious approach doesn't work, though:
+
+```yaml
+jobs:
+  deploy:
+    if: secrets.CLOUDFLARE_API_TOKEN != ''
+```
+
+GitHub Actions refuses to even parse this — the `secrets` context isn't available in a job's `if:` (or a step's `if:`) at all, so this fails with `Unrecognized named-value: 'secrets'` before the workflow ever runs. Secrets are only readable inside a step's `run:` or `env:`.
+
+The workaround is a dedicated job that reads the secrets where it's allowed to, then republishes the result as a plain (non-secret) job output:
+
+```yaml
+  check-secrets:
+    name: Verify Required Secrets
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.check.outputs.ok }}
+
+    steps:
+      - name: Check secrets are set
+        id: check
+        run: |
+          if [ -n "${{ secrets.CLOUDFLARE_API_TOKEN }}" ] && [ -n "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID"
+          fi
+```
+
+Downstream jobs can then gate on that output, since `needs.<job>.outputs.*` (unlike `secrets`) is allowed in a job's `if:`:
+
+```yaml
+  deploy:
+    name: Deploy to Cloudflare Pages
+    needs: [build-site, migrate-d1, check-secrets]
+    if: needs.check-secrets.outputs.ok == 'true'
+```
+
+Job outputs are always strings, so the comparison is against the string `'true'`, not a boolean.
+
+:::warning[A Job-Level Gate Beats Per-Step Guards]
+It's tempting to skip the extra job and instead guard individual steps with something like `if: env.CLOUDFLARE_API_TOKEN != ''`. The problem is that per-step guards fail open: forget to add the guard to one step — or add a new step later without one — and that step just runs anyway, unprotected. A single job-level `if:` blocks the entire job when the gate fails, so there's no step left unguarded by accident.
+:::
+
+## Applying D1 Migrations Before Deploy
+
+If your Worker depends on D1 schema changes, apply migrations before the new code that expects them goes live. Give the migration job its own step in the pipeline, gated by the same secrets check:
+
+```yaml
+  migrate-d1:
+    name: Apply D1 Migrations
+    needs: [check-secrets]
+    if: needs.check-secrets.outputs.ok == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Apply D1 migrations
+        run: npx wrangler@4 d1 migrations apply my-database --remote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+```
+
+:::warning[Migrate Before Deploy, Not After]
+List `migrate-d1` in the deploy job's `needs:` so the workflow fails fast if a migration errors, before any new code that expects the new schema goes live. Running migrations after deploy leaves a window where already-live code queries columns or tables that don't exist yet.
+:::
+
 ## Deploy Job
 
 ```yaml
   deploy:
     name: Deploy to Cloudflare Pages
-    needs: [build-site]
+    needs: [build-site, migrate-d1, check-secrets]
+    if: needs.check-secrets.outputs.ok == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Download site artifact
@@ -97,15 +183,36 @@ Use `fetch-depth: 0` if your build needs git history (e.g., for doc metainfo sho
 
       - name: Deploy to Cloudflare Pages (production)
         run: |
-          npx wrangler@4 pages deploy deploy \
-            --project-name=my-site \
-            --branch=main \
-            --commit-hash="${GITHUB_SHA}" \
-            --commit-message="Production deploy: ${GITHUB_SHA}"
+          for attempt in 1 2 3; do
+            if npx wrangler@4 pages deploy deploy \
+              --project-name=my-site \
+              --branch=main \
+              --commit-hash="${GITHUB_SHA}" \
+              --commit-message="Production deploy: ${GITHUB_SHA}"; then
+              exit 0
+            fi
+            echo "Deploy attempt ${attempt} failed."
+            if [ "${attempt}" -lt 3 ]; then
+              echo "Retrying in 150s..."
+              sleep 150
+            fi
+          done
+          echo "::error::Deploy failed after 3 attempts — treating this as a real error, not a transient blip."
+          exit 1
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 ```
+
+Cloudflare's API occasionally returns a transient 5xx error mid-deploy. Wrapping the deploy command in a small retry loop means a blip doesn't fail the whole workflow run: three attempts, 150 seconds apart, and if all three fail, that's treated as a real error rather than something worth retrying further.
+
+:::tip[Account for the Retry Budget in timeout-minutes]
+Two 150-second waits between three attempts add up to 5 minutes of pure backoff, on top of however long each `wrangler deploy` call takes. This example bumps the job's `timeout-minutes` from 10 to 15 to leave room for that — without the extra budget, the job's own timeout can fire before the loop gets to try a third time.
+:::
+
+:::warning[Retry Transient Failures Only — Not Auth or Config Errors]
+This loop exists for transient Cloudflare API 5xx errors, not for anything else. If `wrangler` fails with an auth or config error — an invalid API token, a Cloudflare error code like `10000` — retrying won't help, since the same failure repeats on every attempt. That turns a fast, clear failure into 5+ minutes of wasted CI time before the job finally reports red. If auth/config errors start showing up inside the retry loop, fix the credential or config problem directly rather than letting the loop mask it.
+:::
 
 ## Separating Build and Deploy
 

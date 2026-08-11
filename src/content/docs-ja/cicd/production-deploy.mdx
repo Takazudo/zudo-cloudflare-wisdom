@@ -25,8 +25,14 @@ permissions:
 ```
 
 :::warning[進行中のデプロイをキャンセルしない]
-本番デプロイでは `cancel-in-progress: false` を設定してください。短時間に2回 push された場合、最初のデプロイを途中でキャンセルせず、順番に両方を完了させたいためです。
+実際に本番へデプロイするジョブでは `cancel-in-progress: false` を設定してください。短時間に2回 push された場合、最初のジョブをデプロイ途中でキルせず、順番に両方を完了させたいためです。
 :::
+
+### デプロイ途中のキャンセルが危険な理由
+
+ワークフローランのキャンセルは残りのステップをスキップするだけではありません。GitHub Actions は現在実行中のステップも中断させます。これが `wrangler deploy` のアップロード途中で発生すると、Cloudflare 側には2つの異なるビルドが混ざったデプロイが残ってしまう可能性があります――キルされたランのアセットの一部と、その後完了する別のランのアセットの一部が混在した状態です。これは机上の空論ではなく、実際に複数回起きているインシデントです。立て続けの2回目の push が最初のデプロイジョブをアップロードステップの途中でキャンセルし、次のデプロイで直るまでサイトが新旧混在の壊れた状態で配信され続ける、という形です。
+
+これは特に **deploy** ジョブに関する懸念です。ビルドジョブやプレビューデプロイジョブでは `cancel-in-progress: true` で問題ありません――むしろ望ましいことすらあります。キャンセルされた場合の最悪の結果が、再実行すれば済む無駄なビルド1回分だからです。本番デプロイは専用の `concurrency.group` に置き、`true` を使うビルド/プレビュージョブとは分けてください。
 
 ## ビルドジョブ
 
@@ -69,14 +75,94 @@ jobs:
 ビルドに git 履歴が必要な場合（例: ドキュメントのメタ情報で作成日/更新日を表示する場合）は `fetch-depth: 0` を使用してください。
 :::
 
+## デプロイ前にシークレットを検証する
+
+:::tip[シークレットはジョブではなくステップにスコープする]
+このページ後半のデプロイステップは、`CLOUDFLARE_API_TOKEN` と `CLOUDFLARE_ACCOUNT_ID` をジョブレベルではなく、そのステップ自身の `env:` ブロックに設定しています。ジョブレベルの `env:` にしてしまうと、checkout、install、依存パッケージが実行する `postinstall` スクリプトなど、ジョブ内のすべてのステップにシークレットが渡ってしまいます。これは実際に `wrangler` を呼ぶ1ステップだけに必要な範囲よりはるかに広い露出です。シークレットは `wrangler` を呼ぶステップだけにスコープしてください。
+:::
+
+Cloudflare のシークレットを使ってデプロイする前に、そもそもそれらが設定されているかを確認したくなります。ただし、素直なやり方はうまくいきません：
+
+```yaml
+jobs:
+  deploy:
+    if: secrets.CLOUDFLARE_API_TOKEN != ''
+```
+
+GitHub Actions はこれをそもそもパースしてくれません。`secrets` コンテキストはジョブの `if:`（およびステップの `if:`）では一切利用できないため、ワークフローが実行される前に `Unrecognized named-value: 'secrets'` というエラーで失敗します。シークレットが読めるのはステップの `run:` や `env:` の中だけです。
+
+回避策は、シークレットを読み取れる場所でそれを読み、結果をシークレットではない普通のジョブ output として再公開する専用ジョブを作ることです：
+
+```yaml
+  check-secrets:
+    name: Verify Required Secrets
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.check.outputs.ok }}
+
+    steps:
+      - name: Check secrets are set
+        id: check
+        run: |
+          if [ -n "${{ secrets.CLOUDFLARE_API_TOKEN }}" ] && [ -n "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID"
+          fi
+```
+
+後続のジョブはこの output でゲートできます。`secrets` とは異なり、`needs.<job>.outputs.*` はジョブの `if:` で利用できるためです：
+
+```yaml
+  deploy:
+    name: Deploy to Cloudflare Pages
+    needs: [build-site, migrate-d1, check-secrets]
+    if: needs.check-secrets.outputs.ok == 'true'
+```
+
+ジョブの output は常に文字列なので、比較対象は真偽値ではなく文字列の `'true'` になります。
+
+:::warning[ステップごとのガードより、ジョブレベルのゲートの方が安全]
+専用ジョブを省略して、代わりに個々のステップを `if: env.CLOUDFLARE_API_TOKEN != ''` のようなガードで守りたくなるかもしれません。問題は、ステップごとのガードは fail open（防御漏れの方向に失敗する）ことです。1つのステップにガードを付け忘れる、あるいは後から追加したステップにガードを付け忘れると、そのステップは保護されないまま普通に実行されてしまいます。ジョブレベルの単一の `if:` であれば、ゲートが失敗したときにジョブ全体をブロックできるため、うっかり無防備なステップが残る心配がありません。
+:::
+
+## デプロイ前に D1 マイグレーションを適用する
+
+Worker が D1 のスキーマ変更に依存している場合、それを前提とする新しいコードが動き出す前にマイグレーションを適用してください。マイグレーションジョブをパイプラインの独立したステップとして持たせ、同じシークレットチェックでゲートします：
+
+```yaml
+  migrate-d1:
+    name: Apply D1 Migrations
+    needs: [check-secrets]
+    if: needs.check-secrets.outputs.ok == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Apply D1 migrations
+        run: npx wrangler@4 d1 migrations apply my-database --remote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+```
+
+:::warning[デプロイの後ではなく前にマイグレーションする]
+デプロイジョブの `needs:` に `migrate-d1` を含めてください。そうすることで、新しいスキーマを前提とするコードが動き出す前に、マイグレーションがエラーになった時点でワークフローを早期に失敗させられます。デプロイの後にマイグレーションを実行すると、すでに動いているコードがまだ存在しないカラムやテーブルを問い合わせてしまう時間帯が生まれます。
+:::
+
 ## デプロイジョブ
 
 ```yaml
   deploy:
     name: Deploy to Cloudflare Pages
-    needs: [build-site]
+    needs: [build-site, migrate-d1, check-secrets]
+    if: needs.check-secrets.outputs.ok == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Download site artifact
@@ -97,15 +183,36 @@ jobs:
 
       - name: Deploy to Cloudflare Pages (production)
         run: |
-          npx wrangler@4 pages deploy deploy \
-            --project-name=my-site \
-            --branch=main \
-            --commit-hash="${GITHUB_SHA}" \
-            --commit-message="Production deploy: ${GITHUB_SHA}"
+          for attempt in 1 2 3; do
+            if npx wrangler@4 pages deploy deploy \
+              --project-name=my-site \
+              --branch=main \
+              --commit-hash="${GITHUB_SHA}" \
+              --commit-message="Production deploy: ${GITHUB_SHA}"; then
+              exit 0
+            fi
+            echo "Deploy attempt ${attempt} failed."
+            if [ "${attempt}" -lt 3 ]; then
+              echo "Retrying in 150s..."
+              sleep 150
+            fi
+          done
+          echo "::error::Deploy failed after 3 attempts — treating this as a real error, not a transient blip."
+          exit 1
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 ```
+
+Cloudflare の API はデプロイの途中で一時的に 5xx エラーを返すことがあります。デプロイコマンドを小さなリトライループでラップしておけば、一時的な不調でワークフロー全体を失敗させずに済みます。3回試行、間隔は150秒。3回とも失敗したら、それ以上リトライする価値のあるものではなく、本物のエラーとして扱います。
+
+:::tip[timeout-minutes にリトライの時間予算を織り込む]
+3回の試行の間に入る2回の150秒の待機は、合計で5分の純粋なバックオフ時間になります。これに加えて `wrangler deploy` 自体の実行時間もかかります。この例ではその余裕を持たせるため、ジョブの `timeout-minutes` を10から15に増やしています。この時間予算がないと、ループが3回目の試行にたどり着く前にジョブ自体のタイムアウトが先に発火してしまいます。
+:::
+
+:::warning[リトライするのは一時的な失敗だけ―認証やコンフィグのエラーはリトライしない]
+このループは Cloudflare API の一時的な 5xx エラーのために存在するもので、それ以外のためではありません。`wrangler` が認証やコンフィグのエラー――無効な API トークンや `10000` のような Cloudflare のエラーコード――で失敗した場合、リトライしても無駄です。同じ失敗が毎回繰り返されるだけだからです。それは、本来ならすぐに分かるはずの明確な失敗を、ジョブが最終的に赤く終わるまでの5分以上の無駄な CI 時間に変えてしまいます。リトライループの中で認証やコンフィグのエラーが出始めたら、ループにそれを隠させるのではなく、認証情報や設定の問題を直接修正してください。
+:::
 
 ## ビルドとデプロイを分離する理由
 
