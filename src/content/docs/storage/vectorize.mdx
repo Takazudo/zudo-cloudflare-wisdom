@@ -1,0 +1,121 @@
+---
+title: Vectorize (Vector Database)
+description: Cloudflare Vectorize usage and the wrangler V1/V2 binding-type trap
+sidebar_position: 4
+---
+
+## Overview
+
+Vectorize is Cloudflare's vector database. Store embeddings from Workers AI or another embedding provider, then query the index for the nearest neighbors -- semantic search, recommendations, [RAG retrieval](../ai/chat-memory-rag.mdx), image similarity.
+
+**Dimensions and the distance metric are fixed at index creation and cannot be changed afterward.** Both must match the embedding model you plan to use before you create the index; if the model changes later, the index has to be recreated from scratch.
+
+## Setup
+
+### Create an Index
+
+```bash
+npx wrangler vectorize create my-index --dimensions=768 --metric=cosine
+```
+
+Add to `wrangler.toml`:
+
+```toml
+[[vectorize]]
+binding = "MY_INDEX"
+index_name = "my-index"
+```
+
+## The V1/V2 Binding-Type Trap
+
+Vectorize has two API generations. V1's binding type is `VectorizeIndex`; its `describe()` returns `VectorizeIndexDetails`, which nests dimensions and metric under `config`. V2's binding type is `Vectorize`; its `describe()` returns `VectorizeIndexInfo`, which puts `dimensions` at the top level -- and drops `metric` entirely.
+
+Indexes created today are V2. But `wrangler types` doesn't know that: **verified on wrangler `4.85.0` and `4.120.0` -- both hardcode `VectorizeIndex` (the V1 type) for every `vectorize` binding**, at both of its type-generation call sites in `wrangler-dist/cli.js`. There's no config knob, no per-binding version field, no compatibility-date branch that changes this. (Check the wrangler version your project pins before assuming its behavior matches.)
+
+The trap isn't a simple type error, though. `VectorizeIndexDetails.config` is typed as `VectorizeIndexConfig`, a union with a `{ preset: string }` arm alongside the `{ dimensions, metric }` arm -- so `description.config.dimensions` does **not** typecheck cleanly against the generated V1 type. tsc rejects it until the code narrows the union or casts past it. That cast is exactly what hides the bug:
+
+- **Before (broken)**: the binding stays typed as the generated `VectorizeIndex` (V1). To reach `.dimensions`, the developer narrows or casts `description.config` past the union. It compiles, and it passes unit tests written against a hand-rolled fake that honors whatever shape the cast implies. It only throws a `TypeError` against the real V2 binding, in production, and tends to surface as an opaque "binding check failed" with nothing pointing back to the actual cause.
+- **After (correct)**: once the binding is typed as the honest V2 shape (the seam below), no cast is needed -- `info.dimensions` sits at the top level of `describe()`'s return value. V2's response also drops `metric` entirely; more on that further down.
+
+### Workaround: declare your own seam
+
+Don't let the generated `Env` type's `VectorizeIndex` propagate through the app. Reference the honest V2 type and cast once, at the boundary. `wrangler types` writes `Vectorize` as a global type into `worker-configuration.d.ts` alongside `Env`, so no import is needed here -- projects that still consume `@cloudflare/workers-types` as a package import it from there instead: `import type { Vectorize } from "@cloudflare/workers-types";`.
+
+```typescript
+// wrangler types always emits VectorizeIndex (V1) for a `vectorize`
+// binding, even for indexes created as V2 -- as of wrangler 4.120.0 this
+// is hardcoded at both type-generation call sites in wrangler-dist/cli.js,
+// with no config knob to opt out.
+interface AppEnv extends Omit<Env, "MY_INDEX"> {
+  MY_INDEX: Vectorize;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    // Single cast at the boundary: env.MY_INDEX is really a V2 Vectorize
+    // index -- the generated Env type just hasn't caught up. Everything
+    // past this line uses the honest V2 type.
+    const appEnv = env as unknown as AppEnv;
+
+    const info = await appEnv.MY_INDEX.describe();
+    return Response.json(info);
+  },
+};
+```
+
+Everything downstream of `appEnv` sees the real V2 shape. The generated V1 type never leaves this one function.
+
+## Usage in Functions
+
+With `appEnv.MY_INDEX` typed correctly via the seam above, the calls look like any other Cloudflare binding:
+
+```typescript
+// Insert vectors
+await appEnv.MY_INDEX.insert([
+  { id: "1", values: [0.1, 0.2, 0.3], metadata: { text: "hello" } },
+]);
+
+// Query for nearest neighbors
+const matches = await appEnv.MY_INDEX.query([0.1, 0.2, 0.3], { topK: 5 });
+```
+
+## Verifying the Distance Metric
+
+V2's `describe()` returns `VectorizeIndexInfo`, and that type has no `metric` field at all -- there is no runtime call that tells a Worker whether an index is `cosine`, `euclidean`, or `dot-product`. The Worker also has no API token to ask the management API directly.
+
+So the metric has to be verified outside the request path: at provisioning time (read it back from `wrangler vectorize create` or `wrangler vectorize get`), or as a deploy-time check that calls the REST API with a scoped token, not at runtime inside the Worker.
+
+## Deploy-Time Failures Aren't Caught by `--dry-run`
+
+A `vectorize` binding that points at an index which doesn't exist yet fails `wrangler deploy` outright, with an API error that includes `code: 10159` (as of wrangler `4.120.0`). It's printed *after* wrangler has already shown the bindings table, so it's easy to miss in a quick skim of CI output.
+
+`wrangler deploy --dry-run` does **not** catch this, as of wrangler `4.120.0` -- dry-run validates the Worker script and config shape, but never resolves remote resources, so a missing index passes dry-run and only fails on the real deploy.
+
+:::warning[No auto-provisioning, unlike KV/R2/D1]
+Contrast this with KV, R2, and D1 bindings: wrangler can [auto-provision](https://developers.cloudflare.com/changelog/post/2025-10-24-automatic-resource-provisioning/) those during deploy when the resource doesn't exist yet, so a missing namespace, bucket, or database self-heals instead of failing the build. Vectorize has no equivalent -- a missing index fails `wrangler deploy` outright, so create the index before the first deploy that binds to it.
+:::
+
+## Return Shape Differences: insert / upsert / deleteByIds
+
+`insert`, `upsert`, and `deleteByIds` return different shapes between generations:
+
+```typescript
+// V1
+const result = await appEnv.MY_INDEX.insert(vectors);
+result.ids; // string[]
+result.count; // number
+
+// V2
+const result = await appEnv.MY_INDEX.insert(vectors);
+result.mutationId; // string
+```
+
+This is latent -- it only breaks when something actually reads `.ids` or `.count` off a V2 response (both `undefined`), which can be well after the insert call itself was written and shipped.
+
+## Gotchas
+
+- **Dimensions and metric are permanent**: set at index creation, no in-place migration -- get them right before the first insert
+- **`wrangler types` emits the V1 binding type**: declare your own `Vectorize` seam (see above) instead of trusting the generated `Env`
+- **No metric at runtime (V2)**: `describe()` cannot report the distance metric -- verify it at provisioning or deploy time instead
+- **Missing index fails deploy, not dry-run**: `--dry-run` does not resolve remote resources, so create the index first
+- **`insert`/`upsert`/`deleteByIds` return shape depends on API generation**: `{ ids, count }` (V1) vs `{ mutationId }` (V2)

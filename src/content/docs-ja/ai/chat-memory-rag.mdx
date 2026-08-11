@@ -77,7 +77,7 @@ flowchart LR
 | [D1](../storage/d1.mdx) | 永続的な会話行、メッセージメタデータ、ユーザーやテナントの JOIN、認可チェック、監査ログ。 | 大きなトランスクリプト、添付ファイル、不透明な blob。 |
 | [R2](../storage/r2.mdx) | トランスクリプト全体のエクスポート、大きなアーカイブ済みターン、添付ファイル、生成ファイル、import/export bundle。 | ホットなリレーショナルクエリやターン単位の認可ロジック。 |
 | [KV](../storage/kv.mdx) | 小さなキャッシュ済み要約、プロンプト断片、セッションスナップショット、TTL bot state、読み取り中心の参照データ。 | デフォルトの主要な永続チャット履歴。KV は結果整合で、監査性には弱い。 |
-| [Vectorize](https://developers.cloudflare.com/vectorize/) | ドキュメントやメッセージの埋め込み、semantic retrieval、RAG candidate lookup。 | source-of-truth storage。正本のコンテンツは D1、R2、または別の永続システムに置く。 |
+| [Vectorize](../storage/vectorize.mdx) | ドキュメントやメッセージの埋め込み、semantic retrieval、RAG candidate lookup。 | source-of-truth storage。正本のコンテンツは D1、R2、または別の永続システムに置く。 |
 | [Durable Objects](../workers/durable-objects.mdx) | リアルタイムルーム、WebSocket fan-out、会話単位の調整、同時書き込みの直列化。 | 大きな長期アーカイブや広範な分析クエリ。 |
 
 ## 関連ドキュメント

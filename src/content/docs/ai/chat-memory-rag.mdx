@@ -91,7 +91,7 @@ state.
 | [D1](../storage/d1.mdx) | Durable conversation rows, message metadata, user or tenant joins, authorization checks, audit trails. | Large transcripts, attachments, or opaque blobs. |
 | [R2](../storage/r2.mdx) | Full transcript exports, large archived turns, attachments, generated files, import/export bundles. | Hot relational queries or per-turn authorization logic. |
 | [KV](../storage/kv.mdx) | Small cached summaries, prompt fragments, session snapshots, TTL bot state, read-heavy lookup data. | Default primary durable chat history. KV is eventually consistent and is weak for auditability. |
-| [Vectorize](https://developers.cloudflare.com/vectorize/) | Embeddings over docs or messages, semantic retrieval, RAG candidate lookup. | Source-of-truth storage. Keep canonical content in D1, R2, or another durable system. |
+| [Vectorize](../storage/vectorize.mdx) | Embeddings over docs or messages, semantic retrieval, RAG candidate lookup. | Source-of-truth storage. Keep canonical content in D1, R2, or another durable system. |
 | [Durable Objects](../workers/durable-objects.mdx) | Realtime rooms, WebSocket fan-out, per-conversation coordination, serializing concurrent writes. | Large long-term archives or broad analytical queries. |
 
 ## Related Docs

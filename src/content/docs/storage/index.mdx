@@ -1,10 +1,10 @@
 ---
 title: Storage
-description: KV, D1, and R2 storage services
+description: KV, D1, R2, and Vectorize storage services
 sidebar_position: 5
 ---
 
-Cloudflare offers three storage services, each optimized for different access patterns.
+Cloudflare offers four storage services, each optimized for different access patterns.
 
 ## Overview
 
@@ -13,6 +13,7 @@ Cloudflare offers three storage services, each optimized for different access pa
 | **KV** | Key-value store | Read-heavy, eventually consistent data | Eventual |
 | **D1** | SQL database (SQLite) | Relational data, complex queries | Strong |
 | **R2** | Object storage (S3-compatible) | Files, images, large blobs | Strong |
+| **Vectorize** | Vector database | Embedding similarity search, RAG retrieval | Async index updates |
 
 ## Choosing the Right Service
 
@@ -22,7 +23,9 @@ graph TD
   B -->|Yes| C[D1 - SQL database]
   B -->|No| D{Large files/blobs?}
   D -->|Yes| E[R2 - Object storage]
-  D -->|No| F{Read-heavy, ok with eventual consistency?}
+  D -->|No| H{Vector embeddings for similarity search?}
+  H -->|Yes| I[Vectorize - Vector database]
+  H -->|No| F{Read-heavy, ok with eventual consistency?}
   F -->|Yes| G[KV - Key-value store]
   F -->|No| C
 ```
@@ -32,3 +35,4 @@ graph TD
 - [KV](./kv.mdx) -- Key-value namespace usage patterns
 - [D1](./d1.mdx) -- SQL database with SQLite
 - [R2](./r2.mdx) -- Object storage for files
+- [Vectorize](./vectorize.mdx) -- Vector database for embeddings and similarity search
