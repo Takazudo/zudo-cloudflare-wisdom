@@ -129,12 +129,69 @@ _worker.js.map
 
 これがないと、`dist/_worker.js` は静的アセットとして公開取得可能になる。`.assetsignore` の内容はアダプターの出力ファイル名に依存するため、ビルド・デプロイツールがコミットせずデプロイ時に `dist/` へ生成することが多い。
 
+## SSR のインデックス + 404 ページで、ブラウザからだけトップページが壊れる
+
+`not_found_handling` が適用されるのは**ナビゲーションリクエストだけ**である。つまり `sec-fetch-mode: navigate` を伴うリクエスト — 人が URL を開いたときにブラウザが必ず送り、`curl` は決して送らないもの。アセットに一致しないナビゲーション以外のリクエストは、代わりに Worker へフォールスルーする。
+
+この違いは、ごく普通の 3 つの選択が揃うまで表に出ない：
+
+1. インデックスルートがサーバーレンダリング（`prerender = false`）で、ビルドが **`dist/index.html` を出力しない**。
+2. `not_found_handling = "404-page"`。
+3. プロジェクトに 404 ページがあり、アセット層が配信できる **`dist/404.html` が存在する**。
+
+こうなると、ブラウザで `/` を開いてもアセットに一致せず、`not_found_handling` で応答され、404 ページが返る — **Worker は一度も動かない**。同じ URL を `curl` で叩くと Worker にフォールスルーして正常に描画される：
+
+```
+curl そのまま                          -> 200  <title>My Site</title>
+curl -H 'sec-fetch-mode: navigate'   -> 404  <title>Not found</title>
+ヘッドレスブラウザ                      -> 404
+```
+
+サイトは人間の訪問者全員に対して壊れており、HTTP レベルのチェックはすべて緑になる。
+
+:::danger[404 ページを消すと「偶然」直る — それに依存してはいけない]
+*同じ* SSR インデックス構成の姉妹プロジェクトが動いていたのは、404 ページを持っていなかったからにすぎない。配信すべき `dist/404.html` が無いのでリクエストが Worker へフォールスルーしていた。ファイルを 1 つ足せば同じ障害になる状態だった。SSR インデックスのアプリが今動いているなら、安全だと決めつける前に*なぜ*動いているのかを確認すること。
+:::
+
+修正は、Worker が担当するルートについて Worker を先に走らせること。新しめの wrangler はパターンのリストを受け付けるので、静的アセットは直接配信のままにできる：
+
+```toml
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "404-page"
+# `/` はサーバーレンダリングで静的ファイルが無く、API ルートも Worker のもの。
+# それ以外（例: /assets/*）は引き続き Worker を経由しない。
+run_worker_first = ["/", "/api/*"]
+```
+
+`run_worker_first = true` でも動作し、そちらのほうが単純だが、すべてのアセットリクエストで Worker が起動するコストがかかる。
+
+検証は、実際にそのヘッダーを伴うリクエストで行うこと。`wrangler dev` はこの挙動を忠実に再現する：
+
+```bash
+curl -H 'sec-fetch-mode: navigate' http://127.0.0.1:8787/        # 200 を期待
+curl -H 'sec-fetch-mode: navigate' http://127.0.0.1:8787/nope    # 本物の 404 を期待
+curl http://127.0.0.1:8787/assets/styles-abc123.css              # 引き続き直接配信
+```
+
+:::warning[`fetch()` はこのヘッダーを送れないので、Node のスモークテストでは捕まえられない]
+`Sec-` で始まる名前は Fetch 仕様の**禁止ヘッダー名**であり、undici — したがって Node のグローバル `fetch()` — はこれを黙って落とす。リクエストは通常のものとして送出され、フォールスルーした 200 が返る：
+
+```
+node fetch + sec-fetch-mode  -> 200   （ヘッダーが落とされる）
+curl       + sec-fetch-mode  -> 404   （ヘッダーが送られる）
+```
+
+つまり fetch ベースのデプロイ後チェックは、ユーザーが決して生成しないリクエスト形状を試しており、まさにこのバグを緑のまま通過させる。ヘッダーをそのまま書き出す `node:https`（あるいは `undici.request`、実ブラウザ）を使うこと。
+:::
+
 ## まとめ
 
 | フィールド | デフォルト | 設定する場面 |
 |---|---|---|
 | `binding` | -- | 常に。アダプターは `env.ASSETS` を読む |
 | `not_found_handling` | `"none"` | SSG -> `"404-page"`、SPA -> `"single-page-application"` |
-| `run_worker_first` | `false` | Worker が**すべての**リクエストをゲート・認可する必要がある -> `true` |
+| `run_worker_first` | `false` | Worker が**すべての**リクエストをゲート・認可する必要がある -> `true`。あるいはインデックスが SSR で `dist/404.html` が存在する -> `["/", ...]` |
 | `workers_dev` | `true` | 本番を `*.workers.dev` で配信するのをやめる -> `false` |
 | `preview_urls` | `workers_dev` に一致 | `workers_dev = false` でもプレビューを残すため常に**明示的に**設定 |
