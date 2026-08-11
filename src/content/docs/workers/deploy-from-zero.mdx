@@ -117,8 +117,51 @@ A working permission set for a Workers + D1 + KV + Workers AI stack (trim to wha
 | Account -- Workers AI | Read |
 | Account -- Account Settings | Read |
 | Zone -- Workers Routes | Edit (only when using custom domains) |
+| Zone -- DNS | Edit (only when using custom domains) |
 
 Store the token and account id as GitHub Actions secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
+
+:::warning[A custom domain needs **two** zone permissions, and Zone Resources must actually include the zone]
+
+`custom_domain = true` has Cloudflare *create and manage* the DNS record and the edge certificate, so `Zone -- Workers Routes: Edit` alone is not enough -- `Zone -- DNS: Edit` is doing real work here. Grant both.
+
+Equally easy to miss: adding zone permissions does nothing while **Zone Resources** is left empty. The permission rows and the resource scope are separate controls, and a token with both zone rows but no zone included still fails at route creation on every deploy.
+
+:::
+
+## A Freshly Attached Custom Domain Is Not Immediately Usable
+
+`wrangler deploy` reports the custom domain the moment it creates the route:
+
+```
+Deployed my-worker triggers (1.12 sec)
+  my-worker.example.com (custom domain)
+```
+
+That line means the route exists, **not** that the hostname works. For roughly a minute afterwards the edge can still answer with Cloudflare's own error pages (`error code: 1104`, or a 5xx) while the record and certificate settle. A post-deploy check that runs seconds later is racing that window, not testing your site.
+
+Two distinct failure shapes show up, and they are easy to misdiagnose as application bugs:
+
+**AAAA lands before A.** Cloudflare publishes the IPv6 record first. GitHub Actions runners have **no IPv6 route**, so every connection attempt in that gap fails with `ENETUNREACH` -- on a Worker that is perfectly healthy. Confirm by fetching the `*.workers.dev` URL, which is unaffected: if that returns 200, the Worker is fine and you are looking at propagation.
+
+Node reports this via Happy Eyeballs as an `AggregateError` that **may carry no `code` of its own** -- the real per-address codes hang off `.errors[]`. Any error classifier that walks only the `.cause` chain misses them entirely:
+
+```js
+function codes(error) {
+  const out = [];
+  for (let e = error; e; e = e.cause) {
+    if (e.code) out.push(e.code);
+    if (Array.isArray(e.errors)) out.push(...e.errors.flatMap(codes)); // <- required
+  }
+  return out;
+}
+```
+
+**The edge answers 5xx before the origin is wired.** The hostname resolves and TLS completes, but Cloudflare serves its own error page. Treat a 5xx on the *first* probe of a freshly attached domain as "not ready", never as a passing response.
+
+:::tip[Scope the leniency, or it becomes a blind spot]
+Retry-and-tolerate is correct only for the **first** probe, and only until it succeeds once. After the host has answered, it is demonstrably deployed -- a later failure is a real fault and must stay fatal. A tolerance that applies to every request turns a genuine outage into a silent pass.
+:::
 
 ## CI Deploys from the Committed Config
 

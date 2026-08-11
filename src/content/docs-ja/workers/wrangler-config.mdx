@@ -270,3 +270,22 @@ custom_domain = true
 ```
 
 `custom_domain = true` は、既存のゾーンのルートパターンに一致させるのではなく、そのホスト名の DNS レコードと TLS 証明書を Cloudflare が自動で作成・管理するよう指示する。
+
+:::danger[名前付き環境はトップレベルの `routes` を継承する — デプロイするとドメインを奪う]
+
+`routes` は**継承される**キーである。カスタムドメインをトップレベルに置き、名前付き環境で上書きしなければ、その環境は production のホスト名を継承する。wrangler 自身がはっきり警告する：
+
+> The "env.preview" environment inherits the top-level `routes` configuration, which includes the custom domain(s): example.com. **Deploying this environment will reassign these custom domains away from the top-level Worker.** Add `"routes": []` to "env.preview" to prevent inheritance.
+
+修正は production 以外の各環境に 1 行の上書きを足すだけ：
+
+```toml
+[env.preview]
+routes = []
+```
+
+**これが表面化しにくい理由。** `wrangler versions upload` で組まれた preview パイプラインはトリガーを適用しないため、設定ミスは休眠したままで、どのデプロイも正常に見える。後からそのパイプラインを `wrangler deploy --env preview` に変えると — それ自体はまっとうなリファクタリングだが — 次の実行で preview の Worker が production のホスト名を黙って奪う。
+
+`wrangler deploy --dry-run --env <name>` で `routes: []` と報告されることを確認すること。デプロイが緑だったことから推測してはいけない。
+
+:::

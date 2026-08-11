@@ -274,3 +274,22 @@ custom_domain = true
 ```
 
 `custom_domain = true` tells Cloudflare to create and manage the DNS record and TLS cert for that hostname automatically, rather than matching an existing zone route pattern.
+
+:::danger[A named environment INHERITS top-level `routes` — and deploying it steals the domain]
+
+`routes` is an **inheritable** key. If the custom domain sits at the top level and a named environment does not override it, that environment inherits the production hostname. Wrangler says so plainly:
+
+> The "env.preview" environment inherits the top-level `routes` configuration, which includes the custom domain(s): example.com. **Deploying this environment will reassign these custom domains away from the top-level Worker.** Add `"routes": []` to "env.preview" to prevent inheritance.
+
+The fix is a one-line override on every non-production environment:
+
+```toml
+[env.preview]
+routes = []
+```
+
+**Why this hides.** A preview pipeline built on `wrangler versions upload` never applies triggers, so the misconfiguration sits dormant and every deploy looks fine. Switch that pipeline to `wrangler deploy --env preview` later — a perfectly reasonable refactor — and the preview Worker silently takes production's hostname on the next run.
+
+Verify with `wrangler deploy --dry-run --env <name>` and confirm it reports `routes: []`. Do not infer it from a green deploy.
+
+:::
