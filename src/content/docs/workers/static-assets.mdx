@@ -190,7 +190,7 @@ A fetch-based post-deploy check therefore exercises a request shape no user ever
 
 | Field | Default | Set it when |
 |---|---|---|
-| `binding` | -- | Always; your adapter reads `env.ASSETS` |
+| `binding` | -- | Worker has `main` -> always set it, your adapter reads `env.ASSETS`; assets-only Worker (no `main`) -> omit it, wrangler hard-errors if it's set |
 | `not_found_handling` | `"none"` | SSG -> `"404-page"`; SPA -> `"single-page-application"` |
 | `run_worker_first` | `false` | The Worker must gate/authorize **every** request -> `true`; or the index is SSR with a `dist/404.html` present -> `["/", ...]` |
 | `workers_dev` | `true` | Stop serving production on `*.workers.dev` -> `false` |
