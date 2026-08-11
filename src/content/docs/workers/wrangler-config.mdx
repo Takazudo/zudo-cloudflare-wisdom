@@ -21,6 +21,32 @@ main = "src/index.ts"
 compatibility_date = "2024-12-01"
 ```
 
+## TOML Table Scoping
+
+`wrangler.toml` is plain [TOML](https://toml.io/), and TOML's table rule applies here: once you write a table header like `[vars]`, `[assets]`, or `[env.preview]`, **every bare `key = value` line that follows belongs to that table** -- not to the top level -- until the next `[...]` header appears. This bites people who append a field to the bottom of the file without checking which table they are currently inside:
+
+```toml
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+
+# Intended as a top-level setting, but it lands inside [assets] because
+# no new table header appeared above it.
+workers_dev = false
+```
+
+Wrangler does not silently accept the misplaced key as harmless noise -- it validates each table's known fields and reports what does not belong:
+
+```
+Unexpected fields found in assets field: "workers_dev"
+```
+
+That is a **warning**, not a hard error: the build still runs, but the field is dropped rather than applied where you meant it. `workers_dev` never takes effect, and the mistake is easy to miss in a long deploy log.
+
+:::tip[Keep top-level keys grouped above the first table header]
+List `name`, `main`, `compatibility_date`, `compatibility_flags`, `workers_dev`, and `preview_urls` together at the very top of the file, before any `[...]` table. Anything meant for the top level has to sit above every table header, not just the one you were last editing.
+:::
+
 ## Bindings
 
 Bindings connect your code to Cloudflare services.
@@ -67,6 +93,39 @@ npx wrangler secret put MY_SECRET
 The `[vars]` section is for non-sensitive configuration only. Secrets should be set via `wrangler secret put` or the Cloudflare dashboard. `wrangler.toml` is committed to git.
 :::
 
+### Declaring Required Secrets
+
+Secrets themselves never belong in `wrangler.toml`, but you can declare **which secret names your Worker expects** with a `[secrets]` table:
+
+```toml
+[secrets]
+required = ["STRIPE_KEY", "SESSION_SECRET"]
+```
+
+This does not set values -- it is a checklist wrangler enforces at dev and deploy time:
+
+- **`wrangler dev`**: a missing required secret is a **warning**, not a hard stop -- `Missing required secrets: STRIPE_KEY. Add them to .dev.vars, .env, or set as environment variables.` The Worker still starts; the secret is simply absent from `env`.
+- **First deploy of a new Worker**: a missing required secret is a **hard error** that stops the deploy -- `The following required secrets have not been set: STRIPE_KEY. Use wrangler secret put <NAME> to set secrets before deploying.`
+- **Redeploying an existing Worker**: wrangler asks the API to inherit the secret's current value from the previous version instead of failing immediately. If the secret was truly never set, the API rejects the inherit and wrangler re-surfaces the same "required secrets have not been set" error -- the failure still happens, just one round-trip later.
+
+:::note[`--strict-vars` is unrelated]
+`--strict-vars` (default `true`) is a flag for `wrangler types` -- it controls whether generated TypeScript types for `[vars]` are literal/union types or widened primitives. It has nothing to do with `[secrets].required`; the similar-sounding names describe two unrelated features.
+:::
+
+### `wrangler deploy` Replaces `[vars]` Wholesale
+
+By default, every `wrangler deploy` **deletes all vars currently live on the Worker and replaces them with exactly what `wrangler.toml` declares.** If a var was added through the Cloudflare dashboard for a quick fix, the next config-driven deploy silently removes it -- there is no merge.
+
+```bash
+npx wrangler deploy --keep-vars
+```
+
+`--keep-vars` skips the delete-then-recreate step, leaving dashboard-set vars in place alongside whatever `wrangler.toml` declares. Use it whenever vars might have been set outside the config file. Secrets are unaffected either way -- `wrangler deploy` never deletes secrets, with or without this flag, so this trap is specific to `[vars]`.
+
+:::tip[Check before you deploy]
+If you are not sure what is currently live, check the dashboard's Variables & Secrets tab before an environment's first config-driven deploy, so you know whether `--keep-vars` is needed.
+:::
+
 ## Pages-Specific Options
 
 For Pages projects, you can specify the build output directory:
@@ -74,6 +133,15 @@ For Pages projects, you can specify the build output directory:
 ```toml
 pages_build_output_dir = "./dist"
 ```
+
+## The `[cache]` Table
+
+```toml
+[cache]
+enabled = true
+```
+
+`[cache]` is a real, valid `wrangler.toml` table with exactly one allowed field, `enabled` (boolean) -- any other key inside it fails the same "Unexpected fields" check described above. It is newer and less documented than the other tables on this page, so **generic TOML/JSON-schema linters in some editors flag it as an unknown key** even though wrangler itself accepts it without complaint. Treat an editor's red squiggle under `[cache]` as a stale schema, not a real error -- confirm against `wrangler deploy --dry-run` (which validates the whole file) rather than the editor's underline.
 
 ## Multiple Bindings Example
 
@@ -159,13 +227,33 @@ binding = "CACHE"
 id = "placeholder-production-kv-id"
 ```
 
-:::warning[Re-declare everything per environment]
-There is no partial inheritance for bindings or vars. If `[env.preview]` exists, it must list its own D1, R2, KV, AI, services, and `[env.preview.vars]`. A missing binding does not error at deploy — it surfaces as a runtime `undefined` inside the Worker.
+:::warning[Re-declare everything per environment -- except `[assets]`]
+There is no partial inheritance for bindings or vars. If `[env.preview]` exists, it must list its own D1, R2, KV, AI, services, and `[env.preview.vars]`. A missing binding does not error at deploy — it surfaces as a runtime `undefined` inside the Worker. The one exception is `[assets]` (Static Assets), covered below.
+:::
+
+:::info[The one exception: `[assets]` IS inherited]
+Static Assets breaks the rule above. If the top level declares `[assets]` and `[env.preview]` does not declare its own `[env.preview.assets]`, `env.preview` automatically uses the top-level block -- directory, binding, and all. Wrangler treats `assets` the same way it treats `workers_dev`: as a normal inheritable setting, not as a binding that needs re-declaring.
+
+```toml
+name = "my-site"
+main = "./dist/_worker.js"
+compatibility_date = "2024-12-01"
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+
+# env.preview declares no [env.preview.assets] block at all,
+# so it inherits the top-level [assets] above unchanged.
+[env.preview]
+```
+
+The inheritance is all-or-nothing per environment: the moment `[env.preview.assets]` exists at all, even partially, it replaces the top-level block outright rather than merging with it -- so a partial override still needs every field you rely on (`directory`, `binding`, `not_found_handling`, `run_worker_first`).
 :::
 
 <Note>
 
-Non-binding *settings* such as `workers_dev` and `preview_urls` DO inherit from the top level into named environments. The non-inheritance rule applies specifically to bindings and `[vars]`. Setting them explicitly per environment is still common for legibility.
+Non-binding *settings* such as `workers_dev` and `preview_urls` DO inherit from the top level into named environments. The non-inheritance rule applies to bindings and `[vars]` -- with the single exception of `[assets]` noted above. Setting things explicitly per environment is still common for legibility.
 
 </Note>
 
