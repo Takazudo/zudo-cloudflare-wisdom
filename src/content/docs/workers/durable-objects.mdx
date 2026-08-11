@@ -237,8 +237,8 @@ detector available:
 ```typescript
 const HEARTBEAT_INTERVAL_MS = 25_000;
 
-private scheduleHeartbeat(): void {
-  this.state.storage.setAlarm(Date.now() + HEARTBEAT_INTERVAL_MS);
+private async scheduleHeartbeat(): Promise<void> {
+  await this.state.storage.setAlarm(Date.now() + HEARTBEAT_INTERVAL_MS);
 }
 
 // The alarm handler doubles as the heartbeat sweep.
@@ -247,7 +247,7 @@ async alarm(): Promise<void> {
     await this.write(id, conn, `: heartbeat\n\n`);
   }
   if (this.connections.size > 0) {
-    this.scheduleHeartbeat();
+    await this.scheduleHeartbeat();
   }
 }
 ```
@@ -259,6 +259,13 @@ failure is the disconnect signal. Unlike the WebSocket broadcast above, which
 can afford to swallow a failed send because `webSocketClose` will eventually
 report the same disconnect independently, an SSE connection has no such
 backstop — the failed heartbeat write is the *only* place cleanup happens.
+
+`scheduleHeartbeat()` must be `async` and awaited at every call site. If
+`setAlarm()` rejects and nothing awaits it, `alarm()` still resolves
+successfully — the runtime sees a clean run, not a throw, so its automatic
+alarm retry never kicks in. With no pending alarm and no retry, the heartbeat
+simply stops, silently disabling the only disconnect detector this section
+just established.
 
 ### Serializing writes per connection
 
@@ -274,16 +281,25 @@ happens exactly once:
 interface Connection {
   controller: ReadableStreamDefaultController<Uint8Array>;
   writeQueue: Promise<void>;
+  closed: boolean;
 }
 
 private write(id: string, conn: Connection, chunk: string): Promise<void> {
   conn.writeQueue = conn.writeQueue
     .then(() => {
+      if (conn.closed) return;
       conn.controller.enqueue(this.encoder.encode(chunk));
     })
     .catch(() => {
-      // First failed write on this connection — treat it as dead.
-      this.connections.delete(id);
+      // First failed write on this connection — mark it closed so every
+      // write already queued behind this one no-ops instead of retrying
+      // against the dead controller.
+      conn.closed = true;
+      // Only remove this exact connection object — a reconnect that took
+      // the same id after this one failed must not be deleted.
+      if (this.connections.get(id) === conn) {
+        this.connections.delete(id);
+      }
     });
   return conn.writeQueue;
 }
@@ -291,8 +307,9 @@ private write(id: string, conn: Connection, chunk: string): Promise<void> {
 
 Every caller — `broadcast()`, the heartbeat sweep, an individual `send()` —
 goes through this same `write()` and the same queue. Whichever write fails
-first removes the connection; the queue's own `.catch` turns writes already
-queued behind it into a no-op instead of a second throw.
+first flips `closed` and removes the connection; every write already queued
+behind it sees `closed` on its turn and no-ops instead of retrying against
+the dead controller and re-triggering cleanup.
 
 ## Alarms and self-scheduling TTL sweeps
 

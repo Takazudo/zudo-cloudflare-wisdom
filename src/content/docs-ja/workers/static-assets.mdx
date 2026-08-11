@@ -190,7 +190,7 @@ curl       + sec-fetch-mode  -> 404   （ヘッダーが送られる）
 
 | フィールド | デフォルト | 設定する場面 |
 |---|---|---|
-| `binding` | -- | Worker に `main` がある -> 常に設定し、アダプターが `env.ASSETS` を読む；assets-only Worker（`main` なし）-> 省略する。設定していると wrangler がハードエラーになる |
+| `binding` | -- | Worker（またはそのアダプター）が実際に `env.ASSETS.fetch()` を呼ぶ -> 設定する；Worker に `main` はあるがアセットファーストのルーティングに任せきりで `env.ASSETS` に一切触れない -> 省略する；assets-only Worker（`main` なし）-> 省略する。設定していると wrangler がハードエラーになる |
 | `not_found_handling` | `"none"` | SSG -> `"404-page"`、SPA -> `"single-page-application"` |
 | `run_worker_first` | `false` | Worker が**すべての**リクエストをゲート・認可する必要がある -> `true`。あるいはインデックスが SSR で `dist/404.html` が存在する -> `["/", ...]` |
 | `workers_dev` | `true` | 本番を `*.workers.dev` で配信するのをやめる -> `false` |
