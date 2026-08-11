@@ -215,6 +215,16 @@ const stream = new ReadableStream<Uint8Array>({
 Once `aborter` fires, the next `if (aborter.signal.aborted) break` exits the loop
 and the reader is released, so no further frames are pulled from Workers AI.
 
+:::warning[This pattern is plain-Worker-only]
+The `AbortController` + `signal`/`cancel()` pair above works because this
+recipe is a single Worker handling one request at a time — there is exactly
+one place doing the aborting and exactly one stream to tear down. Inside a
+Durable Object fanning out SSE to many connections at once, those same hooks
+are not reliable disconnect signals — see [SSE fan-out and the heartbeat
+disconnect check](../workers/durable-objects.mdx#sse-fan-out-and-the-heartbeat-disconnect-check)
+for why, and the heartbeat pattern that replaces it.
+:::
+
 ## Runtime kill switch
 
 Sometimes you need to turn the endpoint off right now — a cost spike, abuse, or a

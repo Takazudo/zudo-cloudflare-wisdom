@@ -215,6 +215,17 @@ const stream = new ReadableStream<Uint8Array>({
 `aborter` が発火すると、次の `if (aborter.signal.aborted) break` でループを抜け、reader が
 解放されるため、Workers AI からそれ以上フレームが引き出されることはありません。
 
+:::warning[このパターンはプレーンな Worker 専用]
+上記の `AbortController` と `signal` / `cancel()` の組み合わせが機能するのは、
+このレシピが 1 度に 1 つのリクエストだけを扱う単一の Worker だからです —
+中断を行う場所も、破棄すべきストリームも、ちょうど 1 つしかありません。
+一度に多数の接続へ SSE をファンアウトする Durable Object の内部では、
+同じフックは信頼できる切断シグナルにはなりません。理由と、それに代わる
+ハートビートのパターンについては
+[SSE ファンアウトとハートビートによる切断検知](../workers/durable-objects.mdx#sse-ファンアウトとハートビートによる切断検知)
+を参照してください。
+:::
+
 ## ランタイムのキルスイッチ
 
 コストの急増、不正利用、あるいはモデルの不調など、エンドポイントを今すぐ止めたい場面が
