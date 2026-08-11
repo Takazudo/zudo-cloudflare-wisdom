@@ -12,13 +12,36 @@ For Pages and Workers deployment, the token needs:
 
 - **Account > Cloudflare Pages > Edit**
 - **Account > Workers Scripts > Edit**
+- **Account > Account Settings > Read**
 - **Account > Workers KV Storage > Edit** (if using KV)
 - **Account > Workers R2 Storage > Edit** (if using R2)
 - **Account > D1 > Edit** (if using D1)
 
+:::warning
+`Account Settings: Read` doesn't look deploy-related, but it's required in practice -- the minimal working Pages token is `{Cloudflare Pages: Edit, Account Settings: Read}`, and a bare `wrangler deploy` with zero bindings needs it too. Leave it out and you get the opaque `Authentication error [code: 10000]` instead of a permission-specific error.
+:::
+
 :::tip
 Create one token with all permissions rather than separate tokens per service. Store it as `CLOUDFLARE_API_TOKEN` in your GitHub repo secrets.
 :::
+
+For the complete corrected token reference -- including the custom-domain dual-zone-permission trap and Zone Resources scoping -- see the CI Token section in [Deploy From Zero](../workers/deploy-from-zero.mdx).
+
+## Shared Token for Low-Risk Repos
+
+Running many small, low-risk repos on one account -- example apps, demos, preview sites -- is a case for minting **one** account-scoped token sized to the union of every repo's permissions, instead of near-identical tokens per repo. Fewer secrets to rotate, one place to reason about scope.
+
+Distribute it with a loop:
+
+```bash
+for repo in org/repo-a org/repo-b org/repo-c; do
+  gh secret set CLOUDFLARE_API_TOKEN --repo "$repo" --body "$TOKEN"
+done
+```
+
+The tradeoff is blast radius: every repo sharing the token is affected if it's compromised. Rotate the token when any one repo's access needs change, or split back into per-group tokens once repos diverge.
+
+This is **not** the default for unrelated or differently-trusted repos -- keep those on separate tokens.
 
 ## Environment Variables for CI
 

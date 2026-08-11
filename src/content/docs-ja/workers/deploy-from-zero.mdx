@@ -102,22 +102,58 @@ _zfb_inner.mjs
 
 CI デプロイ用に API トークンを作る際、ダッシュボードは **「Edit Cloudflare Workers」** トークンテンプレートを提示する。罠：このテンプレートには **D1:Edit** が含まれて**いない**。それがないと `wrangler d1 migrations apply --remote` が認可エラーで失敗する（`code: 7403`、*given account is not valid or is not authorized to access this service*）。
 
+同じテンプレートは **Vectorize:Read** と **Workers AI:Read** も、D1:Edit とまったく同じように欠けている。ただし症状は違って見える：`GET /accounts/{id}/vectorize/v2/indexes/{name}` のような REST アサートは、素の **HTTP 403** で失敗する -- D1 の `7403` のような Cloudflare エラーコードのラッパーがない。（Vectorize の **Edit** でもこのチェックは通る。読み取り専用のアサートなら **Read** で十分だ。）
+
 診断の経験則（正確なコードは変わりうる -- シグナルとして扱うのはメッセージの方）：
 
 - **D1 コマンドでの認可エラー**（例：`7403`）→ トークンに D1 権限が欠けている。
 - **「アカウントが見つからない」系のエラー**（例：`7404`）→ 間違っているのはアカウント id であって、トークンではない。
+- **REST アサートでの素の HTTP 403**（エラーコードのラッパーなし）→ トークンにそのサービスの Read 権限が欠けている（Vectorize、Workers AI など）-- D1 のラップされた `7403` とはシグネチャが違う。
+- **トークンは認証を通るが何も見つからない**→ `CLOUDFLARE_ACCOUNT_ID` がそのトークンを発行したのと同じアカウントに属しているか確認する。アカウント A のトークンとアカウント B のアカウント id を組み合わせると認証はすんなり通り、その後すべてのルックアップが失敗する -- 権限バグに見えるが実際は違う。
+- **汎用の `Authentication error [code: 10000]`**→ それぞれ別の対処が必要な、3 つの異なる原因がある：
 
-Workers + D1 + KV + Workers AI スタックで動作する権限セット（実際に使うものに絞ってよい）：
+| 原因 | 対処 |
+| --- | --- |
+| トークンが期限切れ、または失効している | 新しいトークンを発行するか、既存のトークンを再度有効化する |
+| シークレットの値が壊れている（コピペ時の末尾の空白など） | CI が実際に読む場所で値を再設定する -- GitHub Actions なら `gh secret set CLOUDFLARE_API_TOKEN`、ローカルデプロイならシェル環境変数 |
+| **Account Settings: Read** が欠けている | トークンの権限を編集して追加する |
+
+:::warning[`wrangler secret put` は壊れた CI トークンの修正にはならない]
+
+`wrangler secret put` はそれ自体が `CLOUDFLARE_API_TOKEN` を使って**認証する**コマンドだ -- その値が壊れている・失効しているものだった場合、書き込みに入る前にコマンド自体が失敗する。しかもこのコマンドが書き込むのは**ランタイムの Worker シークレット**（コード内で `env.SOME_KEY` として読むもの）であり、CI のクレデンシャルではない -- うまくいっても CI には何も効かず、最悪の場合は CI が古い壊れた値を使い続けたまま、デプロイトークンを Worker コードに晒すことになる。壊れた・ローテーションした CI トークンは、CI が実際に読む場所で直す：GitHub Actions なら `gh secret set CLOUDFLARE_API_TOKEN`、ローカルデプロイならシェル環境変数。
+
+:::
+
+Workers + D1 + KV + Vectorize + Workers AI スタックで動作する権限セット（実際に使うものに絞ってよい）：
 
 | Scope | Permission |
 | --- | --- |
 | Account -- Workers Scripts | Edit |
 | Account -- D1 | Edit |
 | Account -- Workers KV Storage | Edit |
+| Account -- Vectorize | Read |
 | Account -- Workers AI | Read |
 | Account -- Account Settings | Read |
 | Zone -- Workers Routes | Edit（カスタムドメイン使用時のみ） |
 | Zone -- DNS | Edit（カスタムドメイン使用時のみ） |
+
+より大規模で、実際に検証済みのスタック -- Workers + D1 + R2 + Queues + Vectorize + Workers AI、`routes` に `custom_domain: true` を指定してデプロイする場合 -- で動作した完全な権限セットは次の通り：
+
+| Scope | Permission |
+| --- | --- |
+| Account -- Workers Scripts | Edit |
+| Account -- D1 | Edit |
+| Account -- Workers R2 Storage | Edit |
+| Account -- Queues | Edit |
+| Account -- Workers KV Storage | Edit（オプション -- 上のセットから維持しているだけ。実際に使うものに絞ってよい） |
+| Account -- Vectorize | Read |
+| Account -- Workers AI | Read |
+| Account -- Account Settings | Read |
+| Zone -- Workers Routes | Edit |
+| Zone -- Zone | Read |
+| User -- User Details | Read |
+
+トークンとアカウント id は GitHub Actions のシークレット `CLOUDFLARE_API_TOKEN` と `CLOUDFLARE_ACCOUNT_ID` として保存する。
 
 :::warning[カスタムドメインにはゾーン権限が **2 つ** 必要で、Zone Resources にゾーンを含める必要もある]
 
@@ -127,7 +163,23 @@ Workers + D1 + KV + Workers AI スタックで動作する権限セット（実�
 
 :::
 
-トークンとアカウント id は GitHub Actions のシークレット `CLOUDFLARE_API_TOKEN` と `CLOUDFLARE_ACCOUNT_ID` として保存する。
+:::note[最小限のゾーン権限セットは固定ではない -- wrangler のバージョンとルートのモードに左右される]
+
+上の実証済みスタックは **Workers Routes: Edit** + **Zone: Read** だけ -- DNS:Edit なし -- でも問題なくデプロイできた。これは上の警告と真っ向から矛盾しているように見える。しかしどちらの観測も本物だ：最小限のゾーン権限セットは wrangler のバージョンと、ルートのモード（ダッシュボードでアタッチしたルートと `custom_domain: true` とでは挙動が違う）によって変わる。迷ったら **Workers Routes: Edit + DNS: Edit + Zone: Read** を、Zone Resources に実際のゾーンを含めた状態で付与し、デプロイが通ることを確認してから、1 つずつ権限を削って実際の最小構成を探るとよい。
+
+:::
+
+:::tip[手動のステップと引き換えに、ゾーン権限そのものを避ける方法もある]
+
+CI トークンのゾーン権限が繰り返しトラブルの種になるなら、それを完全に避ける方法がある：`workers_dev = false` のままにし、コミット済みのファイルに**ルート設定を一切宣言しない** -- `wrangler.jsonc` なら `"routes": [...]` 配列、`wrangler.toml` なら `[[routes]]` テーブル、どちらも書かない -- そしてカスタムドメインはダッシュボード経由で一度だけ（またはパイプラインの外で一度だけ CLI を叩いて）アタッチする。こうすれば `wrangler deploy` はゾーン API に一切触れないので、CI トークンにゾーン権限はゼロで済む。これが成り立つのは、どちらの記法でもルート設定が一切残っていない場合だけだ -- どちらか一方でも書き戻せば、ゾーン API はまた関与してくる。トレードオフは、ドメインのアタッチが手動の一度きりのオペレーター作業になり、バージョン管理されないことだ。これはルート設定を書く経路に代わるものではなく、並行して使える選択肢として捉えるとよい。
+
+:::
+
+:::note[トークンの権限編集はシークレットを維持するが、新規トークン作成はそうではない]
+
+**既存の**トークンに権限を追加しても、トークン文字列は変わらない -- CI のシークレットを更新する必要はない。**新しいトークンを作る**場合はそうはいかない -- 新しい値は CI が読む場所で再設定しなければならない：GitHub Actions なら `gh secret set CLOUDFLARE_API_TOKEN`、ローカルデプロイならシェル環境変数。新しく作ったトークンに足りない権限を付与して、なぜ CI が失敗し続けるのか悩んでしまうのはよくある落とし穴だ -- パイプラインはまだ古いシークレットの値で認証しているのだから。
+
+:::
 
 ## 割り当て直後のカスタムドメインはすぐには使えない
 
@@ -181,7 +233,7 @@ CI は `main` への push で、**コミット済み**の `wrangler.jsonc` / `wr
 - [ ] `wrangler.jsonc` / `wrangler.toml` に最終的な Worker `name` と本物のバインディング id が入っていて -- `REPLACE_WITH_*` プレースホルダーがなく -- **コミット済み**である
 - [ ] `.assetsignore` が出力されるアセットルートに存在する（フレームワークがビルド出力にコピーするなら `public/` 経由で）
 - [ ] D1 マイグレーションがデプロイと同じ `CLOUDFLARE_ACCOUNT_ID` で実行される
-- [ ] CI トークンに **D1:Edit**（および必要に応じて KV / AI / Routes 権限）が含まれている -- 「Edit Cloudflare Workers」テンプレートのままではない
+- [ ] CI トークンに、D1 を使うなら **D1:Edit**、Vectorize を使うなら（デプロイ前アサートを含め）**Vectorize:Read**、Workers AI を使うなら（デプロイ前アサートを含め）**Workers AI:Read** が含まれている -- さらに必要に応じて KV / R2 / Queues / Routes 権限も -- 「Edit Cloudflare Workers」テンプレートのままではない
 - [ ] シークレットは `wrangler secret put` / GitHub シークレットで設定されている -- コミット済み設定の中には 1 つもない
 
 関連ページ：設定フォーマットは [Wrangler 設定](./wrangler-config.mdx)、アセットモデルは [Workers Static Assets](./static-assets.mdx)、CI ワークフローは[本番デプロイ](../cicd/production-deploy.mdx)。
