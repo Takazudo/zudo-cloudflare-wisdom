@@ -10,9 +10,10 @@ for a given ID is routed to the same object, so it is the natural home for
 real-time fan-out (WebSockets), counters that must be exact, and any state that
 needs a single source of truth.
 
-This page focuses on the two non-obvious parts of running a DO in production:
-the **WebSocket Hibernation API** and the **SQLite-backed storage backend**. It
-is grounded in a real sync server that broadcasts file changes to connected
+This page focuses on the non-obvious parts of running a DO in production: the
+**WebSocket Hibernation API**, the **SQLite-backed storage backend**, SSE
+fan-out, self-scheduling **Alarms**, and a best-effort per-user rate limiter.
+It is grounded in a real sync server that broadcasts file changes to connected
 editors.
 
 ## WebSocket Hibernation: re-find sockets, don't hold them
@@ -203,13 +204,297 @@ A DO that stores data in SQLite is still configured through `[[migrations]]`, no
 through `wrangler d1 migrations`.
 :::
 
+## SSE fan-out and the heartbeat disconnect check
+
+Some fan-out use cases — a live activity feed, a build-log tail — map better
+onto Server-Sent Events than WebSockets: one-way, plain HTTP, no upgrade
+handshake. A DO fanning out to SSE connections instead of (or alongside)
+WebSockets keeps its own bookkeeping — there is no `getWebSockets`-style call
+to re-find them — so track each connection yourself in a
+`Map<string, Connection>` keyed by a connection ID, storing its
+`ReadableStreamDefaultController`. The snippets below assume that map as
+`private connections` and a `private encoder = new TextEncoder()` field on
+the same class, alongside a `broadcast()` that calls `write()` (defined
+further down) for every connection. But SSE has no protocol-level close
+signal comparable to `webSocketClose()`.
+
+### Why signals never settle in a DO
+
+A WebSocket close is reported to you: the runtime calls `webSocketClose` the
+moment it notices the peer is gone, hibernating or not. SSE has no equivalent
+push notification. The two textbook disconnect hooks — the incoming request's
+`signal` and the outgoing stream's `cancel()` callback, the pair used in
+[the AI streaming proxy's abort handling](../recipes/workers-ai-streaming.mdx#aborting-on-client-disconnect)
+— both depend on the runtime attempting an I/O operation against that specific
+connection and having it fail. If a broadcast-driven feed goes quiet for a few
+minutes because nothing happened upstream, a closed browser tab produces **no
+event at all**: the controller just sits in your `Map`, looking alive, until
+the next broadcast tries to write to it.
+
+That makes a periodic heartbeat not a nicety but the only reliable disconnect
+detector available:
+
+```typescript
+const HEARTBEAT_INTERVAL_MS = 25_000;
+
+private async scheduleHeartbeat(): Promise<void> {
+  await this.state.storage.setAlarm(Date.now() + HEARTBEAT_INTERVAL_MS);
+}
+
+// The alarm handler doubles as the heartbeat sweep.
+async alarm(): Promise<void> {
+  for (const [id, conn] of this.connections) {
+    await this.write(id, conn, `: heartbeat\n\n`);
+  }
+  if (this.connections.size > 0) {
+    await this.scheduleHeartbeat();
+  }
+}
+```
+
+A comment line (`: heartbeat\n\n`) is invisible to `EventSource` listeners — it
+carries no `event:` or `data:` field — but it forces a real write against
+every open connection. The ones whose peer is gone fail immediately, and that
+failure is the disconnect signal. Unlike the WebSocket broadcast above, which
+can afford to swallow a failed send because `webSocketClose` will eventually
+report the same disconnect independently, an SSE connection has no such
+backstop — the failed heartbeat write is the *only* place cleanup happens.
+
+`scheduleHeartbeat()` must be `async` and awaited at every call site. If
+`setAlarm()` rejects and nothing awaits it, `alarm()` still resolves
+successfully — the runtime sees a clean run, not a throw, so its automatic
+alarm retry never kicks in. With no pending alarm and no retry, the heartbeat
+simply stops, silently disabling the only disconnect detector this section
+just established.
+
+### Serializing writes per connection
+
+A broadcast and the heartbeat sweep are two independent call paths that can
+both write to the same connection around the same time. Without a shared
+per-connection queue, each path needs its own try/catch around `enqueue()`,
+and a connection that dies mid-broadcast can get "removed" twice — once by
+the broadcast's catch, once by the heartbeat's — racing on the same `Map`
+entry. Route every write through one queue per connection instead, so cleanup
+happens exactly once:
+
+```typescript
+interface Connection {
+  controller: ReadableStreamDefaultController<Uint8Array>;
+  writeQueue: Promise<void>;
+  closed: boolean;
+}
+
+private write(id: string, conn: Connection, chunk: string): Promise<void> {
+  conn.writeQueue = conn.writeQueue
+    .then(() => {
+      if (conn.closed) return;
+      conn.controller.enqueue(this.encoder.encode(chunk));
+    })
+    .catch(() => {
+      // First failed write on this connection — mark it closed so every
+      // write already queued behind this one no-ops instead of retrying
+      // against the dead controller.
+      conn.closed = true;
+      // Only remove this exact connection object — a reconnect that took
+      // the same id after this one failed must not be deleted.
+      if (this.connections.get(id) === conn) {
+        this.connections.delete(id);
+      }
+    });
+  return conn.writeQueue;
+}
+```
+
+Every caller — `broadcast()`, the heartbeat sweep, an individual `send()` —
+goes through this same `write()` and the same queue. Whichever write fails
+first flips `closed` and removes the connection; every write already queued
+behind it sees `closed` on its turn and no-ops instead of retrying against
+the dead controller and re-triggering cleanup.
+
+## Alarms and self-scheduling TTL sweeps
+
+Durable Object Alarms are a single durable timer per instance: call
+`state.storage.setAlarm(timestamp)` and the runtime guarantees it will call
+the `alarm()` method on the class at, or after, that time — waking the object
+from hibernation or eviction if necessary. There is at most one pending alarm
+per DO; calling `setAlarm()` again overwrites it, and there's no separate list
+to track or cancel.
+
+That single-slot model is exactly what a TTL sweep needs. A cache, a
+short-lived session store, or an invite-code table backed by the DO's own
+SQLite storage can expire its own rows without an external cron trigger:
+
+```typescript
+export class TtlCache implements DurableObject {
+  private state: DurableObjectState;
+  private sql: SqlStorage;
+
+  constructor(state: DurableObjectState, _env: Env) {
+    this.state = state;
+    this.sql = state.storage.sql;
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS entries (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+      )
+    `);
+  }
+
+  async put(key: string, value: string, ttlMs: number): Promise<void> {
+    const expiresAt = Date.now() + ttlMs;
+    this.sql.exec(
+      `INSERT OR REPLACE INTO entries (key, value, expires_at) VALUES (?, ?, ?)`,
+      key,
+      value,
+      expiresAt,
+    );
+    await this.scheduleNextSweep();
+  }
+
+  async get(key: string): Promise<string | null> {
+    const row = [...this.sql.exec(`SELECT value, expires_at FROM entries WHERE key = ?`, key)][0];
+    if (!row || (row.expires_at as number) <= Date.now()) return null;
+    return row.value as string;
+  }
+
+  // The alarm handler IS the sweep — no separate cron trigger needed.
+  async alarm(): Promise<void> {
+    this.sql.exec(`DELETE FROM entries WHERE expires_at <= ?`, Date.now());
+    await this.scheduleNextSweep();
+  }
+
+  // Wake up exactly when the soonest-expiring row needs sweeping — not on a
+  // fixed poll interval — so an idle cache stops costing alarm wakeups.
+  private async scheduleNextSweep(): Promise<void> {
+    const row = [...this.sql.exec(`SELECT MIN(expires_at) as next FROM entries`)][0];
+    const next = row?.next as number | null;
+    if (next != null) {
+      await this.state.storage.setAlarm(next);
+    }
+  }
+}
+```
+
+Two things make this pattern worth reaching for over a scheduled Worker (Cron
+Trigger) polling an endpoint:
+
+- **The alarm is durable, not in-memory.** It survives the DO being evicted
+  between now and the scheduled time — unlike `setTimeout`, there is no
+  running process to lose. The runtime persists the wake-up time and revives
+  the object for it.
+- **It's scoped to the object, for free.** A Cron Trigger sweeping "every
+  expired row across the system" needs its own index to know which of
+  potentially millions of per-user DOs have anything to sweep. Here, each DO
+  only ever schedules a wakeup for its own soonest expiry, so an idle instance
+  costs nothing until it actually has something to clean up.
+
+:::note[`alarm()` retries on throw]
+If `alarm()` throws, the runtime retries it with exponential backoff, up to
+the platform's retry limit, before giving up. Write the sweep to be safe to
+re-run — `DELETE ... WHERE expires_at <= ?` is naturally idempotent, so a
+retried sweep after a transient failure just deletes an already-smaller (or
+empty) set of rows.
+:::
+
+:::danger[SQLite storage needs `new_sqlite_classes`]
+`TtlCache` reads and writes through `state.storage.sql`, so it needs its own
+`[[migrations]]` entry with `new_sqlite_classes` — the same trap covered
+above. A class that never touches `state.storage` at all only needs
+`new_classes`.
+:::
+
+## Best-effort DO-per-user rate limiting
+
+Route a user's requests to a DO named from their user ID via
+`idFromName(...)` — for example a name like `ratelimit:123` — and you get a
+single-threaded counter scoped to that user, with no cross-request races to
+worry about. The temptation is to reach for `state.storage` to make the count
+durable — don't, for a plain request-rate governor. A synchronous SQLite
+write on every single request adds latency to every request just to protect
+against an edge case (the DO evicting mid-window) that, for rate limiting, is
+fine to lose:
+
+```typescript
+export class UserRateLimiter implements DurableObject {
+  // Resets on eviction — see the warning below. That's the accepted
+  // trade-off for a request-rate governor, not a bug.
+  private windowStart = 0;
+  private count = 0;
+
+  private static readonly WINDOW_MS = 60_000;
+  private static readonly LIMIT = 120;
+
+  async fetch(): Promise<Response> {
+    const now = Date.now();
+    if (now - this.windowStart >= UserRateLimiter.WINDOW_MS) {
+      this.windowStart = now;
+      this.count = 0;
+    }
+    this.count++;
+    const allowed = this.count <= UserRateLimiter.LIMIT;
+    return Response.json({
+      allowed,
+      remaining: Math.max(0, UserRateLimiter.LIMIT - this.count),
+    });
+  }
+}
+```
+
+:::warning[Memory-only counters reset on eviction — that's intentional]
+Like the WebSocket instance fields earlier on this page, `windowStart` and
+`count` live in memory and reset to their class defaults whenever the runtime
+evicts this DO. A user whose object happens to get evicted mid-window gets a
+fresh quota early. For a request-rate governor that's an acceptable,
+occasional gap — not a correctness bug. If you need a count that survives
+eviction exactly (a billing counter, a hard per-day quota that must never be
+bypassed), write it through `state.storage` instead — slower per request, but
+exact, the trade-off called out under
+[Exact coordination](#when-to-reach-for-a-durable-object) below.
+:::
+
+Treat it as **fail-open**, too: if the DO call itself errors or times out
+(cold start, a transient platform error), let the request through rather than
+block it. A rate limiter that fails closed turns any DO hiccup into a full
+outage for that user — the whole point of routing rate limiting into a
+best-effort DO instead of exact global coordination is that occasional slack
+is acceptable here.
+
+```typescript
+async function checkRateLimit(env: Env, userId: string): Promise<boolean> {
+  try {
+    const id = env.USER_RATE_LIMITER.idFromName(`ratelimit:${userId}`);
+    const stub = env.USER_RATE_LIMITER.get(id);
+    const res = await stub.fetch("https://do/"); // path unused — DO routes by ID
+    const { allowed } = await res.json<{ allowed: boolean }>();
+    return allowed;
+  } catch {
+    // Fail open: an unreachable limiter should not become a user-facing outage.
+    return true;
+  }
+}
+```
+
+Pair a memory-only per-user limiter with a coarser backstop you don't mind
+being exact and slower — Cloudflare's own rate limiting rules at the edge, or
+a cheap IP-level check — so a user who repeatedly triggers evictions to dodge
+their quota still hits a second, independent ceiling. Defense-in-depth, not a
+single point of enforcement.
+
 ## When to reach for a Durable Object
 
 - **Real-time fan-out** — chat rooms, collaborative editors, live dashboards.
-  One DO per room, every member's WebSocket tagged and broadcast to.
-- **Exact coordination** — counters, rate limits, or locks that must be precise.
-  KV is eventually consistent and will let a few requests slip through under
-  concurrency; a DO is a single instance and serializes access.
+  One DO per room, every member's WebSocket (or SSE connection) tagged and
+  broadcast to.
+- **Exact coordination** — counters, locks, or rate limits that must be
+  precise. KV is eventually consistent and will let a few requests slip
+  through under concurrency; a DO is a single instance and serializes access.
+  "Precise" here means the storage-backed variant — writing through
+  `state.storage` so the count survives eviction. The
+  [memory-only rate limiter](#best-effort-do-per-user-rate-limiting) above is
+  the deliberately looser sibling: same single-instance serialization, but the
+  count itself is allowed to reset, traded for a write with no storage round
+  trip.
 - **Per-entity state** — one object per user, document, or game session, each
   with its own private storage and single-threaded execution.
 

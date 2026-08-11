@@ -1,0 +1,320 @@
+---
+title: ランタイムの落とし穴
+description: ローカルテストやコードレビューではパスし、本物のトラフィックに晒されて初めて表面化する 6 つの Workers ランタイムの罠 -- self-fetch のホスト名、ストアされた fetch レスポンス、waitUntil / scheduled の予算、バインディングをラップするライブラリ、cloudflare:workers のアンビエント env、CORS と WebSocket
+sidebar_position: 9
+---
+
+Cloudflare Workers は普通の Node.js のように見えるが、`workerd` は Node.js やブラウザにはない制約を課している。以下の罠はどれも同じ形をしている -- どこか別の場所で学んだメンタルモデルが通用するのは、ランタイムの本当のルールが自己主張してくるまでの間だけで、それはたいていローカルテストやコードレビューではなく本番で起きる。
+
+## Self-Fetch とサービスバインディング: ホスト名は無効化されている
+
+Worker が自分自身、あるいは[サービスバインディング](./wrangler-config.mdx#名前付き環境とサービスバインディング-サービスバインディング-ある-worker-が別の-worker-を呼ぶ)経由で別の Worker を呼ぶ場合でも、`fetch()` には構文的に妥当な絶対 URL を渡す必要がある -- ただし Cloudflare はその URL のホスト名をルーティングには使わない。宛先の Worker に届くのはメソッド・パス・ヘッダー・ボディだけで、どの Worker が呼び出しを受け取るかはバインディング自体が決める。`env.SELF.fetch(...)` が DNS にも公開ルートにも一切触れないのはそのためだ。
+
+```jsonc
+// wrangler.jsonc -- binds this Worker to itself under SELF
+{
+  "services": [{ "binding": "SELF", "service": "my-worker" }],
+}
+```
+
+```ts
+// Any well-formed hostname works here -- service bindings never resolve it
+// via DNS or use it for routing. Only method/path/headers/body cross over.
+await env.SELF.fetch("https://internal/api/report", { method: "POST", body });
+```
+
+罠になるのは、自分がバインディング経由で呼ばれていることを知らないダウンストリームのコードが `new URL(request.url).hostname` を本物のロジックに使ってしまう場合だ -- Origin の許可リスト、サブドメインによる環境・テナントの判定、絶対リダイレクト URL、クッキーの `Domain` スコープなど。そのすべてが目にするのは、呼び出し元が URL コンストラクタを満たすためだけに書いたプレースホルダーのホスト名であって、実際にブラウザが接続した公開ホスト名ではない。
+
+```ts
+// Trap: this always sees "internal" for any request that arrived via the
+// self-fetch above, never the browser's real Host -- it silently
+// misclassifies every internally-routed request the same way.
+function isKnownOrigin(request: Request): boolean {
+  const host = new URL(request.url).hostname; // "internal"
+  return ALLOWED_HOSTS.has(host);
+}
+```
+
+:::warning[ホスト名依存のロジックは、2 人の呼び出し元が食い違うまで見えない]
+ホスト名は何一つ現実と照合されないため、このバグは長い間眠ったままになりやすい -- 2 人目の呼び出し元が別のプレースホルダーを選んだり、誰かが最初のものをリネームしたりして初めて表面化し、ホスト名ベースの分岐が互いに食い違い始める。
+:::
+
+## ストアされた fetch のレシーバの罠: Node ではパスし、本番では例外
+
+よくある最適化として、`Response`（あるいはそれを返す promise）をモジュールスコープにキャッシュし、以降のリクエストで再利用するというものがある。Node ベースのユニットテスト -- Node 環境の `vitest`、`jest`、`fetch` をモックしたプレーンな `node:test` -- ではこれは問題なく動く。Node の `fetch` にはどの呼び出しがそのオブジェクトを作ったかという概念が一切なく、`Response` はただの値に過ぎないからだ。
+
+```ts
+// Module scope -- evaluated once per isolate, shared by every request that
+// isolate goes on to handle.
+let cachedManifest: Response | null = null;
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    if (!cachedManifest) {
+      cachedManifest = await fetch("https://assets.example.com/manifest.json");
+    }
+    // First request: fine. Any later request reusing this Response's body
+    // throws in workerd -- even though the equivalent Node-based unit test,
+    // with no per-request I/O actor, passes without ever seeing the problem.
+    return new Response(cachedManifest.body, cachedManifest);
+  },
+};
+```
+
+`workerd` はストリーム、`Request` / `Response` のボディ、`fetch()` やバインディングが生成する promise など、あらゆる I/O オブジェクトをそれを作った呼び出しに紐付けている。別の呼び出しが同じオブジェクトに触れると、次の例外が投げられる。
+
+```
+Uncaught (in promise) Error: Cannot perform I/O on behalf of a different
+request. I/O objects (such as streams, request/response bodies, and others)
+created in the context of one request handler cannot be accessed from a
+different request's handler.
+```
+
+修正方法は、I/O オブジェクトそのものではなく取り出したデータをキャッシュし、`Response` はリクエストごとに新しく組み立てることだ。
+
+```ts
+let cachedManifestText: string | null = null;
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    if (!cachedManifestText) {
+      const res = await fetch("https://assets.example.com/manifest.json");
+      cachedManifestText = await res.text();
+    }
+    return new Response(cachedManifestText, {
+      headers: { "content-type": "application/json" },
+    });
+  },
+};
+```
+
+1 つの isolate の寿命を超えて本当にリクエスト間で永続化したいものについては、KV、Cache API、あるいは Durable Object に頼ること -- どれも呼び出しをまたいで共有される生きたオブジェクトではなく、毎回リクエストスコープの新しいオブジェクトを返してくれる。
+
+## ctx.waitUntil() と scheduled(): 2 つの異なる時計
+
+### 30 秒の経過時間予算
+
+`ctx.waitUntil()` は、レスポンスをすでに返し終えた fetch ハンドラの呼び出しを、バックグラウンド処理を終わらせるために生かし続ける。この延長は**経過（壁時計）時間で 30 秒**が上限で、レスポンスが送信されるかクライアントが切断された時点からカウントが始まり、その呼び出し中に登録されたすべての `waitUntil()` 呼び出しが同じ 30 秒の窓を共有する。
+
+これは**CPU 時間の上限**とは別の時計だ -- Paid プランのデフォルトは 30 秒で、`limits.cpu_ms` により最大 5 分（`300,000` ms）まで引き上げられる。`cpu_ms` を上げると呼び出し全体（初期ハンドラと waitUntil の作業を合わせて）が使える実際の CPU 実行時間が増えるが、レスポンスが出て行った時点から始まる固定の 30 秒の経過時間カットオフを引き上げるわけでは**ない**。遅いダウンストリームのリクエストを待っているだけ（CPU ではなく I/O）の `waitUntil()` タスクは、`cpu_ms` がどれだけ寛大でも経過 30 秒の時点で打ち切られうるし、逆に `waitUntil()` の中で CPU を多く使うタスクは、経過時間が 30 秒に近づくよりずっと前に CPU の上限に達することがある。
+
+```ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const response = new Response("ok");
+
+    // Best-effort: shares the 30s elapsed budget (not CPU time) with every
+    // other waitUntil() call below, starting once this response is sent.
+    ctx.waitUntil(sendAnalyticsPing(request, env));
+
+    return response;
+  },
+};
+```
+
+### キャンセルは静かに起きる
+
+30 秒の窓が閉じた時点で `waitUntil()` の promise が解決していなければ、それはキャンセルされる。`workerd` は `waitUntil() tasks did not complete within the allowed time after invocation end and have been cancelled` という警告をログに出すが、クライアントはすでにレスポンスを受け取っており、何も目にすることはない。テイルログや、その警告を監視するオブザーバビリティのパイプラインがなければ、キャンセルされたバックグラウンドタスクは完全に静かに失敗する。
+
+### 30 秒では足りないときの 3 つの逃げ道
+
+「30 秒以内のベストエフォート」より強い保証が必要な作業は、それをトリガーしたリクエストから切り離された、それ自体の呼び出しへと移す必要がある。
+
+- **Queues** -- `send()` を await してメッセージが実際にエンキューされたことを確認してからレスポンスを返し、あとは別のコンシューマ Worker に作業を任せる。独自の予算とリトライを備えている。
+- **Durable Object のアラーム** -- 後続処理を DO のアラームとしてスケジュールする。DO のアラームは、どのリクエストのライフサイクルからも独立した、それ自体のスケジュールで最大 15 分の壁時計時間を得られる。
+- **Tail Worker** -- ロギングと例外キャプチャの作業に限れば、Tail Worker は元になった Worker の実行が途中で打ち切られたり例外を投げたりしても、その完了時に実行される。
+
+```ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    // Await the enqueue itself -- don't wrap it in waitUntil(). The response
+    // promises the message was queued, but a canceled or late-running
+    // waitUntil() would let "ok" go out with nothing actually sent, and once
+    // the request is gone there's no message left for Queues' own retries to
+    // act on. The retries below cover what the consumer does with the
+    // message, not whether it got enqueued in the first place.
+    await env.WEBHOOK_QUEUE.send({ orderId: request.headers.get("x-order-id") });
+
+    return new Response("ok");
+  },
+};
+```
+
+### scheduled(): 固定された壁時計の上限、可変な CPU の上限
+
+Cron Trigger の呼び出しは、**壁時計（経過時間）の上限が 15 分に固定**されている -- cron がどれだけ頻繁に発火するかは関係ない。一方で**CPU 時間の予算は固定されていない** -- Paid プランでは、トリガーが 1 時間より頻繁に発火する場合は 30 秒、1 時間おき以上の間隔なら 15 分になる（Free プランは間隔にかかわらず 10ms）。
+
+つまり 5 分おきに動く cron も、1 時間おきの cron と同じ寛大な 15 分の壁時計の窓を得られるが、その中で実際に使える CPU 実行時間はたった 30 秒しかない。D1 へのクエリや外向きの fetch のように、ほとんど I/O 待ちのハンドラなら余裕を持って収まる。大きなペイロードのパースや変換、画像処理、暗号処理のように実際に計算をこなすハンドラは、単に 30 秒の CPU 予算を使い切っただけの理由で、壁時計の上限にはまだ程遠いうちに強制終了されうる。
+
+```jsonc
+// wrangler.jsonc
+{
+  "triggers": {
+    // Fires every 5 minutes -- CPU budget stays at 30s (< 1 hour interval),
+    // even though the wall-clock cap is the same 15 minutes as an hourly cron.
+    "crons": ["*/5 * * * *"],
+  },
+}
+```
+
+```ts
+async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+  // Fine: I/O wait, not CPU -- well within the 15-minute wall-clock cap.
+  const rows = await env.DB.prepare("SELECT * FROM due_jobs LIMIT 500").all();
+
+  // Risky on a sub-hourly schedule: real CPU work can hit the 30s CPU
+  // ceiling long before the 15-minute wall-clock cap is anywhere close.
+  for (const row of rows.results) {
+    transformAndValidate(row); // CPU-bound
+  }
+}
+```
+
+## バインディングをラップするライブラリのための「リクエストごとに生成する」ルール
+
+バインディングをラップするライブラリ -- D1 や Hyperdrive の上に乗る ORM、ドライバのクライアントなど -- は、モジュールスコープで一度だけではなく、各リクエストハンドラの**内側**で毎回新しく生成する必要がある。この背景には区別しておく価値のある 2 つの異なる理由がある。
+
+**クラッシュのリスク。** あるリクエストのコンテキストで作られたクライアントは、その呼び出しに紐付いた I/O オブジェクトになりうる -- これは前述のストアされた fetch の罠と同じ根本的な制約だ。それを別の -- ことによると並行した -- 呼び出しから再利用すると、同じ「別のリクエスト」エラーのリスクを負うことになる。これらのライブラリは、ただの値ではなく本物の I/O（Hyperdrive 経由でプールされたソケット、開いたままのステートメント）をラップしているからだ。
+
+```ts
+// Wrong: one client for the isolate's whole lifetime. A long-lived,
+// pool-style client doesn't fit the Workers model and risks the same
+// per-request I/O binding as a stored fetch Response.
+const db = drizzle(env.HYPERDRIVE.connectionString); // module scope
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    return Response.json(await db.select().from(users));
+  },
+};
+```
+
+```ts
+// Right: build the client inside the handler. Hyperdrive pools the real
+// TCP connections behind the scenes, so a fresh client per request is cheap.
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const db = drizzle(env.HYPERDRIVE.connectionString);
+    return Response.json(await db.select().from(users));
+  },
+};
+```
+
+**正しさのリスク。** D1 の [Sessions API](https://developers.cloudflare.com/d1/best-practices/read-replication/) がリクエストごとに新しいブックマークを必要とするのは、まったく別の理由からだ。`env.DB.withSession(bookmark)` こそが、読み取りレプリケーションの一貫性（「自分の書き込みが見える」保証）を成り立たせている当のものだからだ。1 つのセッションをリクエストをまたいでキャッシュすると、それを使うすべてのリクエストが、最初にそのセッションを作ったリクエストの一貫性スナップショットを渡されることになり、他の全員に対してその保証を静かに破ってしまう。
+
+```ts
+// The bookmark, not just the client, must be per-request -- reusing a
+// session across requests serves everyone the consistency snapshot of
+// whichever request first created it.
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const bookmark = request.headers.get("x-d1-bookmark") ?? "first-unconstrained";
+    const session = env.DB.withSession(bookmark);
+    const result = await session.prepare("SELECT * FROM orders WHERE id = ?").bind(id).first();
+    return Response.json(result, {
+      headers: { "x-d1-bookmark": session.getBookmark() ?? "" },
+    });
+  },
+};
+```
+
+## cloudflare:workers のアンビエントな env と、遅延インポートの落とし穴
+
+`import { env } from "cloudflare:workers"` を使えば、呼び出し元の関数シグネチャすべてに `env` を通さなくても、モジュールスコープからバインディングにアクセスできる。
+
+```ts
+// helpers.ts -- no ctx/env threading needed by callers
+import { env } from "cloudflare:workers";
+
+export const REGION = env.REGION; // plain var -- fine at module scope
+
+export async function getFlag(key: string) {
+  return env.FLAGS.get(key); // I/O -- needs a request context to have started
+}
+```
+
+モジュール／トップレベルのスコープで実際に動くのは、プレーンな vars、secrets、そして `env.NAMESPACE.get(id)` による Durable Object スタブの取得だ -- スタブの参照を取得すること自体は I/O ではない。そこで**動かない**のは、そのスタブのメソッド呼び出し、`KV.get()` / `.put()`、サービスバインディング経由での別の Worker 呼び出し、D1 クエリなど、実際に I/O であるものすべてだ。Workers はリクエストコンテキストの外からの I/O を許可しておらず、モジュール評価の時点（Worker の起動時、最初のリクエストより前）にはまだリクエストコンテキストが存在しないからだ。
+
+```ts
+// entry.ts -- statically imported: this module (and its imports) are
+// evaluated once at cold start, before any request exists.
+import { getFlag } from "./helpers";
+const eager = await getFlag("beta"); // throws: no request context yet
+
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const flag = await getFlag("beta"); // fine: inside a request context
+    return new Response(flag);
+  },
+};
+```
+
+:::warning[トップレベルの env I/O が「動くかどうか」はコードではなく import グラフ次第]
+ハンドラの内側からの動的な `import()` を通じてしか読み込まれないモジュールは、初めて使われたときに遅延評価される -- そしてその時点ではすでにリクエストコンテキストが存在しているため、静的インポートでは例外を投げるのと同じモジュールスコープの I/O が、そこでは成功してしまう。
+
+```ts
+export default {
+  async fetch(request: Request): Promise<Response> {
+    // First evaluation of helpers.ts happens here, mid-request -- the exact
+    // same top-level I/O that throws under a static import would succeed.
+    const { getFlag } = await import("./helpers");
+    return new Response(await getFlag("beta"));
+  },
+};
+```
+
+これが動くかどうかは、バンドラやリファクタリングがそのモジュールを静的インポートと動的インポートのどちらで読み込むと決めるかという性質であって、コードそのものの性質ではない。これはテクニックとしてではなく、壊れやすいものとして扱うべきだ -- I/O が必要な `env` へのアクセスは、モジュールがどうインポートされるかにかかわらず、実際にハンドラから呼ばれる関数の中に留めておくこと。
+:::
+
+## CORS と WebSocket: ショートサーキットと exposeHeaders
+
+WebSocket のハンドシェイクは、`Upgrade: websocket` と `Sec-WebSocket-Key` を伴うただの `GET` リクエストだ。ブラウザはこれに対して CORS のプリフライト（`OPTIONS`）を一切送らず、`WebSocket` API は接続を受け入れる前に `Access-Control-Allow-Origin` をはじめとするどの `Access-Control-*` レスポンスヘッダーも検査しない -- このリクエストタイプに対しては CORS の強制がまるごとショートサーキットされている。
+
+そのため、プリフライトの `OPTIONS` に応答し、実際のレスポンスに `Access-Control-Allow-Origin` を設定するような一般的な CORS ミドルウェアは、WebSocket のルートに対しては何の保護にもならない。`101` レスポンスのヘッダーが何であれ、ブラウザはハンドシェイクを完了させてソケットを開いてしまう -- そもそも CORS のアルゴリズムをそのヘッダーに対して一切実行しないからだ。
+
+```ts
+// Trap: this "protects" every route except the one that actually needs it --
+// the browser never sends this a preflight for a WebSocket handshake, and
+// never checks its Access-Control-Allow-Origin on the 101 response either.
+function withCors(handler: Handler): Handler {
+  return async (request, env, ctx) => {
+    if (request.method === "OPTIONS") return preflightResponse(request);
+    const response = await handler(request, env, ctx);
+    response.headers.set("access-control-allow-origin", ALLOWED_ORIGIN);
+    return response;
+  };
+}
+```
+
+WebSocket に対する Origin の制限は、アップグレードの前に、サーバー側で明示的に強制する必要がある -- `Origin` リクエストヘッダーを読み、許可されていなければ `101` 以外のレスポンスを返すという形で。`101` レスポンス自体に CORS ヘッダーを付けようとするのでは意味がない。
+
+```ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    if (request.headers.get("Upgrade") === "websocket") {
+      if (request.headers.get("Origin") !== ALLOWED_ORIGIN) {
+        return new Response("Forbidden", { status: 403 });
+      }
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      server.accept();
+      return new Response(null, { status: 101, webSocket: client });
+    }
+    // Forward ctx through -- withCors() calls routeHandler(request, env, ctx),
+    // so dropping it here leaves ctx undefined for every ordinary HTTP route
+    // and ctx.waitUntil() throws the moment routeHandler tries to use it.
+    return withCors(routeHandler)(request, env, ctx);
+  },
+};
+```
+
+`Access-Control-Expose-Headers` はこれとは別の、`fetch` / XHR だけの話だ -- `WebSocket` API はそもそも何が設定されていようとハンドシェイクのレスポンスヘッダーを JavaScript に公開しないので、WebSocket にはまったく関係しない。普通のクロスオリジン `fetch()` レスポンスについては、ブラウザはサーバーが明示的に列挙しない限り、セーフリストに載った少数のレスポンスヘッダーしか JS に公開しない。そしてそのヘッダーは、プリフライトではなく実際のレスポンスに設定する必要がある。
+
+```ts
+// Without this, cross-origin JS calling fetch() can read Content-Type and a
+// handful of other safelisted headers, but response.headers.get("x-request-id")
+// returns null even though the header is right there on the wire.
+response.headers.set("access-control-expose-headers", "x-request-id, x-ratelimit-remaining");
+```
+
+関連ページ: サービスバインディングの構文は [Wrangler 設定](./wrangler-config.mdx)、WebSocket Hibernation API 自体のアップグレードハンドシェイクは [Durable Objects](./durable-objects.mdx)、これらの挙動のうちどれが実際に `wrangler dev` で再現するかは [ローカル開発: バインディング対応表](./local-dev-bindings.mdx) を参照。

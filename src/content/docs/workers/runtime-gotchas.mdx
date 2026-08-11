@@ -1,0 +1,320 @@
+---
+title: Runtime Gotchas
+description: Six Workers runtime traps that pass in local testing or code review and only surface against real traffic -- self-fetch hostnames, stored fetch responses, waitUntil/scheduled budgets, binding-wrapping libraries, the cloudflare:workers ambient env, and CORS vs WebSocket
+sidebar_position: 9
+---
+
+Cloudflare Workers looks like ordinary JavaScript running on a server, but `workerd` enforces constraints that Node.js and the browser don't. Each trap below shares the same shape: a mental model borrowed from somewhere else works right up until the runtime's actual rules assert themselves, usually in production rather than in a local test or a code review.
+
+## Self-Fetch and Service Bindings: the Hostname Is Inert
+
+A Worker calling itself or another Worker through a [service binding](./wrangler-config.mdx#named-environments-service-bindings-service-bindings-one-worker-calling-another) still has to pass `fetch()` a syntactically valid absolute URL -- but Cloudflare does not use that URL's hostname for routing. Only the method, path, headers, and body reach the bound Worker; the binding itself decides which Worker receives the call, the same way `env.SELF.fetch(...)` never touches DNS or a public route.
+
+```jsonc
+// wrangler.jsonc -- binds this Worker to itself under SELF
+{
+  "services": [{ "binding": "SELF", "service": "my-worker" }],
+}
+```
+
+```ts
+// Any well-formed hostname works here -- service bindings never resolve it
+// via DNS or use it for routing. Only method/path/headers/body cross over.
+await env.SELF.fetch("https://internal/api/report", { method: "POST", body });
+```
+
+The trap is downstream code that doesn't know it's being reached through a binding and inspects `new URL(request.url).hostname` for real logic -- an Origin allowlist, environment or tenant selection by subdomain, an absolute redirect URL, a cookie `Domain` scope. All of that sees whatever placeholder hostname the caller happened to write to satisfy the URL constructor, never the public hostname the original browser connected to.
+
+```ts
+// Trap: this always sees "internal" for any request that arrived via the
+// self-fetch above, never the browser's real Host -- it silently
+// misclassifies every internally-routed request the same way.
+function isKnownOrigin(request: Request): boolean {
+  const host = new URL(request.url).hostname; // "internal"
+  return ALLOWED_HOSTS.has(host);
+}
+```
+
+:::warning[Hostname-dependent logic is invisible until two callers disagree]
+Because the hostname is never validated against anything real, this bug can sit dormant for a long time -- it only surfaces once a second caller picks a different placeholder, or someone renames the first one, and hostname-based branches suddenly disagree with each other.
+:::
+
+## The Stored-Fetch Receiver Trap: Passes in Node, Throws in Production
+
+A common optimization is caching a `Response` (or a promise for one) at module scope so later requests can reuse it instead of refetching. In a Node-based unit test -- `vitest` in a Node environment, `jest`, plain `node:test` with a mocked `fetch` -- this works fine, because Node's `fetch` has no concept of which invocation created a given object; a `Response` is just a value.
+
+```ts
+// Module scope -- evaluated once per isolate, shared by every request that
+// isolate goes on to handle.
+let cachedManifest: Response | null = null;
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    if (!cachedManifest) {
+      cachedManifest = await fetch("https://assets.example.com/manifest.json");
+    }
+    // First request: fine. Any later request reusing this Response's body
+    // throws in workerd -- even though the equivalent Node-based unit test,
+    // with no per-request I/O actor, passes without ever seeing the problem.
+    return new Response(cachedManifest.body, cachedManifest);
+  },
+};
+```
+
+`workerd` ties every I/O object -- streams, `Request`/`Response` bodies, promises produced by `fetch()` or a binding -- to the specific invocation that created it. A second invocation touching that same object throws:
+
+```
+Uncaught (in promise) Error: Cannot perform I/O on behalf of a different
+request. I/O objects (such as streams, request/response bodies, and others)
+created in the context of one request handler cannot be accessed from a
+different request's handler.
+```
+
+The fix is to cache the extracted data, not the I/O object, and build a fresh `Response` per request:
+
+```ts
+let cachedManifestText: string | null = null;
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    if (!cachedManifestText) {
+      const res = await fetch("https://assets.example.com/manifest.json");
+      cachedManifestText = await res.text();
+    }
+    return new Response(cachedManifestText, {
+      headers: { "content-type": "application/json" },
+    });
+  },
+};
+```
+
+For anything that genuinely needs to persist across requests rather than just within one isolate's lifetime, reach for KV, the Cache API, or a Durable Object -- each hands back a fresh, request-scoped object every time instead of a live one shared across invocations.
+
+## ctx.waitUntil() and scheduled(): Two Different Clocks
+
+### The 30-Second Elapsed Budget
+
+`ctx.waitUntil()` keeps a fetch handler's invocation alive to finish background work after the response has already gone out. That extension is capped at **30 seconds of elapsed (wall-clock) time**, starting once the response is sent or the client disconnects, and every `waitUntil()` call registered during that invocation shares the same 30-second window.
+
+This is a different clock from the **CPU-time limit** -- 30 seconds by default on the Paid plan, configurable up to 5 minutes (`300,000` ms) via `limits.cpu_ms`. Raising `cpu_ms` raises how much actual CPU execution the whole invocation is allowed to use; it does **not** raise the fixed 30-second elapsed cutoff that starts once the response leaves. A `waitUntil()` task that's mostly waiting on a slow downstream request (I/O, not CPU) can still get cut off at the 30-second elapsed mark no matter how generous `cpu_ms` is, and a CPU-heavy task inside `waitUntil()` can hit the CPU ceiling before elapsed time is even close to 30 seconds.
+
+```ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const response = new Response("ok");
+
+    // Best-effort: shares the 30s elapsed budget (not CPU time) with every
+    // other waitUntil() call below, starting once this response is sent.
+    ctx.waitUntil(sendAnalyticsPing(request, env));
+
+    return response;
+  },
+};
+```
+
+### Cancellation Is Silent
+
+If a `waitUntil()` promise hasn't settled when the 30-second window closes, it's canceled. `workerd` logs a warning -- `waitUntil() tasks did not complete within the allowed time after invocation end and have been cancelled` -- but the client already has its response and never sees anything. Without tail logs or an observability pipeline watching for that warning, a canceled background task fails completely silently.
+
+### Three Escapes When 30 Seconds Isn't Enough
+
+Work that needs a stronger guarantee than "best effort within 30 seconds" has to move into its own invocation, decoupled from the request that triggered it:
+
+- **Queues** -- await `send()` so the message is actually enqueued before responding, then let a separate consumer Worker do the work, with its own budget and built-in retries.
+- **Durable Object alarms** -- schedule the follow-up as a DO alarm, which gets up to 15 minutes of wall-clock time on its own schedule, independent of any request's lifecycle.
+- **Tail Workers** -- for logging and exception-capture work specifically, a Tail Worker runs on the producing Worker's completion even if that Worker's own execution was cut short or threw.
+
+```ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    // Await the enqueue itself -- don't wrap it in waitUntil(). The response
+    // promises the message was queued, but a canceled or late-running
+    // waitUntil() would let "ok" go out with nothing actually sent, and once
+    // the request is gone there's no message left for Queues' own retries to
+    // act on. The retries below cover what the consumer does with the
+    // message, not whether it got enqueued in the first place.
+    await env.WEBHOOK_QUEUE.send({ orderId: request.headers.get("x-order-id") });
+
+    return new Response("ok");
+  },
+};
+```
+
+### scheduled(): a Fixed Wall-Clock Cap, a Variable CPU Cap
+
+A Cron Trigger invocation's **wall-clock duration cap is fixed at 15 minutes**, no matter how often the cron fires. Its **CPU-time budget is not fixed** -- on the Paid plan it's 30 seconds if the trigger fires more often than hourly, and 15 minutes if it fires hourly or less often (the Free plan is 10ms regardless of interval).
+
+That means a cron running every five minutes gets the same generous 15-minute wall-clock window as one running hourly, but only 30 seconds of actual CPU execution inside it. A handler that's mostly waiting on I/O -- D1 queries, outbound fetches -- fits comfortably. A handler that does real compute -- parsing or transforming a large payload, image processing, crypto -- can be killed well before the wall-clock cap is anywhere close, purely because it burned its 30-second CPU budget.
+
+```jsonc
+// wrangler.jsonc
+{
+  "triggers": {
+    // Fires every 5 minutes -- CPU budget stays at 30s (< 1 hour interval),
+    // even though the wall-clock cap is the same 15 minutes as an hourly cron.
+    "crons": ["*/5 * * * *"],
+  },
+}
+```
+
+```ts
+async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+  // Fine: I/O wait, not CPU -- well within the 15-minute wall-clock cap.
+  const rows = await env.DB.prepare("SELECT * FROM due_jobs LIMIT 500").all();
+
+  // Risky on a sub-hourly schedule: real CPU work can hit the 30s CPU
+  // ceiling long before the 15-minute wall-clock cap is anywhere close.
+  for (const row of rows.results) {
+    transformAndValidate(row); // CPU-bound
+  }
+}
+```
+
+## The Per-Request Factory Rule for Binding-Wrapping Libraries
+
+Libraries that wrap a binding -- an ORM over D1 or Hyperdrive, a driver client -- need to be constructed fresh **inside** each request handler, not once at module scope. Two different reasons back this, worth telling apart:
+
+**Crash risk.** A client built in one request's context can become an I/O object tied to that invocation, the same underlying constraint behind the stored-fetch trap above. Reusing it from a different -- possibly concurrent -- invocation risks the same "different request" error, because these libraries wrap real I/O (pooled sockets via Hyperdrive, open statements) rather than a plain value.
+
+```ts
+// Wrong: one client for the isolate's whole lifetime. A long-lived,
+// pool-style client doesn't fit the Workers model and risks the same
+// per-request I/O binding as a stored fetch Response.
+const db = drizzle(env.HYPERDRIVE.connectionString); // module scope
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    return Response.json(await db.select().from(users));
+  },
+};
+```
+
+```ts
+// Right: build the client inside the handler. Hyperdrive pools the real
+// TCP connections behind the scenes, so a fresh client per request is cheap.
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const db = drizzle(env.HYPERDRIVE.connectionString);
+    return Response.json(await db.select().from(users));
+  },
+};
+```
+
+**Correctness risk.** D1's [Sessions API](https://developers.cloudflare.com/d1/best-practices/read-replication/) needs a fresh bookmark per request for a different reason entirely: `env.DB.withSession(bookmark)` is what gives read-replication consistency ("see your own writes") its guarantee. Caching one session across requests serves every one of them the consistency snapshot of whichever request first created it, silently breaking that guarantee for everyone else.
+
+```ts
+// The bookmark, not just the client, must be per-request -- reusing a
+// session across requests serves everyone the consistency snapshot of
+// whichever request first created it.
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const bookmark = request.headers.get("x-d1-bookmark") ?? "first-unconstrained";
+    const session = env.DB.withSession(bookmark);
+    const result = await session.prepare("SELECT * FROM orders WHERE id = ?").bind(id).first();
+    return Response.json(result, {
+      headers: { "x-d1-bookmark": session.getBookmark() ?? "" },
+    });
+  },
+};
+```
+
+## cloudflare:workers' Ambient env, and the Lazy-Import Caveat
+
+`import { env } from "cloudflare:workers"` gives module-scope access to bindings without threading `env` through every function signature:
+
+```ts
+// helpers.ts -- no ctx/env threading needed by callers
+import { env } from "cloudflare:workers";
+
+export const REGION = env.REGION; // plain var -- fine at module scope
+
+export async function getFlag(key: string) {
+  return env.FLAGS.get(key); // I/O -- needs a request context to have started
+}
+```
+
+What actually works at module/top-level scope: plain vars, secrets, and obtaining a Durable Object stub via `env.NAMESPACE.get(id)` -- fetching the stub reference isn't itself I/O. What does **not** work there: calling methods on that stub, `KV.get()`/`.put()`, calling another Worker over a service binding, a D1 query -- anything that's actually I/O -- because Workers do not allow I/O from outside a request context, and at module-evaluation time (Worker boot, before the first request), no request context exists yet.
+
+```ts
+// entry.ts -- statically imported: this module (and its imports) are
+// evaluated once at cold start, before any request exists.
+import { getFlag } from "./helpers";
+const eager = await getFlag("beta"); // throws: no request context yet
+
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const flag = await getFlag("beta"); // fine: inside a request context
+    return new Response(flag);
+  },
+};
+```
+
+:::warning[Whether top-level env I/O "works" depends on the import graph, not the code]
+A module reached only through a dynamic `import()` inside a handler is evaluated lazily, on first use -- and by then a request context already exists, so identical module-scope I/O that throws when statically imported would succeed there instead:
+
+```ts
+export default {
+  async fetch(request: Request): Promise<Response> {
+    // First evaluation of helpers.ts happens here, mid-request -- the exact
+    // same top-level I/O that throws under a static import would succeed.
+    const { getFlag } = await import("./helpers");
+    return new Response(await getFlag("beta"));
+  },
+};
+```
+
+Whether this happens to work is a property of how a bundler or a refactor decides to load the module -- static versus dynamic import -- not a property of the code itself. Treat it as fragile rather than as a technique: keep I/O-needing `env` access inside functions that are actually called from a handler, regardless of how the module is imported.
+:::
+
+## CORS and WebSocket: a Short Circuit, Plus exposeHeaders
+
+A WebSocket handshake is a plain `GET` request carrying `Upgrade: websocket` and `Sec-WebSocket-Key`. Browsers never send a CORS preflight (`OPTIONS`) for it, and the `WebSocket` API never inspects `Access-Control-Allow-Origin` or any other `Access-Control-*` response header before accepting the connection -- CORS enforcement is short-circuited entirely for this request type.
+
+That makes generic CORS middleware -- the kind that answers preflight `OPTIONS` and sets `Access-Control-Allow-Origin` on the real response -- provide zero protection on a WebSocket route. The browser completes the handshake and opens the socket regardless of what the `101` response's headers say, because it never runs the CORS algorithm against them.
+
+```ts
+// Trap: this "protects" every route except the one that actually needs it --
+// the browser never sends this a preflight for a WebSocket handshake, and
+// never checks its Access-Control-Allow-Origin on the 101 response either.
+function withCors(handler: Handler): Handler {
+  return async (request, env, ctx) => {
+    if (request.method === "OPTIONS") return preflightResponse(request);
+    const response = await handler(request, env, ctx);
+    response.headers.set("access-control-allow-origin", ALLOWED_ORIGIN);
+    return response;
+  };
+}
+```
+
+Origin restriction for WebSocket has to be enforced explicitly, server-side, before the upgrade -- by reading the `Origin` request header and returning a non-`101` response if it isn't allowed, not by trying to attach CORS headers to the `101` response itself:
+
+```ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    if (request.headers.get("Upgrade") === "websocket") {
+      if (request.headers.get("Origin") !== ALLOWED_ORIGIN) {
+        return new Response("Forbidden", { status: 403 });
+      }
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      server.accept();
+      return new Response(null, { status: 101, webSocket: client });
+    }
+    // Forward ctx through -- withCors() calls routeHandler(request, env, ctx),
+    // so dropping it here leaves ctx undefined for every ordinary HTTP route
+    // and ctx.waitUntil() throws the moment routeHandler tries to use it.
+    return withCors(routeHandler)(request, env, ctx);
+  },
+};
+```
+
+`Access-Control-Expose-Headers` is a separate, `fetch`/XHR-only concern -- it never touches WebSocket at all, since the `WebSocket` API doesn't expose handshake response headers to JavaScript regardless of what's set. For ordinary cross-origin `fetch()` responses, the browser only exposes a small safelisted set of response headers to JS unless the server lists the rest explicitly, and that header has to be set on the actual response, never the preflight:
+
+```ts
+// Without this, cross-origin JS calling fetch() can read Content-Type and a
+// handful of other safelisted headers, but response.headers.get("x-request-id")
+// returns null even though the header is right there on the wire.
+response.headers.set("access-control-expose-headers", "x-request-id, x-ratelimit-remaining");
+```
+
+Related pages: [Wrangler Config](./wrangler-config.mdx) for service binding syntax, [Durable Objects](./durable-objects.mdx) for the WebSocket Hibernation API's own upgrade handshake, and [Local Dev: Binding Support Matrix](./local-dev-bindings.mdx) for which of these behaviors actually reproduce under `wrangler dev`.

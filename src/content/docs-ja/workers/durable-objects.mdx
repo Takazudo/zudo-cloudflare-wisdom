@@ -10,9 +10,11 @@ Worker である。名前付きの各インスタンスは調整ポイントで�
 （WebSocket）、正確でなければならないカウンター、単一の信頼できる情報源を必要とする
 あらゆる状態にとって自然な置き場所となる。
 
-このページでは、DO を本番環境で動かすうえで自明でない 2 つの部分、すなわち
-**WebSocket Hibernation API** と **SQLite バックエンドのストレージ** に焦点を当てる。
-接続中のエディターへファイル変更をブロードキャストする実在の同期サーバーを題材にしている。
+このページでは、DO を本番環境で動かすうえで自明でない部分、すなわち
+**WebSocket Hibernation API**、**SQLite バックエンドのストレージ**、SSE
+ファンアウト、セルフスケジュールする **Alarms**、そしてベストエフォートな
+ユーザー単位のレート制限に焦点を当てる。接続中のエディターへファイル変更を
+ブロードキャストする実在の同期サーバーを題材にしている。
 
 ## WebSocket Hibernation: ソケットは保持せず再取得する
 
@@ -199,14 +201,295 @@ SQLite にデータを格納する DO も、`wrangler d1 migrations` ではな�
 通じて設定する。
 :::
 
+## SSE ファンアウトとハートビートによる切断検知
+
+ライブなアクティビティフィードやビルドログの追跡など、一部のファンアウト用途は
+WebSocket よりも Server-Sent Events のほうがうまくはまる。一方向で、プレーンな HTTP で、
+アップグレードのハンドシェイクも不要だ。WebSocket の代わりに(あるいは併用して)SSE
+接続へファンアウトする DO は、自前で接続を管理する必要がある。`getWebSockets` のような
+再取得手段は存在しないため、各接続をコネクション ID をキーとした
+`Map<string, Connection>` として自分で追跡し、その `ReadableStreamDefaultController`
+を保持する。以下のコード断片は、同じクラス上にこの Map を `private connections` として、
+また `private encoder = new TextEncoder()` フィールドを持ち、さらに各接続に対して
+(後述の)`write()` を呼び出す `broadcast()` があることを前提にしている。だが SSE には
+`webSocketClose()` に相当するプロトコルレベルのクローズ通知が存在しない。
+
+### なぜ DO では signal が発火しないのか
+
+WebSocket のクローズは通知される。ランタイムは、Hibernation 中かどうかにかかわらず、
+相手の切断に気づいた瞬間に `webSocketClose` を呼び出す。SSE にはこれに相当する
+プッシュ通知が存在しない。教科書的な切断検知フックである、受信リクエストの `signal` と
+送出側ストリームの `cancel()` コールバック(
+[AI ストリーミングプロキシの中断処理](../recipes/workers-ai-streaming.mdx#クライアント切断時に中断する)
+で使われている組み合わせ)は、どちらもランタイムがその特定の接続に対して実際に I/O を
+試み、それが失敗することに依存している。ブロードキャスト駆動のフィードが上流で何も
+起きずに数分間静かなままだと、ブラウザのタブが閉じられても **イベントはまったく
+発生しない**。コントローラーは生きているように見えたまま `Map` に残り続け、次の
+ブロードキャストが書き込みを試みるまでそのままだ。
+
+そのため、定期的なハートビートは単なる気配りではなく、利用できる唯一の信頼できる
+切断検知手段になる。
+
+```typescript
+const HEARTBEAT_INTERVAL_MS = 25_000;
+
+private async scheduleHeartbeat(): Promise<void> {
+  await this.state.storage.setAlarm(Date.now() + HEARTBEAT_INTERVAL_MS);
+}
+
+// The alarm handler doubles as the heartbeat sweep.
+async alarm(): Promise<void> {
+  for (const [id, conn] of this.connections) {
+    await this.write(id, conn, `: heartbeat\n\n`);
+  }
+  if (this.connections.size > 0) {
+    await this.scheduleHeartbeat();
+  }
+}
+```
+
+コメント行(`: heartbeat\n\n`)は `EventSource` のリスナーには見えない —
+`event:` や `data:` フィールドを持たないからだ — が、開いているすべての接続に対して
+実際の書き込みを強制する。相手が切断済みの接続はただちに失敗し、その失敗が切断の
+シグナルになる。上のブロードキャストが失敗した送信を握りつぶしても構わないのは、
+`webSocketClose` が同じ切断をいずれ独立に報告してくれるからだ。SSE の接続にはその
+バックストップがなく、失敗したハートビートの書き込みだけが唯一のクリーンアップの
+発生源になる。
+
+`scheduleHeartbeat()` は `async` にして、すべての呼び出し箇所で await しなければ
+ならない。`setAlarm()` が失敗しても誰もそれを await していなければ、`alarm()` は
+そのまま成功として解決してしまう — ランタイムからはスローではなく正常終了に見える
+ため、自動的なアラームの再試行が働かない。保留中のアラームも再試行もない状態になり、
+ハートビートは静かに止まり、この節でちょうど確立したはずの唯一の切断検知手段が
+無効化されてしまう。
+
+### 接続ごとに書き込みを直列化する
+
+ブロードキャストとハートビートの掃引は、ほぼ同時に同じ接続へ書き込もうとしうる
+2 つの独立した呼び出し経路だ。接続ごとの共有キューがなければ、それぞれの経路が
+`enqueue()` の周りに独自の try/catch を持つことになり、ブロードキャストの途中で
+死んだ接続が二重に「削除」されうる — ブロードキャスト側の catch と、ハートビート側の
+catch とが、同じ `Map` のエントリを取り合ってしまう。代わりにすべての書き込みを
+接続ごとに 1 本のキューへ通し、クリーンアップがちょうど 1 回だけ起きるようにする。
+
+```typescript
+interface Connection {
+  controller: ReadableStreamDefaultController<Uint8Array>;
+  writeQueue: Promise<void>;
+  closed: boolean;
+}
+
+private write(id: string, conn: Connection, chunk: string): Promise<void> {
+  conn.writeQueue = conn.writeQueue
+    .then(() => {
+      if (conn.closed) return;
+      conn.controller.enqueue(this.encoder.encode(chunk));
+    })
+    .catch(() => {
+      // First failed write on this connection — mark it closed so every
+      // write already queued behind this one no-ops instead of retrying
+      // against the dead controller.
+      conn.closed = true;
+      // Only remove this exact connection object — a reconnect that took
+      // the same id after this one failed must not be deleted.
+      if (this.connections.get(id) === conn) {
+        this.connections.delete(id);
+      }
+    });
+  return conn.writeQueue;
+}
+```
+
+`broadcast()`、ハートビートの掃引、個別の `send()` といったすべての呼び出し元は、
+同じこの `write()` と同じキューを通る。最初に失敗した書き込みが `closed` を立てて
+接続を削除する。その後ろにすでにキュー済みだった書き込みは、自分の番が来たときに
+`closed` を見て、死んだコントローラーに対して再試行しクリーンアップを再発生させる
+代わりに no-op になる。
+
+## Alarms によるセルフスケジュール TTL スイープ
+
+Durable Object の Alarms はインスタンスごとに 1 つだけ持てる永続的なタイマーだ。
+`state.storage.setAlarm(timestamp)` を呼べば、ランタイムはその時刻以降に
+クラスの `alarm()` メソッドを呼び出すことを保証する — 必要なら Hibernation や
+退避からオブジェクトを起こしてでも。DO ごとに保留中のアラームは最大 1 つで、
+`setAlarm()` を再度呼ぶとそれを上書きする。追跡したり取り消したりするための
+別リストは存在しない。
+
+このシングルスロットのモデルは、まさに TTL スイープが必要とするものだ。
+キャッシュ、短命なセッションストア、招待コードのテーブルなど、DO 自身の SQLite
+ストレージに支えられたデータは、外部の cron トリガーなしに自分自身の行を
+期限切れにできる。
+
+```typescript
+export class TtlCache implements DurableObject {
+  private state: DurableObjectState;
+  private sql: SqlStorage;
+
+  constructor(state: DurableObjectState, _env: Env) {
+    this.state = state;
+    this.sql = state.storage.sql;
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS entries (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+      )
+    `);
+  }
+
+  async put(key: string, value: string, ttlMs: number): Promise<void> {
+    const expiresAt = Date.now() + ttlMs;
+    this.sql.exec(
+      `INSERT OR REPLACE INTO entries (key, value, expires_at) VALUES (?, ?, ?)`,
+      key,
+      value,
+      expiresAt,
+    );
+    await this.scheduleNextSweep();
+  }
+
+  async get(key: string): Promise<string | null> {
+    const row = [...this.sql.exec(`SELECT value, expires_at FROM entries WHERE key = ?`, key)][0];
+    if (!row || (row.expires_at as number) <= Date.now()) return null;
+    return row.value as string;
+  }
+
+  // The alarm handler IS the sweep — no separate cron trigger needed.
+  async alarm(): Promise<void> {
+    this.sql.exec(`DELETE FROM entries WHERE expires_at <= ?`, Date.now());
+    await this.scheduleNextSweep();
+  }
+
+  // Wake up exactly when the soonest-expiring row needs sweeping — not on a
+  // fixed poll interval — so an idle cache stops costing alarm wakeups.
+  private async scheduleNextSweep(): Promise<void> {
+    const row = [...this.sql.exec(`SELECT MIN(expires_at) as next FROM entries`)][0];
+    const next = row?.next as number | null;
+    if (next != null) {
+      await this.state.storage.setAlarm(next);
+    }
+  }
+}
+```
+
+このパターンが、エンドポイントをポーリングする Cron Trigger の Worker より
+選ぶ価値がある理由は 2 つある。
+
+- **アラームはインメモリではなく永続的だ。** 今からスケジュールされた時刻までの
+  あいだに DO が退避されても生き残る — `setTimeout` と違って、失われるような
+  稼働中プロセスが存在しない。ランタイムが起床時刻を永続化し、そのために
+  オブジェクトを復活させる。
+- **オブジェクト単位のスコープがタダで手に入る。**「システム全体の期限切れ行を
+  すべて」掃くような Cron Trigger は、潜在的に数百万に及ぶユーザーごとの DO の
+  うちどれに掃除対象があるかを知るための、専用のインデックスを自前で持つ必要が
+  ある。ここでは各 DO が自分自身のもっとも近い期限のためだけに起床をスケジュール
+  するので、アイドル状態のインスタンスは実際に掃除すべきものができるまで何の
+  コストもかからない。
+
+:::note[`alarm()` はスローすると再試行される]
+`alarm()` がスローすると、ランタイムは指数バックオフで、プラットフォームの
+再試行上限まで再試行してから諦める。再実行しても安全なようにスイープを
+書くこと — `DELETE ... WHERE expires_at <= ?` は本質的に冪等なので、一時的な
+失敗のあとに再試行されたスイープは、すでに小さくなった(あるいは空の)行の
+集合を削除するだけで済む。
+:::
+
+:::danger[SQLite ストレージには `new_sqlite_classes` が必要]
+`TtlCache` は `state.storage.sql` を通じて読み書きするため、独自の
+`[[migrations]]` エントリに `new_sqlite_classes` が必要になる — 上で扱った罠と
+同じだ。`state.storage` にまったく触れないクラスは `new_classes` だけで足りる。
+:::
+
+## ユーザー単位の DO レート制限はベストエフォート
+
+ユーザーの ID から名前を作って `idFromName(...)` に渡し(例えば `ratelimit:123`
+のような名前)、そのユーザー専用の DO にリクエストをルーティングすれば、
+リクエスト間の競合を心配する必要のない単一スレッドのカウンターが手に入る。
+そのカウントを `state.storage` で永続化したくなるが、単純なリクエストレート
+ガバナーではそれはやらないほうがいい。すべてのリクエストごとに同期的な SQLite
+書き込みを行うと、レート制限にとっては失っても構わないエッジケース(DO が
+ウィンドウの途中で退避される)を守るためだけに、すべてのリクエストへ
+レイテンシーを加えることになる。
+
+```typescript
+export class UserRateLimiter implements DurableObject {
+  // Resets on eviction — see the warning below. That's the accepted
+  // trade-off for a request-rate governor, not a bug.
+  private windowStart = 0;
+  private count = 0;
+
+  private static readonly WINDOW_MS = 60_000;
+  private static readonly LIMIT = 120;
+
+  async fetch(): Promise<Response> {
+    const now = Date.now();
+    if (now - this.windowStart >= UserRateLimiter.WINDOW_MS) {
+      this.windowStart = now;
+      this.count = 0;
+    }
+    this.count++;
+    const allowed = this.count <= UserRateLimiter.LIMIT;
+    return Response.json({
+      allowed,
+      remaining: Math.max(0, UserRateLimiter.LIMIT - this.count),
+    });
+  }
+}
+```
+
+:::warning[退避すればメモリだけのカウンターはリセットされる — これは意図的な仕様]
+このページの前半に出てきた WebSocket のインスタンスフィールドと同じく、
+`windowStart` と `count` はメモリ上にあり、ランタイムがこの DO を退避させる
+たびにクラスのデフォルト値へリセットされる。ウィンドウの途中でたまたま
+退避されたユーザーは、早めに新しいクォータを得ることになる。リクエストレート
+ガバナーにとって、これは許容できる、たまに起きる程度のギャップであり、
+正しさのバグではない。退避を跨いで正確に生き残るカウントが必要な場合
+(課金カウンター、絶対に迂回されてはならない日次のハードクォータなど)は、
+代わりに `state.storage` を通じて書き込むこと — リクエストごとに遅くなるが
+正確であり、その使い分けは下の
+[正確な調整](#いつ-durable-object-を使うか) で述べているとおりだ。
+:::
+
+**フェイルオープン** として扱うことも重要だ。DO 自体の呼び出しがエラーになったり
+タイムアウトしたりした場合(コールドスタート、一時的なプラットフォームの障害)は、
+リクエストをブロックするのではなく通してしまう。フェイルクローズなレート制限は、
+DO のちょっとした不調をそのユーザーにとっての全面的な障害に変えてしまう —
+正確なグローバル調整の代わりにベストエフォートな DO へレート制限を持ち込む
+そもそもの狙いは、多少の緩みを許容できることにある。
+
+```typescript
+async function checkRateLimit(env: Env, userId: string): Promise<boolean> {
+  try {
+    const id = env.USER_RATE_LIMITER.idFromName(`ratelimit:${userId}`);
+    const stub = env.USER_RATE_LIMITER.get(id);
+    const res = await stub.fetch("https://do/"); // path unused — DO routes by ID
+    const { allowed } = await res.json<{ allowed: boolean }>();
+    return allowed;
+  } catch {
+    // Fail open: an unreachable limiter should not become a user-facing outage.
+    return true;
+  }
+}
+```
+
+メモリだけのユーザー単位リミッターは、正確で多少遅くても構わない粗めの
+バックストップと組み合わせること — Cloudflare 自身のエッジのレート制限
+ルールや、安価な IP 単位のチェックなど。そうすれば、退避を繰り返し誘発して
+クォータを回避しようとするユーザーも、独立した 2 つ目の上限に必ず引っかかる。
+単一の強制ポイントではなく、多層防御にする。
+
 ## いつ Durable Object を使うか
 
 - **リアルタイムなファンアウト** — チャットルーム、共同編集エディター、ライブ
-  ダッシュボード。1 ルームにつき 1 つの DO を置き、各メンバーの WebSocket をタグ付けして
-  ブロードキャストする。
-- **正確な調整** — 厳密でなければならないカウンター、レート制限、ロック。KV は結果整合性で
+  ダッシュボード。1 ルームにつき 1 つの DO を置き、各メンバーの WebSocket(あるいは
+  SSE 接続)をタグ付けしてブロードキャストする。
+- **正確な調整** — 厳密でなければならないカウンター、ロック、レート制限。KV は結果整合性で
   あり、同時実行下では数件のリクエストが通過してしまう。DO は単一インスタンスであり
-  アクセスを直列化する。
+  アクセスを直列化する。ここでいう「厳密」とは、ストレージに支えられた版のことを指す —
+  `state.storage` を通じて書き込み、カウントが退避を跨いで生き残る。上の
+  [メモリだけのレート制限](#ユーザー単位の-do-レート制限はベストエフォート) は、意図的に
+  緩められた兄弟版だ — 単一インスタンスによる直列化は同じだが、カウント自体は
+  リセットされうることを許容し、そのぶんストレージへの往復のない書き込みを得ている。
 - **エンティティごとの状態** — ユーザー、ドキュメント、ゲームセッションごとに 1 つの
   オブジェクトを置き、それぞれが独自のプライベートなストレージと単一スレッドの実行を持つ。
 
