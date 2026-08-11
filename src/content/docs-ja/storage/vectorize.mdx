@@ -6,7 +6,7 @@ sidebar_position: 4
 
 ## 概要
 
-Vectorize は Cloudflare のベクトルデータベース。Workers AI や他の埋め込みプロバイダーから得た埋め込みを保存し、インデックスに問い合わせて最近傍を検索する -- セマンティック検索、レコメンデーション、RAG 検索、画像類似検索など。
+Vectorize は Cloudflare のベクトルデータベース。Workers AI や他の埋め込みプロバイダーから得た埋め込みを保存し、インデックスに問い合わせて最近傍を検索する -- セマンティック検索、レコメンデーション、[RAG 検索](../ai/chat-memory-rag.mdx)、画像類似検索など。
 
 **次元数と距離メトリックはインデックス作成時に固定され、あとから変更できない。** 使用する予定の埋め込みモデルに合わせて、インデックス作成前にどちらも決めておく必要がある。モデルを後で変更する場合は、インデックスを作り直すことになる。
 
@@ -30,17 +30,18 @@ index_name = "my-index"
 
 Vectorize には2つの API 世代がある。V1 のバインディング型は `VectorizeIndex` で、その `describe()` は `VectorizeIndexDetails` を返し、次元数とメトリックを `config` の下にネストする。V2 のバインディング型は `Vectorize` で、その `describe()` は `VectorizeIndexInfo` を返し、`dimensions` をトップレベルに置く -- そして `metric` は完全に無くなる。
 
-今日作成されるインデックスは V2 だ。しかし `wrangler types` はそれを知らない -- **wrangler `4.120.0` の時点で、`vectorize` バインディングすべてに対して `VectorizeIndex`（V1 の型）をハードコードしている**、`wrangler-dist/cli.js` の2つの型生成呼び出し箇所の両方で。これを変える設定項目、バインディングごとのバージョンフィールド、compatibility date による分岐は存在しない。（このリポジトリは wrangler `4.85.0` を pin している。上記の主張は `4.120.0` で調査した内容であり、自分がインストールしているバージョンの挙動が同じだと決めつける前に確認すること。）
+今日作成されるインデックスは V2 だ。しかし `wrangler types` はそれを知らない -- **wrangler `4.85.0` と `4.120.0` の両方で確認したところ、`wrangler-dist/cli.js` にある2つの型生成呼び出し箇所のどちらでも、`vectorize` バインディングすべてに対して `VectorizeIndex`（V1 の型）をハードコードしている**。これを変える設定項目、バインディングごとのバージョンフィールド、compatibility date による分岐は存在しない。（自分のプロジェクトが固定している wrangler のバージョンでの挙動を、この前提に頼る前に確認すること。）
 
-結果として、`description.config.dimensions` のような、生成された型に対して書いたコードは、**型チェックを通過し、手書きのフェイクに対するユニットテストにも通ってしまう** -- フェイクが型の言う通りの形を守っているからだ。実際のバインディングに対してだけ `TypeError` を投げ、それも本番で発生し、たいていは呼び出し元とは無関係などこかで不透明な「binding check failed」として現れる。
+実はこの罠は、単純な型エラーにはならない。`VectorizeIndexDetails.config` の型は `VectorizeIndexConfig` で、`{ preset: string }` のアームと `{ dimensions, metric }` のアームを持つユニオン型だ -- そのため `description.config.dimensions` は、生成された V1 の型に対しては**型チェックを通過しない**。tsc は、ユニオンを絞り込むかキャストするまでこれを拒否する。そして、そのキャストこそがバグを隠す：
+
+- **Before（壊れている場合）**: バインディングは生成された `VectorizeIndex`（V1）のまま型付けされている。`.dimensions` に到達するため、開発者は `description.config` をユニオンの外へ絞り込むかキャストする。これはコンパイルを通り、キャストが示す形をそのまま守る手書きのフェイクに対するユニットテストにも通ってしまう。実際の V2 バインディングに対してだけ `TypeError` を投げ、それも本番で発生し、たいていは呼び出し元とは無関係などこかで不透明な「binding check failed」として現れる。
+- **After（正しい場合）**: バインディングが正直な V2 の形で型付けされていれば（後述の seam を参照）、キャストは不要になる -- `info.dimensions` は `describe()` の戻り値のトップレベルにある。V2 のレスポンスには `metric` も存在しない。詳しくは後述する。
 
 ### ワークアラウンド: 自分自身の seam を宣言する
 
-生成された `Env` 型の `VectorizeIndex` をアプリ全体に伝播させない。正直な V2 の型を import し、境界で一度だけキャストする：
+生成された `Env` 型の `VectorizeIndex` をアプリ全体に伝播させない。正直な V2 の型を参照し、境界で一度だけキャストする。`wrangler types` は `Vectorize` を `Env` と並ぶグローバル型として `worker-configuration.d.ts` に書き出すため、ここでは import は不要だ -- `@cloudflare/workers-types` をパッケージとして使い続けているプロジェクトでは、代わりにそこから import する：`import type { Vectorize } from "@cloudflare/workers-types";`。
 
 ```typescript
-import type { Vectorize } from "@cloudflare/workers-types";
-
 // wrangler types always emits VectorizeIndex (V1) for a `vectorize`
 // binding, even for indexes created as V2 -- as of wrangler 4.120.0 this
 // is hardcoded at both type-generation call sites in wrangler-dist/cli.js,
@@ -66,16 +67,16 @@ export default {
 
 ## 関数での使用
 
-バインディングが正しく型付けされていれば、呼び出し方は他の Cloudflare バインディングと変わらない：
+上記の seam で `appEnv.MY_INDEX` が正しく型付けされていれば、呼び出し方は他の Cloudflare バインディングと変わらない：
 
 ```typescript
 // Insert vectors
-await env.MY_INDEX.insert([
+await appEnv.MY_INDEX.insert([
   { id: "1", values: [0.1, 0.2, 0.3], metadata: { text: "hello" } },
 ]);
 
 // Query for nearest neighbors
-const matches = await env.MY_INDEX.query([0.1, 0.2, 0.3], { topK: 5 });
+const matches = await appEnv.MY_INDEX.query([0.1, 0.2, 0.3], { topK: 5 });
 ```
 
 ## 距離メトリックの検証
@@ -86,12 +87,12 @@ V2 の `describe()` は `VectorizeIndexInfo` を返し、その型には `metric
 
 ## デプロイ時の失敗は `--dry-run` では捕まえられない
 
-まだ存在しないインデックスを指す `vectorize` バインディングは、`wrangler deploy` を完全に失敗させ、`code: 10159` を含む API エラーを出す。これは wrangler がバインディングテーブルを表示した *あとに* 出力されるため、CI の出力をざっと見ただけでは見逃しやすい。
+まだ存在しないインデックスを指す `vectorize` バインディングは、`wrangler deploy` を完全に失敗させ、`code: 10159` を含む API エラーを出す（wrangler `4.120.0` の時点）。これは wrangler がバインディングテーブルを表示した *あとに* 出力されるため、CI の出力をざっと見ただけでは見逃しやすい。
 
-`wrangler deploy --dry-run` は **これを捕まえない** -- dry-run は Worker スクリプトと設定の形は検証するが、リモートリソースの解決は一切行わないため、インデックスが存在しなくても dry-run は通り、実際のデプロイでだけ失敗する。
+`wrangler deploy --dry-run` は **これを捕まえない**（wrangler `4.120.0` の時点） -- dry-run は Worker スクリプトと設定の形は検証するが、リモートリソースの解決は一切行わないため、インデックスが存在しなくても dry-run は通り、実際のデプロイでだけ失敗する。
 
-:::warning[Queues と違い、自動プロビジョニングはない]
-Queues と比較するとよくわかる：wrangler はデプロイ中に存在しないキューを自動プロビジョニングするため、`wrangler queues create` をやり忘れても自己修復する。Vectorize には同等の仕組みがない -- バインドする最初のデプロイより前にインデックスを作成しておくこと。
+:::warning[KV/R2/D1 と違い、自動プロビジョニングはない]
+KV、R2、D1 バインディングと比較するとよくわかる：wrangler はデプロイ中に、まだ存在しないリソースを[自動プロビジョニング](https://developers.cloudflare.com/changelog/post/2025-10-24-automatic-resource-provisioning/)できるため、namespace や bucket、database の作成漏れが自己修復する。Vectorize には同等の仕組みがない -- インデックスの欠落は `wrangler deploy` を完全に失敗させる。バインドする最初のデプロイより前にインデックスを作成しておくこと。
 :::
 
 ## 戻り値の形の違い: insert / upsert / deleteByIds
@@ -100,12 +101,12 @@ Queues と比較するとよくわかる：wrangler はデプロイ中に存在�
 
 ```typescript
 // V1
-const result = await env.MY_INDEX.insert(vectors);
+const result = await appEnv.MY_INDEX.insert(vectors);
 result.ids; // string[]
 result.count; // number
 
 // V2
-const result = await env.MY_INDEX.insert(vectors);
+const result = await appEnv.MY_INDEX.insert(vectors);
 result.mutationId; // string
 ```
 
@@ -116,5 +117,5 @@ result.mutationId; // string
 - **次元数とメトリックは恒久的**: インデックス作成時に決まり、その場での移行はできない -- 最初の insert の前に正しく設定する
 - **`wrangler types` は V1 のバインディング型を生成する**: 生成された `Env` を信用せず、自分の `Vectorize` seam を宣言する（上記参照）
 - **ランタイムでメトリックが取れない（V2）**: `describe()` は距離メトリックを返せない -- プロビジョニング時かデプロイ時に検証する
-- **インデックスの欠落はデプロイを失敗させる、dry-run ではない**: `--dry-run` はリモートリソースを解決しないため、先にインデックスを作成する
+- **インデックスの欠落はデプロイを完全に失敗させ、`--dry-run` では捕まえられない**: `--dry-run` はリモートリソースを解決しないため、先にインデックスを作成する
 - **`insert`/`upsert`/`deleteByIds` の戻り値の形は API 世代に依存する**: `{ ids, count }`（V1）対 `{ mutationId }`（V2）
