@@ -235,7 +235,9 @@ not_found_handling = "single-page-application"
 run_worker_first = ["/oauth/callback", "/api/*"]
 ```
 
-This exists to cut billable Worker invocations for client-heavy SPAs -- most navigations serve `index.html` straight from the edge with zero Worker cost -- not to express a security boundary. If you reach for the array form to "protect" a set of routes, every path outside the list has no gate whatsoever; there is no implicit deny for the paths you didn't list. Use `run_worker_first = true` (or gate inside the Worker itself, as above) when the requirement is authorization. Reserve the array form for routing and cost optimization.
+This exists to cut billable Worker invocations for client-heavy SPAs -- most navigations serve `index.html` straight from the edge with zero Worker cost -- and it can double as a gate too, but only for a **bounded subtree** where everything outside the list is deliberately public. `run_worker_first = ["/admin/*"]` on a site where `/admin/*` is the only thing that needs auth and everything else is meant to be public is a legitimate security gate: it protects the admin subtree and avoids invoking the Worker for the public assets that don't need it.
+
+Where the array form goes wrong is a **catch-all or default-deny** requirement -- "authorize every request" or "nothing is public unless explicitly listed." There, every path outside the array has no gate whatsoever, and there is no implicit deny for paths you didn't think to list; a route added later ships ungated by default. Use `run_worker_first = true` (or gate inside the Worker itself, as above) when the requirement is default-deny. Reserve the array form for a known, bounded subtree -- whether that's for cost optimization, or as a gate over a specific set of routes with everything else intentionally public.
 
 ### `not_found_handling = "single-page-application"` Always Serves the Root `index.html`
 
@@ -252,25 +254,28 @@ not_found_handling = "single-page-application"
 
 The trap surfaces on multi-zone builds: if `dist/app-a/index.html` and `dist/app-b/index.html` ship as separate SPA shells, each expected to own its own subtree, the fallback ignores that structure entirely. A request to `/app-a/settings` that matches no real file gets the root `dist/index.html`, not `dist/app-a/index.html` -- unless the root shell's own router is what's supposed to own `/app-a/*` in the first place.
 
-### `auto-trailing-slash` Rewrites Before Your Patterns Ever See the Request
+### `run_worker_first` and `_redirects` See the Request Before `auto-trailing-slash` Rewrites It
 
-The default `html_handling = "auto-trailing-slash"` serves `foo/index.html` **with** a trailing slash, and redirects a bare `/foo` request to `/foo/` first:
+The default `html_handling = "auto-trailing-slash"` serves `foo/index.html` **with** a trailing slash, and redirects a bare `/foo` request to `/foo/`:
 
 ```
 GET /foo   -> 307 Location: /foo/
 GET /foo/  -> 200 (serves dist/foo/index.html)
 ```
 
-The trap: any pattern written against the bare form -- a `run_worker_first` array entry, a manual redirect rule, a string comparison in Worker code -- never sees matching traffic, because the browser already followed the 307 before the request you're trying to match arrives. Write patterns against the canonical `/dir/` form:
+That redirect is the asset layer's own behavior, and it only fires once a request has already been routed there. `run_worker_first` pattern matching happens upstream of it, against the pathname as originally requested -- so a pattern written against the bare form (`/admin`, no trailing slash) does see a request for `/admin`; it isn't skipped. The same is true of `_redirects` rules, which also evaluate before `html_handling`.
+
+What the bare form alone misses is everything past it: the canonical `/admin/` destination the browser lands on after the redirect, and anything nested under it, like `/admin/settings`. A `/admin/*` entry doesn't cover the bare `/admin` request either -- the glob requires the literal `/` that follows. Cover both explicitly when the whole subtree needs the Worker:
 
 ```toml
 [assets]
 directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
-# Wrong: "/admin" never arrives here -- auto-trailing-slash 307s it to
-# "/admin/" first. Match the form that's actually requested.
-run_worker_first = ["/admin/*"]
+# "/admin" matches the request as originally made, before auto-trailing-slash
+# would redirect it. "/admin/*" covers the "/admin/" destination and every
+# path nested under it. Neither pattern covers the other -- list both.
+run_worker_first = ["/admin", "/admin/*"]
 ```
 
 ### `env.ASSETS.fetch()` Matches by Pathname Only
@@ -292,7 +297,7 @@ Do not rely on a query string to select between asset variants through the bindi
 |---|---|---|
 | `binding` | -- | Worker (or its adapter) actually calls `env.ASSETS.fetch()` -> set it; Worker has `main` but only relies on asset-first routing and never touches `env.ASSETS` -> omit it; assets-only Worker (no `main`) -> omit it, wrangler hard-errors if it's set |
 | `not_found_handling` | `"none"` | SSG -> `"404-page"`; SPA -> `"single-page-application"` |
-| `run_worker_first` | `false` | The Worker must gate/authorize **every** request -> `true`; a subset of routes needs Worker-first for cost reasons (never security) -> an array of patterns; or the index is SSR with a `dist/404.html` present -> `["/", ...]` |
-| `html_handling` | `"auto-trailing-slash"` | Writing `run_worker_first` patterns or redirect rules against a directory path -> use the `/dir/` form the browser actually requests, not the bare `/dir` form it gets redirected away from |
+| `run_worker_first` | `false` | The Worker must gate/authorize **every** request (default-deny) -> `true`; a subset of routes needs Worker-first for cost reasons, or as a gate over a bounded subtree with everything else intentionally public -> an array of patterns; or the index is SSR with a `dist/404.html` present -> `["/", ...]` |
+| `html_handling` | `"auto-trailing-slash"` | Gating a directory subtree with `run_worker_first` -> list both the bare form and the `/dir/*` form; each covers requests the other doesn't |
 | `workers_dev` | `true` | Stop serving production on `*.workers.dev` -> `false` |
 | `preview_urls` | matches `workers_dev` | Always set **explicitly** so previews survive `workers_dev = false` |

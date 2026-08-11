@@ -12,7 +12,7 @@ sidebar_position: 1
 npx wrangler@4 pages project create zudo-cloudflare --production-branch=main
 ```
 
-`--production-branch` は明示的に渡す。省略すると `project create` が本番ブランチをインタラクティブに尋ねてくるため、非対話の CI ランナー上ではそこで止まる。
+`--production-branch` は明示的に渡す。省略すると `project create` は本番ブランチを必要とし、本来はインタラクティブに尋ねてくる。しかし CI には尋ねる相手の TTY がないため、そこで止まるのではなく `Must specify a production branch.` で即座に失敗する。
 
 :::warning
 CI では `pages deploy` がプロジェクトを自動作成してくれると期待しないこと。Cloudflare 公式ドキュメントには `pages deploy` の自動作成パスが記載されているが、これはプロジェクト名と本番ブランチを尋ねるインタラクティブなプロンプト経由でしか発火しない。GitHub Actions のランナーには TTY がないため、そのプロンプトは表示されない。さらに悪いことに、`--project-name` を渡すと（下記の[デプロイコマンド](#デプロイコマンド)のように、CI では監査可能なログのために必要）、wrangler はプロジェクトが既存であることを前提とし、作成する代わりに `Project not found. The specified project name does not match any of your existing projects. [code: 8000007]` で失敗する。CI の初回デプロイ前には必ず `pages project create` を実行すること。これは現行の `wrangler@4` に該当する挙動で、自動作成プロンプトはインタラクティブ専用であり、非対話環境向けのフォールバックはドキュメント上存在しない。

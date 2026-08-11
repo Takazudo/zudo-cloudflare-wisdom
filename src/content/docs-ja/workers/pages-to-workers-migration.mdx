@@ -1,12 +1,12 @@
 ---
 title: Pages から Workers への移行
-description: ダウンタイムなしでライブサイトを Cloudflare Pages から Workers Static Assets へ移し、うまくいかなかった場合にきれいにロールバックする
+description: 最小限のダウンタイムでライブサイトを Cloudflare Pages から Workers Static Assets へ移し、うまくいかなかった場合にきれいにロールバックする
 sidebar_position: 10
 ---
 
 ## なぜ移行するのか
 
-[Workers Static Assets](./static-assets.mdx) は、静的サイトと SSR サイトにおける Cloudflare Pages の後継だ -- 別個の Pages プロジェクトとそのデプロイパイプラインを持つ代わりに、アセットディレクトリとリクエストロジックの両方を 1 つの Worker が持つ。ゼロから作るならこれを直接使えばいい。このページが扱うのは別のケースだ：すでに Pages でライブ稼働しているサイトを、サービスの空白なしで Workers に移したい場合。
+[Workers Static Assets](./static-assets.mdx) は、静的サイトと SSR サイトにおける Cloudflare Pages の後継だ -- 別個の Pages プロジェクトとそのデプロイパイプラインを持つ代わりに、アセットディレクトリとリクエストロジックの両方を 1 つの Worker が持つ。ゼロから作るならこれを直接使えばいい。このページが扱うのは別のケースだ：すでに Pages でライブ稼働しているサイトを、いきなり切り替えるのではなく、短く計画された切り替えウィンドウだけで Workers に移したい場合。
 
 移行する前に [Workers Static Assets](./static-assets.mdx) を読んでおくこと -- そこに書かれている `[assets]` の罠（ゲーティングの順序、SPA フォールバック、末尾スラッシュのリライト）は、どんな経路を辿ってきたかに関係なく、これから立ち上げる Worker にそのまま当てはまる。
 
@@ -29,7 +29,7 @@ graph TB
 2. **CI トークンの権限を更新する。** Workers デプロイには、Pages トークンが一度も持たなかった権限が必要になる（下の[トークンの差分](#トークンの差分)を参照）。新しいトークンを新規発行するのではなく、*既存の*トークンを編集すること -- これは後述するロールバックに関わってくる。
 3. **`*.workers.dev` のみで最初の Workers デプロイを行う。** ルートやカスタムドメインを一切アタッチせずにデプロイする。これによって、設定・トークン・ビルド・アセットアップロードというパイプライン全体を、ライブトラフィックに触れずに一通り検証できる。
 4. **`workers.dev` の URL に対して検証する。** アセットレイヤーが正しいファイルを配信しているか、Worker のロジックが正しく動作しているかを、まだライブのままの Pages サイトと並べて確認する。
-5. **DNS/ドメインの切り替え。** 実トラフィックが動くのはこのステップだけだ -- 詳細は後述する。
+5. **DNS/ドメインの切り替え。** 実トラフィックが動くのはこのステップだけだ -- バックグラウンドでの入れ替えではなく、メンテナンスウィンドウとして扱うこと。詳細は後述する。
 6. **古い Pages プロジェクトはそのまま残す。** Worker がライブになったからといって削除しない。これは余りものではなく、ロールバック経路そのものだ。
 7. **信頼できるようになってから、後で削除する。** Workers デプロイが十分な期間、本番トラフィックを問題なく処理し続けたことを確認できたら、Pages プロジェクトとそのワークフロー、そして Pages 専用のトークン権限を廃止する。
 
@@ -37,18 +37,20 @@ graph TB
 
 Pages のデプロイトークンと Workers のデプロイトークンは、思っているより重なりが少ない。しかもその差分を取り違える方向は、まさにライブ切り替えを壊す方向だ。
 
-| Scope | Pages token (existing) | Workers, `*.workers.dev` only | Workers, custom domain / route |
-| --- | --- | --- | --- |
-| Account -- Cloudflare Pages | Edit | -- | -- |
-| Account -- Workers Scripts | -- | Edit | Edit |
-| Account -- Account Settings | Read | Read | Read |
-| Zone -- Workers Routes | -- | -- | Edit |
-| Zone -- DNS | -- | -- | Edit |
-| Zone -- Zone | -- | -- | Read |
+| Scope | Pages token (existing) | Workers, `*.workers.dev` only | Workers, plain route (no `custom_domain`) | Workers, custom domain |
+| --- | --- | --- | --- | --- |
+| Account -- Cloudflare Pages | Edit | -- | -- | -- |
+| Account -- Workers Scripts | -- | Edit | Edit | Edit |
+| Account -- Account Settings | Read | Read | Read | Read |
+| Zone -- Workers Routes | -- | -- | Edit | Edit |
+| Zone -- DNS | -- | -- | -- | Edit |
+| Zone -- Zone | -- | -- | -- | Read |
 
 正確に言うとこうなる：**`*.workers.dev` のみの Workers デプロイには、Zone の行は一切要らない。** `Account -- Cloudflare Pages: Edit` が `Account -- Workers Scripts: Edit` に置き換わるだけで、それ以外の形は変わらない -- 置き換え元の Pages トークンとまったく同じ、アカウント内だけで完結する影響範囲のままだ。
 
-Zone の行が現れるのは、カスタムドメインやルートをアタッチする場合だけだ。理由は、Workers のカスタムドメインとルートがゾーンスコープのリソースであるのに対し、Pages のカスタムドメインはアカウントスコープの Pages API 経由で管理されており、そもそも Zone の権限カテゴリに一度も触れていなかったからだ。サイトが `workers.dev` の URL だけで完結するなら、真ん中の列で止めていい -- それで完了だ。Pages サイトが現在応答しているのと同じカスタムドメインが必要なら、Zone の行のぶんの予算は切り替えステップの最中ではなく、その前に確保しておくこと。
+Zone の行が現れるのは、ルートかカスタムドメインをアタッチする場合だけだ。ただしこの 2 つが必要とするものは違うので、CI トークンのスコープを決めるときに一緒くたにしないこと。プレーンなルート（`{ pattern = "example.com/*" }`、`custom_domain = true` なし）は既存のゾーンルートに Worker をアタッチするだけで、必要なのは `Zone -- Workers Routes: Edit` だけだ -- DNS には一切触れないので、ルートだけの CI トークンに `Zone -- DNS: Edit` を持たせるべきではない。カスタムドメイン（`custom_domain = true`）はコストが違う：Pages のカスタムドメインと同じように、DNS レコードとエッジ証明書の作成・管理を Cloudflare にまかせるので、`Zone -- Workers Routes: Edit` に加えて `Zone -- DNS: Edit` と `Zone -- Zone: Read` も必要になる。
+
+サイトが `workers.dev` の URL だけで完結するなら、2 列目で止めていい -- それで完了だ。既存のルートパターンに `custom_domain = true` なしでアタッチするだけなら、`Zone -- Workers Routes: Edit` を付与してそこで止めること -- DNS を一切書き込まないトークンに `Zone -- DNS: Edit` を与えるのは権限の過剰付与だ。Pages サイトが現在応答しているのと同じカスタムドメインが必要なら、Zone の行一式（Workers Routes、DNS、Zone）のぶんの予算は切り替えステップの最中ではなく、その前に確保しておくこと。
 
 :::note[この表の外にあるフル権限セット]
 この表は Pages と Workers の差分だけをカバーしている。D1、KV、R2、Vectorize、Workers AI、そして実証済みのカスタムドメイン権限セット（wrangler のバージョンによる `Zone -- DNS: Edit` と `Zone -- Zone: Read` だけの違いを含む）については、[CI トークン：「Edit Cloudflare Workers」では足りない](./deploy-from-zero.mdx)を参照。
@@ -71,6 +73,13 @@ jobs:
     steps:
       - id: check
         run: echo "active=${{ vars.WORKERS_MIGRATION_ACTIVE == 'true' }}" >> "$GITHUB_OUTPUT"
+      - name: Verify deploy credentials are set
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo "::error::CLOUDFLARE_API_TOKEN is not set"; exit 1; }
+          test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo "::error::CLOUDFLARE_ACCOUNT_ID is not set"; exit 1; }
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
   deploy:
     needs: preflight
@@ -85,7 +94,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 ```
 
-リポジトリ変数 `WORKERS_MIGRATION_ACTIVE` が `true` にセットされるまでは、`preflight` は実行されて `active=false` と評価され、`deploy` は失敗ではなく**スキップ**として報告される。これにより、移行期間の全体を通じて、ワークフローは push のたびにマージ済み・構文チェック済み・シークレット解決済みの状態を保ちながら、誤って何かをデプロイしてしまうことはない。トークンを更新して最初の手動デプロイを確認し終えたら、この変数を切り替えるだけでいい。同じ、すでに PR でテスト済みのワークフローがそのまま本番デプロイを始める -- 初めて信頼しなければならない別の「有効化」コードパスは存在しない。
+リポジトリ変数 `WORKERS_MIGRATION_ACTIVE` が `true` にセットされるまでは、`preflight` は実行されて `active=false` と評価され、`deploy` は失敗ではなく**スキップ**として報告される。`Verify deploy credentials are set` ステップが重要なのは、フラグのチェックだけでは足りないからだ -- ジョブレベルの `if:` によるスキップは、`deploy` 自身の `env:` ブロックがスキップ中は一切評価されないことを意味する。つまりスキップされたジョブの中にある `secrets.CLOUDFLARE_API_TOKEN` の参照は何も証明しないし、シークレットが未設定でもエラーにはならず空文字列に解決されるだけだ。実際に push のたびに実行される `preflight` 側にプレゼンスチェックを置くことで、はじめてこの主張が真実になる：これにより、移行期間の全体を通じて、ワークフローは push のたびにマージ済み・構文チェック済みで、かつデプロイ用クレデンシャルが実際に機能することを確認済みの状態を保ちながら、誤って何かをデプロイしてしまうことはない。トークンを更新して最初の手動デプロイを確認し終えたら、この変数を切り替えるだけでいい。同じ、すでに PR でテスト済みのワークフローがそのまま本番デプロイを始める -- 初めて信頼しなければならない別の「有効化」コードパスは存在しない。
 
 ビルド/デプロイのジョブ分割そのものは [本番デプロイ](../cicd/production-deploy.mdx)と同じ形をとっている -- 新しいのは、その手前に置かれたプリフライトのゲートだけだ。
 
@@ -98,6 +107,10 @@ routes = [
   { pattern = "example.com", custom_domain = true }
 ]
 ```
+
+:::warning[このステップはメンテナンスウィンドウとしてスケジュールすること]
+デタッチしてからアタッチするという操作に加えて、下で説明する伝播ウィンドウがあるため、レコードと証明書が落ち着くまでの数分間、訪問者が Cloudflare 自身のエラーページを目にすることがある。これは他の計画済みメンテナンスと同じように、トラフィックの少ない時間帯に、誰かが見守っている状態で実施すること -- たまたま安全なバックグラウンド変更として扱わないこと。
+:::
 
 `custom_domain = true` を指定すると、Pages のカスタムドメインと同じように、DNS レコードとエッジ証明書の作成・管理を Cloudflare 側にまかせられる -- その代償として何が必要になるかは上の Zone 権限の表の通りだ。アタッチした後は、新規のカスタムドメインをアタッチしたときと同じ伝播ウィンドウが発生すると考えておく：レコードと証明書が落ち着くまでの短い間、エッジが Cloudflare 自身のエラーページで応答することがあり、その直後の秒単位のスモークテストだけを見て切り替えが失敗したと判断しないこと。AAAA が A より先に反映される件や証明書が落ち着くまでの挙動については、[新しくアタッチしたカスタムドメインはすぐには使えない](./deploy-from-zero.mdx)を参照 -- 今回はその隙間を実トラフィックが通過することになるぶん、なおさら鋭く効いてくる。
 
