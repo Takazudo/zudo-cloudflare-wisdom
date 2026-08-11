@@ -221,3 +221,168 @@ Cloudflare の API はデプロイの途中で一時的に 5xx エラーを返�
 1. **成果物の確認**: 必要に応じてビルド出力をダウンロードして検査できる
 2. **デプロイの再試行**: デプロイが失敗した場合（ネットワーク障害など）、デプロイジョブのみ再実行できる
 3. **ビルドとデプロイの間でテスト**: ビルドとデプロイの間にテストジョブ（e2e、Lighthouse など）を挟める
+
+## デプロイ後のスモークテスト
+
+デプロイがエラーなく完了することと、サイトが実際に新しいビルドを配信していることは別の話だ。Cloudflare はパークページ、古いルートを指したままの stale な `*.pages.dev` デプロイ、あるいは伝播がまだ終わっていないドメインからでも `200 OK` を返すことがあり、これらはどれも `deploy` ジョブからは見えない。`deploy` の直後に置くスモークテストジョブは、本番の URL に対してステータスコードだけでなく、このビルドの実際のコンテンツを確認することでそのギャップを埋める。
+
+### DNS を先に見る：HTTP に触れる前に skip か fail かを決める
+
+スモークテストがまず答えるべき問いは「サイトは正しく応答したか」ではなく「そもそも尋ねる相手がまだ存在するか」だ。新しいカスタムドメインは伝播に数分から数時間かかることがあり、その間に `fetch()` で叩くと例外が投げられる——が、それは本物の TLS 証明書の破損、本物のホスト名の誤り、本物の DNS 障害でも同じように起こる。`fetch()` のエラーの形（`TypeError: fetch failed`、Node のバージョンによって形が変わる `cause` チェーンの奥に埋もれた `ENOTFOUND` や `ECONNREFUSED`）を覗いてこれらを見分けようとするのは、契約になったことのない実装の詳細を当てにいく行為だ。
+
+`node:dns/promises` はこの問いに直接答えてくれる：そのホスト名に A または AAAA レコードがそもそも存在するかどうか。
+
+```js
+import { resolve4, resolve6 } from "node:dns/promises";
+
+async function hasDnsRecord(hostname) {
+  const results = await Promise.allSettled([resolve4(hostname), resolve6(hostname)]);
+  return results.some((r) => r.status === "fulfilled" && r.value.length > 0);
+}
+```
+
+レコードがまだ無ければドメインが伝播していないだけ——これは失敗ではなく **skip** だ。レコードは解決するのにその先が間違っている場合は別の問題であり、次に確認する。
+
+### 200 単体より、実ビルドのコンテンツマーカー
+
+`200 OK` それ単体では、*どのサイトが* 答えたかは何も証明しない。次の2つの状況も、正しいデプロイと同じように 200 を返す：
+
+- Cloudflare のパークページ製品にまだルーティングされたままのドメインが、プレースホルダーのコンテンツで `200` を返す。
+- 先週の Cloudflare Pages デプロイを指したままのカスタムドメインが、完全に正当な——そして完全に stale な——サイトで `200` を返す。
+
+ステータスコードだけを確認するチェックはどちらも通してしまう。修正策は、実際のビルド出力にリテラルなマーカーを焼き込むこと——デプロイのコミット SHA をフッターのコメントや meta タグに埋め込む——そしてレスポンスボディをその厳密な文字列で確認することだ。ビルドがうまくいったと決めてかかったハードコードの値ではなく：
+
+```js
+const marker = process.env.SMOKE_CONTENT_MARKER; // baked into the page at build time, e.g. the commit SHA
+const body = await res.text();
+if (!body.includes(marker)) {
+  throw new Error(`response is missing content marker "${marker}"`);
+}
+```
+
+:::warning[マーカーは実ビルドから取ること、推測ではない]
+スモークテストのスクリプトに期待する文字列をハードコードして、ビルドがそれに一致することを祈るようなことはしない。ビルドが実際に出力した HTML からリテラルなマーカーを読み取るか、ビルドステップが埋め込んだのと同じ値（例えば `github.sha`）を渡す。そうすることでチェックは「たまたま一度うまくいった文字列」ではなく、この特定のビルドの出力を検証することになる。
+:::
+
+### リダイレクトを追わない
+
+stale なカスタムドメインは、常に古いコンテンツを直接返すとは限らない——現在そのルートを持っているデプロイの `*.pages.dev` URL へ 301 することもある。`fetch()` はデフォルトでリダイレクトを追うので、素朴なチェックは *遷移先* のページに着地し、そのマーカーを読んで通過してしまう——ドメイン自体は誤ってルーティングされたままなのに。`redirect: "manual"` を渡し、何かがポインタを別の場所へ追う前に、テスト対象の URL から Node が実際に受け取ったレスポンスを検査する：
+
+```js
+const res = await fetch(target, { redirect: "manual" });
+if (res.status >= 300 && res.status < 400) {
+  throw new Error(`unexpected redirect (${res.status}) — check that ${target.hostname} isn't still pointed at a stale deployment`);
+}
+```
+
+### `SMOKE_REQUIRE_LIVE`：初日は寛容に、確立後は厳格に
+
+新しいサイトの最初のデプロイは、上記のチェックすべてに正当に失敗しうる——DNS がまだ伝播していない、まだ一致させるコンテンツが無い——が、それはデプロイが壊れていることを意味しない。確立済みのサイトが全く同じチェックに失敗する場合は、何かが退行したということだ。1つのスモークテストが、ライフサイクルの異なる時点でこの両方の振る舞いを必要とする：
+
+- 未設定 / `false`：あらゆる失敗（DNS レコードなし、ステータス異常、リダイレクト、マーカー欠落）は警告を出して `0` で終了する——「まだ live ではない」として扱われ、壊れたデプロイとしては扱われない。
+- `true`：同じ失敗が `1` で終了し、ワークフローを失敗させる。
+
+ドメインが新しい間は未設定のままにしておき、サイトが live であることを確認できたらリポジトリの variables で `true` に切り替える——その時点から先は、スモークテストは本物の退行を決して見逃してはならない。
+
+### スクリプト
+
+```js
+// scripts/smoke-test.mjs
+import { resolve4, resolve6 } from "node:dns/promises";
+
+const target = new URL(process.env.SMOKE_URL);
+const marker = process.env.SMOKE_CONTENT_MARKER;
+const requireLive = process.env.SMOKE_REQUIRE_LIVE === "true";
+
+function skipOrFail(reason) {
+  if (requireLive) {
+    console.error(`::error::${reason}`);
+    process.exit(1);
+  }
+  console.log(`::warning::${reason} -- treating as not-live-yet (SMOKE_REQUIRE_LIVE is unset)`);
+  process.exit(0);
+}
+
+async function hasDnsRecord(hostname) {
+  const results = await Promise.allSettled([resolve4(hostname), resolve6(hostname)]);
+  return results.some((r) => r.status === "fulfilled" && r.value.length > 0);
+}
+
+if (!(await hasDnsRecord(target.hostname))) {
+  skipOrFail(`${target.hostname} has no A/AAAA record yet`);
+}
+
+const res = await fetch(target, { redirect: "manual" });
+
+if (res.status >= 300 && res.status < 400) {
+  skipOrFail(`${target} redirected (${res.status}) instead of serving directly`);
+} else if (res.status !== 200) {
+  skipOrFail(`${target} returned HTTP ${res.status}`);
+} else if (!(await res.text()).includes(marker)) {
+  skipOrFail(`${target} is missing content marker "${marker}"`);
+} else {
+  console.log(`smoke test passed: ${target} is serving ${marker}`);
+}
+```
+
+### ワークフローへの組み込み
+
+```yaml
+  smoke-test:
+    name: Post-deploy Smoke Test
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Run smoke test
+        run: node scripts/smoke-test.mjs
+        env:
+          SMOKE_URL: https://my-site.example.com
+          SMOKE_CONTENT_MARKER: ${{ github.sha }}
+          SMOKE_REQUIRE_LIVE: ${{ vars.SMOKE_REQUIRE_LIVE }}
+```
+
+`SMOKE_REQUIRE_LIVE` は `secrets` ではなく `vars` から読む——これは認証情報ではなく、ドメインが live だと確認できた時点でチームが切り替える、ただのリポジトリ変数だからだ。
+
+### API Worker 版：認証 → 作成 → 検証 → 削除
+
+静的サイトのスモークテストは `GET` 1本で済む。API Worker のスモークテストは書き込み経路全体が動くことを証明する必要があり、それには実際に呼び出すしかない：認証し、レコードを作成し、正しく返ってくることを検証し、削除する。これを毎回のデプロイで安全に実行できるようにする鍵が2つある：
+
+- **実行ごとに一意な識別子** —— タイムスタンプにランダムなサフィックスを足したもの。これにより、並行する実行（立て続けの2回の push）が同じリソースで衝突することがなく、万一残ってしまったレコードもどの実行が作ったものか追跡できる。
+- **クリーンアップ用の `trap ... EXIT`** —— これにより、作成したレコードはスクリプトが成功しても、verify ステップで失敗しても、ジョブの `timeout-minutes` で kill されても削除される。ハッピーパスだけではない。
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUN_ID="smoke-$(date +%s)-$RANDOM"
+ITEM_ID=""
+
+cleanup() {
+  [ -n "$ITEM_ID" ] && curl -fsS -X DELETE "$API_URL/items/$ITEM_ID" \
+    -H "Authorization: Bearer $API_TOKEN" >/dev/null
+  return 0
+}
+trap cleanup EXIT
+
+curl -fsS "$API_URL/auth/verify" -H "Authorization: Bearer $API_TOKEN" >/dev/null
+
+ITEM_ID=$(curl -fsS -X POST "$API_URL/items" \
+  -H "Authorization: Bearer $API_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"name\":\"$RUN_ID\"}" | jq -r '.id')
+
+curl -fsS "$API_URL/items/$ITEM_ID" -H "Authorization: Bearer $API_TOKEN" \
+  | jq -e --arg name "$RUN_ID" '.name == $name' >/dev/null
+
+echo "API smoke test passed for $RUN_ID"
+```
+
+:::warning[`trap ... EXIT` が生き残るのは通常の失敗経路だけ]
+`trap ... EXIT` は、通常の終了、`exit` の呼び出し、`set -e` によるスクリプトの中断で実行される——上記のあらゆる失敗経路をカバーする。ただし、一部の CI ランナーがハードタイムアウトを強制する方法である `SIGKILL` でプロセスが kill された場合は実行され**ない**。`timeout-minutes` は、ジョブ側の外側の上限ではなく、スクリプト自身のロジックがジョブを終わらせる程度に余裕を持たせておくこと。
+:::
+
+上記の DNS/fetch 版の代わりに、API Worker の `smoke-test` ジョブではこのスクリプトを `run:` ステップとして差し替える。周囲のジョブ（`needs: [deploy]`、`timeout-minutes`）はそのままでよい。
