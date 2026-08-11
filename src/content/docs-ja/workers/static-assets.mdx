@@ -186,12 +186,113 @@ curl       + sec-fetch-mode  -> 404   （ヘッダーが送られる）
 つまり fetch ベースのデプロイ後チェックは、ユーザーが決して生成しないリクエスト形状を試しており、まさにこのバグを緑のまま通過させる。ヘッダーをそのまま書き出す `node:https`（あるいは `undici.request`、実ブラウザ）を使うこと。
 :::
 
+## ルーティングの罠
+
+上のゲーティングの罠と SSR インデックスの障害は、根本原因が同じだ -- アセットレイヤーが「ファイルを配信するか、Worker に渡すか」を決めるのは Worker コードが動く**前**であり、その境界線はリクエストの種類と使っている Wrangler のバージョンによって位置が変わる。同じ仕組みから、さらにいくつかの罠が生まれる。
+
+### ブラウザのナビゲーションは `curl` が通るゲートをすり抜けられる
+
+Worker スクリプト（`main`）が設定されており、`not_found_handling` が設定されており、かつ互換性日付が `2025-04-01` 以降（あるいは `assets_navigation_prefers_asset_serving` 互換性フラグが設定されている）場合、**アセットに一致しないナビゲーションリクエストは `not_found_handling` から直接応答され、Worker には一切到達しない** -- `run_worker_first` のデフォルトが `false` かどうかとは無関係に。ナビゲーションでないリクエスト（`Sec-Fetch-Mode: navigate` ヘッダーを持たない、`curl` やほとんどのサーバー間呼び出し）は、これまでどおり Worker へフォールスルーする。
+
+「アセットに一致しない -> Worker へフォールスルーする」を暗黙のバックストップとして当てにしていた場合 -- 例えば、既知の公開ファイルでないパスすべてに対する catch-all の認可チェックなど -- そのバックストップは、プロジェクトが最新の互換性日付に乗った瞬間、実際のブラウザトラフィックに対しては静かに動かなくなる。「保護されている」はずのパスへの `curl` チェックは相変わらず Worker に到達して成功と報告するが、実際のブラウザ訪問者はみな `not_found_handling` の応答を受け取るだけで、ゲートは一切かからない。
+
+:::danger[curl は通るが、すべてのブラウザはすり抜ける -- セキュリティゲートが静かに開けっぱなしになっている]
+互換性日付が `2025-04-01` を超えたら、手動の `curl` チェックはブラウザが何を受け取るかについて何も証明しない。`Sec-Fetch-Mode: navigate` を伴うリクエストで検証すること（上の SSR インデックスの検証コマンドを参照）。あるいは曖昧さそのものを消す方法として、`run_worker_first = true` を設定し、リクエストの形に関係なく Worker を必ず実行させる。
+:::
+
+### 完全なゲーティング修正は `run_worker_first = true` と、アセット自身を配信する Worker とのペアだ
+
+`run_worker_first = true` は**ルーティング**だけを変える -- すべてのリクエストが先に Worker に到達するようになる。それ自体は何もゲートしないし、アセットを配信もしない。Worker 自身が認可を確認し、一致するアセットをバインディング経由で自分で配信する必要がある：
+
+```typescript
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const authorized = await checkAuth(request, env);
+    if (!authorized) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    // Gate passed -- now serve the matching static asset ourselves.
+    return env.ASSETS.fetch(request);
+  },
+};
+```
+
+これを追加せずにフラグだけ切り替えても修正としては不完全だ。Worker はすべてのリクエストで実行されるようになるが、明示的に認可した上で `env.ASSETS.fetch()` を呼ばない限り、サイトの静的ファイルを実際に返す手段がない。修正はこのペアである -- `run_worker_first = true` **と**認証済みの `env.ASSETS.fetch(request)` 呼び出し -- フラグ単体ではない。
+
+### 配列形式の `run_worker_first` はコスト最適化であり、ゲートではない
+
+Wrangler 4.20.0 以降では、`run_worker_first` にブール値の代わりにルートパターンの配列を渡せる：
+
+```toml
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+# Only these paths invoke the Worker first; every path NOT listed here --
+# including paths you haven't thought of yet -- serves straight from the
+# asset layer with no Worker involvement at all.
+run_worker_first = ["/oauth/callback", "/api/*"]
+```
+
+これが存在するのは、クライアント重めの SPA で課金対象の Worker 呼び出しを減らすためだ -- ほとんどのナビゲーションは Worker のコストゼロでエッジから直接 `index.html` を配信する -- セキュリティ境界を表現するためではない。ルート集合を「保護する」つもりで配列形式に手を伸ばすと、リストの外にあるパスにはゲートが一切かからない。列挙しなかったパスに対する暗黙の拒否は存在しない。認可が要件なら `run_worker_first = true`（あるいは前述のように Worker 内部でゲートする）を使うこと。配列形式はルーティングとコスト最適化のために取っておく。
+
+### `not_found_handling = "single-page-application"` は常にルートの `index.html` を配信する
+
+一致しないパスに対して、SPA フォールバックは**トップレベル**の `dist/index.html` の内容を `200 OK` で配信する -- パスがどれだけ深くても関係ない。ディレクトリごとのフォールバックは存在しない。
+
+```toml
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+# Every unmatched path -- /app-a/settings, /app-b/reports, /anything --
+# gets the SAME top-level dist/index.html. There is no per-directory variant.
+not_found_handling = "single-page-application"
+```
+
+この罠はマルチゾーンのビルドで表面化する。`dist/app-a/index.html` と `dist/app-b/index.html` を、それぞれが自分のサブツリーを持つ別々の SPA シェルとして出荷しているなら、フォールバックはその構造を完全に無視する。`/app-a/settings` への、実ファイルに一致しないリクエストが受け取るのはルートの `dist/index.html` であって `dist/app-a/index.html` ではない -- ルートシェル自身のルーターが `/app-a/*` を担当する設計になっていない限り。
+
+### `auto-trailing-slash` はパターンがリクエストを目にする前に書き換えてしまう
+
+デフォルトの `html_handling = "auto-trailing-slash"` は `foo/index.html` をトレイリングスラッシュ**あり**で配信し、素の `/foo` リクエストはまず `/foo/` へリダイレクトする：
+
+```
+GET /foo   -> 307 Location: /foo/
+GET /foo/  -> 200 (serves dist/foo/index.html)
+```
+
+罠はこうだ。素の形に対して書いたパターン -- `run_worker_first` の配列エントリ、手動のリダイレクトルール、Worker コード内の文字列比較 -- は一致するトラフィックを一切目にしない。あなたがマッチさせようとしているリクエストが到着する前に、ブラウザはすでに 307 をたどっているからだ。正規形である `/dir/` の形に対してパターンを書くこと：
+
+```toml
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+# Wrong: "/admin" never arrives here -- auto-trailing-slash 307s it to
+# "/admin/" first. Match the form that's actually requested.
+run_worker_first = ["/admin/*"]
+```
+
+### `env.ASSETS.fetch()` はパス名だけでマッチする
+
+`env.ASSETS.fetch(request)` -- 上のゲートがリクエストを認可した後にアセットを配信するために使う呼び出し -- は**URL のパス名だけ**でマッチする。クエリ文字列はアセットのマッチングに一切関与しない：
+
+```typescript
+// Both requests resolve to the SAME asset -- the query string is ignored
+// for matching purposes, even though it's still visible to your Worker code.
+await env.ASSETS.fetch(new Request("https://example.com/report.pdf"));
+await env.ASSETS.fetch(new Request("https://example.com/report.pdf?v=2"));
+```
+
+バインディング経由でアセットのバリアントをクエリ文字列で選び分けようとしないこと -- 常に同じファイルに解決される。ハッシュ付きバンドルのバージョニングはファイル名自体で表現するべきものだ。コンテンツハッシュ付きファイル名と組み合わせる `_headers` パターンについては[ハッシュ付きアセットのブラウザキャッシュ](./static-assets-caching.mdx)を参照。
+
 ## まとめ
 
 | フィールド | デフォルト | 設定する場面 |
 |---|---|---|
 | `binding` | -- | Worker（またはそのアダプター）が実際に `env.ASSETS.fetch()` を呼ぶ -> 設定する；Worker に `main` はあるがアセットファーストのルーティングに任せきりで `env.ASSETS` に一切触れない -> 省略する；assets-only Worker（`main` なし）-> 省略する。設定していると wrangler がハードエラーになる |
 | `not_found_handling` | `"none"` | SSG -> `"404-page"`、SPA -> `"single-page-application"` |
-| `run_worker_first` | `false` | Worker が**すべての**リクエストをゲート・認可する必要がある -> `true`。あるいはインデックスが SSR で `dist/404.html` が存在する -> `["/", ...]` |
+| `run_worker_first` | `false` | Worker が**すべての**リクエストをゲート・認可する必要がある -> `true`；一部のルートだけコスト上の理由で Worker-first にしたい（セキュリティ目的では使わない）-> パターンの配列；あるいはインデックスが SSR で `dist/404.html` が存在する -> `["/", ...]` |
+| `html_handling` | `"auto-trailing-slash"` | `run_worker_first` のパターンやリダイレクトルールをディレクトリパスに対して書く -> ブラウザが実際にリクエストする `/dir/` の形を使うこと。リダイレクトされて消えていく素の `/dir` の形ではなく |
 | `workers_dev` | `true` | 本番を `*.workers.dev` で配信するのをやめる -> `false` |
 | `preview_urls` | `workers_dev` に一致 | `workers_dev = false` でもプレビューを残すため常に**明示的に**設定 |
