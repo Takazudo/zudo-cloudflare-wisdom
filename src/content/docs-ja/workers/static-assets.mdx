@@ -235,7 +235,9 @@ not_found_handling = "single-page-application"
 run_worker_first = ["/oauth/callback", "/api/*"]
 ```
 
-これが存在するのは、クライアント重めの SPA で課金対象の Worker 呼び出しを減らすためだ -- ほとんどのナビゲーションは Worker のコストゼロでエッジから直接 `index.html` を配信する -- セキュリティ境界を表現するためではない。ルート集合を「保護する」つもりで配列形式に手を伸ばすと、リストの外にあるパスにはゲートが一切かからない。列挙しなかったパスに対する暗黙の拒否は存在しない。認可が要件なら `run_worker_first = true`（あるいは前述のように Worker 内部でゲートする）を使うこと。配列形式はルーティングとコスト最適化のために取っておく。
+これが存在するのは、クライアント重めの SPA で課金対象の Worker 呼び出しを減らすためだ -- ほとんどのナビゲーションは Worker のコストゼロでエッジから直接 `index.html` を配信する -- が、これはゲートとしても使える。ただしそれは、リストの外がすべて意図的に公開されている**限定されたサブツリー**に対してだけだ。`/admin/*` だけが認証を必要とし、それ以外はすべて公開のつもりのサイトで `run_worker_first = ["/admin/*"]` を使うのは正当なセキュリティゲートだ -- admin サブツリーを保護しつつ、保護が要らない公開アセットについては Worker を呼び出さずに済む。
+
+配列形式が誤りになるのは、**catch-all あるいはデフォルト拒否**の要件のときだ -- 「すべてのリクエストを認可する」「明示的にリストしない限り公開しない」といったケース。この場合、配列の外にあるパスにはゲートが一切かからず、列挙しなかったパスに対する暗黙の拒否は存在しない。後から追加したルートはデフォルトでゲートなしのまま公開される。要件がデフォルト拒否なら `run_worker_first = true`（あるいは前述のように Worker 内部でゲートする）を使うこと。配列形式は、既知の限定されたサブツリー向けに取っておく -- コスト最適化のためであれ、それ以外を意図的に公開したままにする特定のルート集合へのゲートのためであれ。
 
 ### `not_found_handling = "single-page-application"` は常にルートの `index.html` を配信する
 
@@ -252,25 +254,28 @@ not_found_handling = "single-page-application"
 
 この罠はマルチゾーンのビルドで表面化する。`dist/app-a/index.html` と `dist/app-b/index.html` を、それぞれが自分のサブツリーを持つ別々の SPA シェルとして出荷しているなら、フォールバックはその構造を完全に無視する。`/app-a/settings` への、実ファイルに一致しないリクエストが受け取るのはルートの `dist/index.html` であって `dist/app-a/index.html` ではない -- ルートシェル自身のルーターが `/app-a/*` を担当する設計になっていない限り。
 
-### `auto-trailing-slash` はパターンがリクエストを目にする前に書き換えてしまう
+### `run_worker_first` と `_redirects` は、`auto-trailing-slash` が書き換える前のリクエストを見る
 
-デフォルトの `html_handling = "auto-trailing-slash"` は `foo/index.html` をトレイリングスラッシュ**あり**で配信し、素の `/foo` リクエストはまず `/foo/` へリダイレクトする：
+デフォルトの `html_handling = "auto-trailing-slash"` は `foo/index.html` をトレイリングスラッシュ**あり**で配信し、素の `/foo` リクエストは `/foo/` へリダイレクトする：
 
 ```
 GET /foo   -> 307 Location: /foo/
 GET /foo/  -> 200 (serves dist/foo/index.html)
 ```
 
-罠はこうだ。素の形に対して書いたパターン -- `run_worker_first` の配列エントリ、手動のリダイレクトルール、Worker コード内の文字列比較 -- は一致するトラフィックを一切目にしない。あなたがマッチさせようとしているリクエストが到着する前に、ブラウザはすでに 307 をたどっているからだ。正規形である `/dir/` の形に対してパターンを書くこと：
+このリダイレクトはアセットレイヤー自身の挙動であり、リクエストが既にそこへルーティングされた後で初めて発火する。`run_worker_first` のパターンマッチングはそれより上流、つまり実際にリクエストされたままのパス名に対して行われる -- だから素の形（`/admin`、トレイリングスラッシュなし）に対して書いたパターンは `/admin` へのリクエストをちゃんと目にする。スキップされたりはしない。これは `_redirects` のルールも同じで、こちらも `html_handling` より前に評価される。
+
+素の形だけで抜け落ちるのは、その先にあるものすべてだ -- リダイレクト後にブラウザがたどり着く正規の `/admin/` という宛先や、`/admin/settings` のようにその下にネストされたものすべて。`/admin/*` というエントリも、素の `/admin` へのリクエストはカバーしない -- グロブはその後に続く `/` を文字どおり要求するからだ。サブツリー全体に Worker を通したいなら、両方を明示的にカバーすること：
 
 ```toml
 [assets]
 directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
-# Wrong: "/admin" never arrives here -- auto-trailing-slash 307s it to
-# "/admin/" first. Match the form that's actually requested.
-run_worker_first = ["/admin/*"]
+# "/admin" matches the request as originally made, before auto-trailing-slash
+# would redirect it. "/admin/*" covers the "/admin/" destination and every
+# path nested under it. Neither pattern covers the other -- list both.
+run_worker_first = ["/admin", "/admin/*"]
 ```
 
 ### `env.ASSETS.fetch()` はパス名だけでマッチする
@@ -292,7 +297,7 @@ await env.ASSETS.fetch(new Request("https://example.com/report.pdf?v=2"));
 |---|---|---|
 | `binding` | -- | Worker（またはそのアダプター）が実際に `env.ASSETS.fetch()` を呼ぶ -> 設定する；Worker に `main` はあるがアセットファーストのルーティングに任せきりで `env.ASSETS` に一切触れない -> 省略する；assets-only Worker（`main` なし）-> 省略する。設定していると wrangler がハードエラーになる |
 | `not_found_handling` | `"none"` | SSG -> `"404-page"`、SPA -> `"single-page-application"` |
-| `run_worker_first` | `false` | Worker が**すべての**リクエストをゲート・認可する必要がある -> `true`；一部のルートだけコスト上の理由で Worker-first にしたい（セキュリティ目的では使わない）-> パターンの配列；あるいはインデックスが SSR で `dist/404.html` が存在する -> `["/", ...]` |
-| `html_handling` | `"auto-trailing-slash"` | `run_worker_first` のパターンやリダイレクトルールをディレクトリパスに対して書く -> ブラウザが実際にリクエストする `/dir/` の形を使うこと。リダイレクトされて消えていく素の `/dir` の形ではなく |
+| `run_worker_first` | `false` | Worker が**すべての**リクエストをゲート・認可する必要がある（デフォルト拒否）-> `true`；一部のルートだけコスト上の理由で Worker-first にしたい、あるいは他をすべて意図的に公開したままにする限定サブツリーへのゲートにしたい -> パターンの配列；あるいはインデックスが SSR で `dist/404.html` が存在する -> `["/", ...]` |
+| `html_handling` | `"auto-trailing-slash"` | `run_worker_first` でディレクトリのサブツリーをゲートする -> 素の形と `/dir/*` の形の両方をリストすること。それぞれがカバーする範囲は違う |
 | `workers_dev` | `true` | 本番を `*.workers.dev` で配信するのをやめる -> `false` |
 | `preview_urls` | `workers_dev` に一致 | `workers_dev = false` でもプレビューを残すため常に**明示的に**設定 |

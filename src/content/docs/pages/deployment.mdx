@@ -12,7 +12,7 @@ Before your first deploy, create the project:
 npx wrangler@4 pages project create zudo-cloudflare --production-branch=main
 ```
 
-Pass `--production-branch` explicitly — without it, `project create` prompts for the production branch interactively, which hangs a non-interactive CI runner.
+Pass `--production-branch` explicitly — without it, `project create` needs a production branch and would normally prompt for one interactively. In CI there's no TTY to prompt against, so it doesn't hang: it fails immediately with `Must specify a production branch.`
 
 :::warning
 Don't rely on `pages deploy` to create the project for you in CI. Cloudflare's own docs describe an auto-create path for `pages deploy`, but it only fires through an interactive prompt for the project name and production branch — a GitHub Actions runner has no TTY, so that prompt never appears. Worse, once you pass `--project-name` (as the [deploy command](#deploy-command) below does, which you need in CI for an auditable log), wrangler requires the project to already exist and fails with `Project not found. The specified project name does not match any of your existing projects. [code: 8000007]` instead of creating one. Always run `pages project create` before the first CI deploy. This applies to current `wrangler@4` — the auto-create prompt is documented as interactive-only, with no non-interactive fallback.
