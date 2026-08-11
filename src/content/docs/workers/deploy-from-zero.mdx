@@ -102,22 +102,50 @@ An app Worker whose `main` lives **outside** the assets directory never triggers
 
 For CI deploys you create an API token, and the dashboard offers an **"Edit Cloudflare Workers"** token template. The trap: that template does **not** include **D1:Edit**. Without it, `wrangler d1 migrations apply --remote` fails with an authorization error (`code: 7403`, *given account is not valid or is not authorized to access this service*).
 
+The same template also omits **Vectorize:Read** and **Workers AI:Read**, exactly the way it omits D1:Edit. The symptom looks different, though: a REST assert like `GET /accounts/{id}/vectorize/v2/indexes/{name}` fails with a plain **HTTP 403** -- no Cloudflare error-code wrapper, unlike D1's `7403`. (Vectorize **Edit** also satisfies this check; **Read** is enough for a read-only assert.)
+
 Diagnostic rule of thumb (exact codes can drift -- treat the message as the signal):
 
 - **Authorization error on a D1 command** (e.g. `7403`) -> the token is missing a D1 permission.
 - **"Account not found"-style error** (e.g. `7404`) -> the account id is wrong, not the token.
+- **Plain HTTP 403 on a REST assert** (no wrapping error code) -> the token is missing that service's Read permission (Vectorize, Workers AI, ...) -- a different signature from D1's wrapped `7403`.
+- **Token authenticates but nothing is found** -> check whether `CLOUDFLARE_ACCOUNT_ID` belongs to the same account the token was minted for. A token from account A paired with the account id from account B passes authentication cleanly and then fails every lookup, which reads like a permissions bug and isn't one.
+- **Generic `Authentication error [code: 10000]`** -> three distinct causes, each needing a different fix:
 
-A working permission set for a Workers + D1 + KV + Workers AI stack (trim to what you actually use):
+| Cause | Fix |
+| --- | --- |
+| Token expired or revoked | Mint a new token, or re-enable the existing one |
+| Malformed secret value (e.g. trailing whitespace from a copy-paste) | Re-set the secret via `wrangler secret put` / the GitHub Actions secret |
+| Missing **Account Settings: Read** | Edit the token's permissions to add it |
+
+A working permission set for a Workers + D1 + KV + Vectorize + Workers AI stack (trim to what you actually use):
 
 | Scope | Permission |
 | --- | --- |
 | Account -- Workers Scripts | Edit |
 | Account -- D1 | Edit |
 | Account -- Workers KV Storage | Edit |
+| Account -- Vectorize | Read |
 | Account -- Workers AI | Read |
 | Account -- Account Settings | Read |
 | Zone -- Workers Routes | Edit (only when using custom domains) |
 | Zone -- DNS | Edit (only when using custom domains) |
+
+For a larger, empirically-verified stack -- Workers + D1 + R2 + Queues + Vectorize + Workers AI, deploying `routes` with `custom_domain: true` -- the full working set was:
+
+| Scope | Permission |
+| --- | --- |
+| Account -- Workers Scripts | Edit |
+| Account -- D1 | Edit |
+| Account -- Workers R2 Storage | Edit |
+| Account -- Queues | Edit |
+| Account -- Workers KV Storage | Edit (optional -- retained from the set above; trim to what you actually use) |
+| Account -- Vectorize | Read |
+| Account -- Workers AI | Read |
+| Account -- Account Settings | Read |
+| Zone -- Workers Routes | Edit |
+| Zone -- Zone | Read |
+| User -- User Details | Read |
 
 Store the token and account id as GitHub Actions secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
 
@@ -126,6 +154,24 @@ Store the token and account id as GitHub Actions secrets `CLOUDFLARE_API_TOKEN` 
 `custom_domain = true` has Cloudflare *create and manage* the DNS record and the edge certificate, so `Zone -- Workers Routes: Edit` alone is not enough -- `Zone -- DNS: Edit` is doing real work here. Grant both.
 
 Equally easy to miss: adding zone permissions does nothing while **Zone Resources** is left empty. The permission rows and the resource scope are separate controls, and a token with both zone rows but no zone included still fails at route creation on every deploy.
+
+:::
+
+:::note[The minimal zone set isn't fixed -- it depends on wrangler version and route mode]
+
+The empirically-verified stack above deployed fine with just **Workers Routes: Edit** + **Zone: Read** -- no DNS:Edit -- which looks like a direct contradiction of the warning above. Both observations are real: the minimal zone permission set varies by wrangler version and by route mode (a dashboard-attached route behaves differently from `custom_domain: true`). When in doubt, grant **Workers Routes: Edit + DNS: Edit + Zone: Read** with Zone Resources populated, get a green deploy, then trim permissions one at a time to find the actual minimum for your setup.
+
+:::
+
+:::tip[A zone-permission-free alternative exists, at the cost of a manual step]
+
+If the CI token's zone permissions keep causing trouble, there's a way to avoid them entirely: keep `workers_dev = false`, declare **no `[[routes]]`** in the committed config, and attach the custom domain once through the dashboard (or a one-time CLI call run outside the pipeline). `wrangler deploy` then never touches the zone API, so the CI token needs zero zone permissions. The tradeoff: attaching the domain becomes a manual, one-time operator step that isn't version-controlled. Treat this as an option alongside the `[[routes]]` path, not a replacement for it.
+
+:::
+
+:::note[Editing a token's permissions keeps the secret; creating a new token doesn't]
+
+Adding a permission to an **existing** token keeps the token string unchanged -- the CI secret needs no update. **Creating a new token** does not preserve the string -- the secret must be re-set via `wrangler secret put` / the GitHub Actions secret. It's easy to grant the missing permission on a freshly created token and then wonder why CI still fails: the pipeline is still authenticating with the old secret value.
 
 :::
 
@@ -181,7 +227,7 @@ Before calling the provisioning done, verify:
 - [ ] `wrangler.jsonc` / `wrangler.toml` has the final Worker `name` and real binding ids -- no `REPLACE_WITH_*` placeholders -- and is **committed**
 - [ ] `.assetsignore` sits in the emitted assets root (via `public/` if the framework copies it into the build output)
 - [ ] D1 migrations run with the same `CLOUDFLARE_ACCOUNT_ID` the deploy uses
-- [ ] The CI token includes **D1:Edit** (and KV / AI / Routes permissions as needed), not just the "Edit Cloudflare Workers" template
+- [ ] The CI token includes **D1:Edit**, **Vectorize:Read**, and **Workers AI:Read** (plus KV / R2 / Queues / Routes permissions as needed), not just the "Edit Cloudflare Workers" template
 - [ ] Secrets are set via `wrangler secret put` / GitHub secrets -- none of them live in the committed config
 
 Related pages: [Wrangler Config](./wrangler-config.mdx) for the config format, [Workers Static Assets](./static-assets.mdx) for the assets model, and [Production Deploy](../cicd/production-deploy.mdx) for the CI workflow.
