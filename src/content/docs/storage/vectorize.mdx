@@ -119,3 +119,4 @@ This is latent -- it only breaks when something actually reads `.ids` or `.count
 - **No metric at runtime (V2)**: `describe()` cannot report the distance metric -- verify it at provisioning or deploy time instead
 - **Missing index fails deploy, not dry-run**: `--dry-run` does not resolve remote resources, so create the index first
 - **`insert`/`upsert`/`deleteByIds` return shape depends on API generation**: `{ ids, count }` (V1) vs `{ mutationId }` (V2)
+- **No local emulation**: `wrangler dev` doesn't emulate Vectorize at all -- see the [binding support matrix](../workers/local-dev-bindings.mdx) for what does and doesn't work locally

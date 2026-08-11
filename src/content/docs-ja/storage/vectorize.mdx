@@ -119,3 +119,4 @@ result.mutationId; // string
 - **ランタイムでメトリックが取れない（V2）**: `describe()` は距離メトリックを返せない -- プロビジョニング時かデプロイ時に検証する
 - **インデックスの欠落はデプロイを完全に失敗させ、`--dry-run` では捕まえられない**: `--dry-run` はリモートリソースを解決しないため、先にインデックスを作成する
 - **`insert`/`upsert`/`deleteByIds` の戻り値の形は API 世代に依存する**: `{ ids, count }`（V1）対 `{ mutationId }`（V2）
+- **ローカルエミュレーションなし**: `wrangler dev` は Vectorize を一切エミュレートしない -- ローカルで何が動作するかは[バインディング対応表](../workers/local-dev-bindings.mdx)を参照
