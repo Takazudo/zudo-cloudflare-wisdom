@@ -8,7 +8,7 @@ Cloudflare Workers は普通の Node.js のように見えるが、`workerd` は
 
 ## Self-Fetch とサービスバインディング: ホスト名は無効化されている
 
-Worker が自分自身、あるいは[サービスバインディング](./wrangler-config.mdx#service-bindings-one-worker-calling-another)経由で別の Worker を呼ぶ場合でも、`fetch()` には構文的に妥当な絶対 URL を渡す必要がある -- ただし Cloudflare はその URL のホスト名をルーティングには使わない。宛先の Worker に届くのはメソッド・パス・ヘッダー・ボディだけで、どの Worker が呼び出しを受け取るかはバインディング自体が決める。`env.SELF.fetch(...)` が DNS にも公開ルートにも一切触れないのはそのためだ。
+Worker が自分自身、あるいは[サービスバインディング](./wrangler-config.mdx#名前付き環境とサービスバインディング-サービスバインディング-ある-worker-が別の-worker-を呼ぶ)経由で別の Worker を呼ぶ場合でも、`fetch()` には構文的に妥当な絶対 URL を渡す必要がある -- ただし Cloudflare はその URL のホスト名をルーティングには使わない。宛先の Worker に届くのはメソッド・パス・ヘッダー・ボディだけで、どの Worker が呼び出しを受け取るかはバインディング自体が決める。`env.SELF.fetch(...)` が DNS にも公開ルートにも一切触れないのはそのためだ。
 
 ```jsonc
 // wrangler.jsonc -- binds this Worker to itself under SELF
