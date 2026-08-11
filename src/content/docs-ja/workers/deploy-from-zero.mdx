@@ -117,8 +117,51 @@ Workers + D1 + KV + Workers AI スタックで動作する権限セット（実�
 | Account -- Workers AI | Read |
 | Account -- Account Settings | Read |
 | Zone -- Workers Routes | Edit（カスタムドメイン使用時のみ） |
+| Zone -- DNS | Edit（カスタムドメイン使用時のみ） |
+
+:::warning[カスタムドメインにはゾーン権限が **2 つ** 必要で、Zone Resources にゾーンを含める必要もある]
+
+`custom_domain = true` は DNS レコードとエッジ証明書を Cloudflare が*作成・管理*する仕組みなので、`Zone -- Workers Routes: Edit` だけでは足りない — `Zone -- DNS: Edit` が実際に効いている。両方を付与すること。
+
+同じくらい見落としやすいのが、**Zone Resources** が空のままではゾーン権限を足しても何も起きない点。権限の行とリソースのスコープは別々の設定であり、ゾーンの行が 2 つ揃っていてもゾーンが含まれていないトークンは、毎回のデプロイでルート作成時に失敗する。
+
+:::
 
 トークンとアカウント id は GitHub Actions のシークレット `CLOUDFLARE_API_TOKEN` と `CLOUDFLARE_ACCOUNT_ID` として保存する。
+
+## 割り当て直後のカスタムドメインはすぐには使えない
+
+`wrangler deploy` はルートを作成した時点でカスタムドメインを報告する：
+
+```
+Deployed my-worker triggers (1.12 sec)
+  my-worker.example.com (custom domain)
+```
+
+この行が意味するのはルートが存在することであって、ホスト名が**動作すること**ではない。その後 1 分ほどは、レコードと証明書が落ち着くまでエッジが Cloudflare 自身のエラーページ（`error code: 1104` や 5xx）を返しうる。数秒後に走るデプロイ後チェックは、サイトではなくこのウィンドウと競走している。
+
+現れる失敗は 2 種類あり、どちらもアプリのバグと誤診しやすい：
+
+**AAAA が A より先に来る。** Cloudflare は IPv6 レコードを先に公開する。GitHub Actions のランナーには **IPv6 の経路がない**ため、その隙間の接続はすべて `ENETUNREACH` で失敗する — Worker 自体は完全に正常なのに。`*.workers.dev` の URL は影響を受けないので、そちらが 200 を返すなら Worker は正常で、見ているのは伝播の問題だと確認できる。
+
+Node はこれを Happy Eyeballs 経由で `AggregateError` として報告するが、**その集約エラー自体は `code` を持たないことがある** — 実際のアドレスごとのコードは `.errors[]` にぶら下がる。`.cause` チェーンだけを辿る分類器は、これを完全に見逃す：
+
+```js
+function codes(error) {
+  const out = [];
+  for (let e = error; e; e = e.cause) {
+    if (e.code) out.push(e.code);
+    if (Array.isArray(e.errors)) out.push(...e.errors.flatMap(codes)); // <- 必須
+  }
+  return out;
+}
+```
+
+**オリジンが繋がる前にエッジが 5xx を返す。** ホスト名は解決し TLS も完了するが、Cloudflare が自前のエラーページを返す。割り当て直後のドメインへの*最初の*プローブで 5xx を受けたら「まだ準備できていない」と扱い、成功レスポンスとして扱ってはいけない。
+
+:::tip[緩和は範囲を絞る。さもないと盲点になる]
+リトライして許容してよいのは**最初の**プローブだけ、しかも 1 回成功するまでの間だけである。ホストが一度応答すれば、それはデプロイ済みであることの証明であり、以降の失敗は本物の障害なので致命的なままにしなければならない。全リクエストに適用される緩和は、本物の障害を静かな成功に変えてしまう。
+:::
 
 ## CI はコミット済みの設定からデプロイする
 
