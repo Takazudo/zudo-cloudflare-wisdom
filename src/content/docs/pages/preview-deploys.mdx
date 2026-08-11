@@ -110,3 +110,11 @@ permissions:
   contents: read
   pull-requests: write
 ```
+
+## Fork PRs Don't Get Previews
+
+GitHub does not expose repository secrets to workflows triggered by a pull request from a fork. If your preview-deploy workflow runs on the `pull_request` event and the PR comes from a fork, `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` resolve to empty strings and the deploy step fails with an authentication error.
+
+:::note
+This is expected GitHub Actions behavior, not a bug in this setup. Preview deploys only work for branches pushed to this repository (same-repo PRs). Fork PRs from external contributors will not get a preview URL unless you switch to `pull_request_target` (which runs with repo secrets against the fork's code — treat this as a security decision, not a quick fix) or split the workflow into a build-on-fork / deploy-after-approval pattern.
+:::
