@@ -20,11 +20,13 @@ sidebar_position: 8
 | Assets | Yes | No |
 | Plain vars | Yes | No |
 | Secrets | Yes | No |
+| Cache API (`caches.default`, not a binding) | Yes | No |
 | AI (`remote: true`) | No -- proxies to the real API | Yes -- and its absence fails the *entire* dev server boot |
-| Vectorize | No -- prints `not supported`, no emulation | N/A -- binding is simply absent from `env` |
-| Cache API (not a binding) | No -- zero local simulation, no flag | N/A -- only observable after deploy to `*.workers.dev` |
+| Vectorize (default config) | No -- prints `not supported`, no emulation | N/A -- binding is simply absent from `env` |
+| Vectorize (`remote: true`) | No local emulation -- proxies to the real index | Yes -- same remote-proxy path as AI |
+| Workers Cache (`cache.enabled` block, edge caching) | No -- deploy-time feature, zero local simulation | N/A -- only observable on a deployed Worker |
 
-上のブロック -- D1、R2、KV、Queues、Rate Limiting、Assets、プレーンな vars、secrets -- はすべてローカルでエミュレートされ、Cloudflare のクラウド側からは何も必要としない。下の 2 行が例外で、それぞれ違う形で失敗する。
+Cache API までのブロック -- D1、R2、KV、Queues、Rate Limiting、Assets、プレーンな vars、secrets、そして Cache API 自体 -- はすべてローカルでエミュレートされ、Cloudflare のクラウド側からは何も必要としない。それより下の行はそれぞれ足りないものが違う：AI は常に有効な `CLOUDFLARE_API_TOKEN` を必要とする。Vectorize は `remote: true` を選んだ場合だけそれを必要とし、そうでなければ単に存在しない。そして Workers Cache は、設定にかかわらずローカルでは一切動かない。
 
 :::warning[`ai: { remote: true }` は AI バインディングだけでなく dev サーバー全体を落とす]
 `ai` バインディングの `remote: true` モードは、起動時にリモートプロキシセッションを強制する。`CLOUDFLARE_API_TOKEN` が設定されていないと、そのプロキシセッションの確立に失敗する -- そして `wrangler dev` は、`env.AI` に一切触れないリクエストに対してさえ、起動そのものを拒否する。
@@ -47,9 +49,19 @@ env.AI                  AI                remote
 - `env.VECTOR_INDEX`（Vectorize）は `not supported` と出力してそのまま進む -- ここで起動自体は失敗しないが、バインディングは `env` に存在しないため、それに触れるコードパスはリクエスト時に例外を投げる。
 - `env.AI` は `remote` と出力する。これは wrangler がこれからリモートプロキシセッションを開こうとしているサインだ。そのセッションには `CLOUDFLARE_API_TOKEN` が必要で、見つからないと*プロセス全体*が上記のエラーで終了する -- AI に依存するルートだけでなく。
 
-## Workers Cache API はローカルに一切存在しない
+`not supported` というフォールバックは Vectorize の初期設定での挙動に過ぎない -- バインディングに `remote` フラグが設定されていない場合にのみ当てはまる。同じバインディングに `remote: true` を追加すると、`ai: { remote: true }` が常に取る認証済みリモートプロキシと同じ経路にオプトインすることになる：`wrangler dev` はバインディングを `env` から欠落させたままにする代わりに、実際のインデックスに接続する。その代償として `CLOUDFLARE_API_TOKEN` が必要になり、ローカル dev から実際の Vectorize サービスに触れることになる。
 
-バインディングとは別の話として：Workers の Cache API（`caches.default`）はローカルシミュレーションがゼロで、それを有効にするフラグも存在しない。コードが `caches.default.put()` / `.match()` で何をしようと、`wrangler dev` のレスポンスに `Cf-Cache-Status` が現れることはない。キャッシュの挙動は、実際の `*.workers.dev` URL にデプロイした後でしか検証できない。
+## Cache API はローカルでエミュレートされるが、Workers Cache はされない
+
+Cloudflare Workers には無関係な 2 つのキャッシュ機構があり、そのうち `wrangler dev` に存在するのは片方だけだ。
+
+プログラマティックな Cache API（`caches.default.put()` / `.match()`、`caches.open()`）はデフォルトでローカルにシミュレートされる -- `wrangler dev` はこれを Miniflare が管理するキャッシュで裏付けており、`.wrangler/state/v3/cache` 配下に永続化され、フラグは一切不要だ。`await caches.default.match(request)` を実行してその戻り値を返すコードは、本番で見るのと同じ `CF-Cache-Status: HIT` / `MISS` ヘッダーをローカルでも目にする。
+
+:::warning[デプロイ済み Worker で検証するなら `*.workers.dev` は避ける]
+本番では、Cache API はカスタムドメインに紐づいた Worker でしか動かない -- Pages Functions は `*.pages.dev` でも同等の扱いを受けるが、素の `*.workers.dev` サブドメインにデプロイしたただの Worker では `cache` 操作が一切機能しない。ローカル dev の挙動を workers.dev の URL と比較すると、コードが正しくても「キャッシュが壊れている」ように見えてしまう。代わりにカスタムドメインで検証すること。
+:::
+
+宣言的な Workers Cache -- `wrangler.jsonc` の `cache` ブロック（`{ "cache": { "enabled": true } }`）で、`Cache-Control` ヘッダーに駆動され `ctx.cache.purge()` でパージされるもの -- はまったく別の仕組みだ：Worker 全体の手前に立つエッジレベルのキャッシュで、デプロイされた Worker バージョンに紐づいている。ローカルシミュレーションはゼロだ。Worker が何を返そうと、この面での `Cf-Cache-Status` は `wrangler dev` のレスポンスに一切現れない -- `wrangler deploy` の後にしか現れない。Cache API と違い、こちらはゾーンレスで、デプロイさえすれば `*.workers.dev` でも問題なく動く。ただローカルへの経路が単純に存在しないだけだ。
 
 ## 設計上の帰結: クレデンシャル不要な e2e 用の別設定
 
@@ -57,8 +69,9 @@ env.AI                  AI                remote
 
 ```jsonc
 // wrangler.e2e.jsonc -- credential-free config for CI e2e.
-// Same bindings as production, minus `ai` and `vectorize` -- both force a
-// remote proxy session that needs CLOUDFLARE_API_TOKEN, which CI doesn't have.
+// ai always forces a remote proxy session and needs CLOUDFLARE_API_TOKEN.
+// vectorize only does that if it's configured with `remote: true` -- omit
+// both here so this config never needs a token to boot.
 {
   "name": "my-worker-e2e",
   "main": "src/index.ts",
@@ -79,11 +92,13 @@ CI の `wrangler dev --config wrangler.e2e.jsonc` を、本物の dev / 本番�
 
 ## 罠: `secrets.required` バインディングはブロックの宣言が必要
 
-`secrets.required` のリストは単なるドキュメントではない -- `.dev.vars` / `.env` から `env` に実際にロードするキーを `wrangler dev` に伝えるものだ。シェルや CI で環境変数を設定していても、設定ファイルから `secrets` ブロックを省いていれば、wrangler はそれを一切バインドしない。症状は静かだ：認証ゲートはトークンを期待する場所で `undefined` を読み、「無効」として解決し、`GET /` は `401` ではなく `200` を返す。その設定に対して書かれたテストはパスする -- ただし認証ゲートを一切テストしていないだけだ。
+`wrangler dev` は `.dev.vars`（そしてデフォルトで読み込まれる `.env`）の中に見つけたキーを、`secrets` ブロックの有無にかかわらずすべてシークレットとしてバインドする -- そこには宣言は一切要らない。`secrets.required` が実際に変えるのはもっと狭い範囲で、逆に誤解しやすい：ブロックが存在する場合、`required` に名前が挙がったキーだけがバインドされ（`.dev.vars` / `.env` にあるそれ以外のキーは黙って除外される）、しかもブロックが存在する場合に限り、wrangler は `process.env` も読み始める -- つまりシェルでエクスポートされた、あるいは CI から注入された環境変数だけが存在するキーでも、宣言された要件を満たせるようになる。ブロックがなければ、シークレットのために `process.env` が参照されることは一切ない。
+
+これが本当の罠だ：プロセスレベルの環境変数としてしか存在しないシークレット -- シェルでエクスポートされた、あるいは `.dev.vars` の裏付けを持たない生の CI 環境変数として設定されただけのもの -- は、`secrets.required` がそれを名指ししない限り `wrangler dev` からは見えない。症状は静かだ：認証ゲートはトークンを期待する場所で `undefined` を読み、「無効」として解決し、`GET /` は `401` ではなく `200` を返す。その設定に対して書かれたテストはパスする -- ただし認証ゲートを一切テストしていないだけだ。同じシークレットを `.dev.vars` に置いていれば、`secrets` ブロックなしでもバインドされていたはずだ -- この罠は process-env 経由の場合に固有のものだ。
 
 ```jsonc
-// wrangler.jsonc -- without this block, AUTH_TOKEN is never bound locally
-// even if it's present in .dev.vars or the shell environment.
+// wrangler.jsonc -- required so a shell-exported or CI-injected AUTH_TOKEN
+// (no .dev.vars entry) gets read from process.env and bound locally.
 {
   "secrets": {
     "required": ["AUTH_TOKEN"]
@@ -91,11 +106,13 @@ CI の `wrangler dev --config wrangler.e2e.jsonc` を、本物の dev / 本番�
 }
 ```
 
-## 罠: Secure クッキーは Wrangler Dev のデフォルト HTTP を往復できない
+## 罠: Secure クッキーは localhost 以外の HTTP を往復できない
 
-`wrangler dev` はデフォルトで素の `http://` を配信する。Worker がセットした `Secure` クッキーは、その接続上では本物のクッキージャー -- Playwright のものも含め -- によって正しく破棄される。ログイン後のすべてのアサーションが 401 になり、まさに壊れた認証ゲートのように見える。見落としやすいのは、`Cookie:` ヘッダーを手で設定した `curl` はジャーを完全に迂回してしまい問題を隠すからだ -- 本物のジャー（`curl -c/-b`、あるいは実際のブラウザ）だけがこれを再現する。
+モダンなブラウザと `curl` はどちらも `localhost`（および `127.0.0.1` / `[::1]`）を `Secure` クッキー属性にとって信頼できるオリジンとして扱う。そのため `wrangler dev` のデフォルト設定 -- 素の `http://localhost:8787` -- では、Worker がセットした `Secure` クッキーは Playwright のものを含む本物のクッキージャーを問題なく往復する。この罠はそこでは発動しない。
 
-修正はローカル dev を HTTPS で配信し、テストランナーに自己署名証明書を信頼させることだ -- これは、素の HTTP でテストするより本番に近いという副産物もある：
+罠が発動するのは、対象が文字どおりの `localhost` でなくなった瞬間だ：LAN の IP アドレス、`/etc/hosts` で `127.0.0.1` に向けたカスタムの dev ホスト名、CI 上のコンテナのホスト名、その他ブラウザの固定されたループバック許可リストの外にあるものすべて。それらはどれも localhost の例外を受けられないため、本物のクッキージャーは素の HTTP 上で `Secure` クッキーを正しく破棄し、ログイン後のすべてのアサーションが 401 になり、まさに壊れた認証ゲートのように見える。見落としやすいのは、`Cookie:` ヘッダーを手で設定した `curl` はジャーを完全に迂回してしまい問題を隠すからだ -- 本物のジャー（`curl -c/-b`、あるいは実際のブラウザ）だけがこれを再現する。
+
+こうした localhost 以外の構成のために -- そして `localhost` ですでに動いている場合でも本番との整合性のために -- ローカル dev を HTTPS で配信し、テストランナーに自己署名証明書を信頼させる：
 
 ```bash
 wrangler dev --local-protocol https
@@ -140,8 +157,10 @@ function killGroup(signal) {
 
 child.on("exit", (code) => {
   killGroup("SIGTERM");
-  setTimeout(() => killGroup("SIGKILL"), 2000);
-  process.exit(code ?? 1);
+  setTimeout(() => {
+    killGroup("SIGKILL");
+    process.exit(code ?? 1);
+  }, 2000);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
