@@ -129,12 +129,69 @@ _worker.js.map
 
 Without this, `dist/_worker.js` would be publicly fetchable as a static asset. Build/deploy tooling often generates `.assetsignore` into `dist/` at deploy time rather than committing it, since its contents depend on the adapter's output filenames.
 
+## An SSR Index Plus a 404 Page Breaks the Homepage for Browsers Only
+
+`not_found_handling` is applied **only to navigation requests** -- ones carrying `sec-fetch-mode: navigate`, which every browser sends when a person opens a URL and which `curl` never sends. Non-navigation requests that match no asset fall through to the Worker instead.
+
+That distinction is invisible until three ordinary choices line up:
+
+1. The index route is server-rendered (`prerender = false`), so the build emits **no `dist/index.html`**.
+2. `not_found_handling = "404-page"`.
+3. The project has a 404 page, so `dist/404.html` **exists** for the asset layer to serve.
+
+Now a browser hitting `/` matches no asset, gets answered from `not_found_handling`, and receives the 404 page -- **the Worker never runs**. The same URL under `curl` falls through to the Worker and renders perfectly:
+
+```
+curl bare                            -> 200  <title>My Site</title>
+curl -H 'sec-fetch-mode: navigate'   -> 404  <title>Not found</title>
+headless browser                     -> 404
+```
+
+The site is broken for every human visitor and green in every HTTP-level check.
+
+:::danger[Removing the 404 page "fixes" it by accident -- do not rely on that]
+A sibling project with the *same* SSR-index config worked only because it had no 404 page: with no `dist/404.html` to serve, requests fell through to the Worker. It was one added file away from the same outage. If your SSR-index app currently works, confirm *why* before assuming it is safe.
+:::
+
+The fix is to run the Worker first for the routes it owns. Newer wrangler accepts a pattern list, so static assets keep being served directly:
+
+```toml
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "404-page"
+# `/` is server-rendered and has no static file; the API routes are the
+# Worker's too. Everything else (e.g. /assets/*) still bypasses the Worker.
+run_worker_first = ["/", "/api/*"]
+```
+
+`run_worker_first = true` also works and is simpler, at the cost of invoking the Worker for every asset request.
+
+Verify with a request that actually carries the header -- `wrangler dev` reproduces this faithfully:
+
+```bash
+curl -H 'sec-fetch-mode: navigate' http://127.0.0.1:8787/        # expect 200
+curl -H 'sec-fetch-mode: navigate' http://127.0.0.1:8787/nope    # expect the real 404
+curl http://127.0.0.1:8787/assets/styles-abc123.css              # still served directly
+```
+
+:::warning[`fetch()` cannot send this header, so a Node smoke test cannot catch it]
+`Sec-` prefixed names are **forbidden header names** in the Fetch spec, so undici -- and therefore Node's global `fetch()` -- drops them silently. The request goes out as an ordinary one and gets the falling-through 200:
+
+```
+node fetch + sec-fetch-mode  -> 200   (header dropped)
+curl       + sec-fetch-mode  -> 404   (header sent)
+```
+
+A fetch-based post-deploy check therefore exercises a request shape no user ever produces, and stays green through this exact bug. Use `node:https` (or `undici.request`, or a real browser), which write headers verbatim.
+:::
+
 ## Summary
 
 | Field | Default | Set it when |
 |---|---|---|
 | `binding` | -- | Always; your adapter reads `env.ASSETS` |
 | `not_found_handling` | `"none"` | SSG -> `"404-page"`; SPA -> `"single-page-application"` |
-| `run_worker_first` | `false` | The Worker must gate/authorize **every** request -> `true` |
+| `run_worker_first` | `false` | The Worker must gate/authorize **every** request -> `true`; or the index is SSR with a `dist/404.html` present -> `["/", ...]` |
 | `workers_dev` | `true` | Stop serving production on `*.workers.dev` -> `false` |
 | `preview_urls` | matches `workers_dev` | Always set **explicitly** so previews survive `workers_dev = false` |
