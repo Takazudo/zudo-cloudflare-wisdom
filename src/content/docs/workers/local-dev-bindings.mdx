@@ -1,0 +1,173 @@
+---
+title: "Local Dev: Binding Support Matrix"
+description: What wrangler dev actually emulates locally -- the binding matrix, the credential-free e2e config pattern, and two silent traps that make a test pass while testing nothing
+sidebar_position: 8
+---
+
+`wrangler dev` looks like a full local replica of the production Worker, but only some of what a Worker can bind to actually runs locally. The gap between what emulates and what doesn't decides something structural: whether a Worker can boot in CI without a `CLOUDFLARE_API_TOKEN`, and therefore whether real browser e2e tests against it are possible at all without handing Cloudflare credentials to CI.
+
+The notes below come from provisioning a Worker with a full production binding set -- D1, R2, Queues, Vectorize, Workers AI -- and watching `wrangler dev` refuse to boot without cloud credentials, then working out which bindings were actually responsible.
+
+## The Binding Support Matrix
+
+| Binding | Local emulation | Credentials required |
+| --- | --- | --- |
+| D1 | Yes | No |
+| R2 | Yes | No |
+| KV | Yes | No |
+| Queues (producer + consumer) | Yes | No |
+| Rate Limiting | Yes | No |
+| Assets | Yes | No |
+| Plain vars | Yes | No |
+| Secrets | Yes | No |
+| AI (`remote: true`) | No -- proxies to the real API | Yes -- and its absence fails the *entire* dev server boot |
+| Vectorize | No -- prints `not supported`, no emulation | N/A -- binding is simply absent from `env` |
+| Cache API (not a binding) | No -- zero local simulation, no flag | N/A -- only observable after deploy to `*.workers.dev` |
+
+Everything in the top block -- D1, R2, KV, Queues, Rate Limiting, Assets, plain vars, secrets -- emulates locally and needs nothing from Cloudflare's cloud. The bottom two rows are the exception, and they fail in different ways.
+
+:::warning[`ai: { remote: true }` takes down the whole dev server, not just the AI binding]
+The `ai` binding's `remote: true` mode forces a remote proxy session on boot. Without `CLOUDFLARE_API_TOKEN` set, that proxy session fails to establish -- and `wrangler dev` refuses to start at all, even for requests that never touch `env.AI`.
+:::
+
+## A Failed Boot, Generalized
+
+Booting `wrangler dev` against a config with the full production binding set, with `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` unset, fails outright:
+
+```
+env.VECTOR_INDEX (…)   Vectorize Index   not supported
+env.AI                  AI                remote
+⎔ Establishing remote connection...
+✘ [ERROR] Failed to start the remote proxy session … it's necessary to set a
+  CLOUDFLARE_API_TOKEN environment variable for wrangler to work.
+```
+
+Two separate problems are stacked in that one boot:
+
+- `env.VECTOR_INDEX` (Vectorize) prints `not supported` and moves on -- the boot itself doesn't fail here, but the binding is absent from `env`, so any code path that touches it throws at request time.
+- `env.AI` prints `remote`, which is `wrangler`'s way of saying it's about to open a remote proxy session. That session needs `CLOUDFLARE_API_TOKEN`, doesn't find it, and the *whole process* exits with the error above -- not just the AI-dependent routes.
+
+## Workers Cache API Has No Local Presence
+
+Separate from bindings: the Workers Cache API (`caches.default`) has zero local simulation, and there is no flag to turn one on. `Cf-Cache-Status` never appears on a `wrangler dev` response no matter what the code does with `caches.default.put()` / `.match()`. Caching behavior is only verifiable after deploying to a real `*.workers.dev` URL.
+
+## Design Consequence: A Separate Config for Credential-Free E2E
+
+Because `ai: { remote: true }` fails the whole boot, a credential-free local Worker cannot reuse the dev config as-is -- it needs a **separate wrangler config** that omits `ai` and `vectorize` entirely. Every other binding in that file still emulates locally, so the Worker boots credential-free in roughly 25 seconds. With that boot working, real e2e becomes possible in CI without any Cloudflare secrets: the auth gate, same-origin enforcement, and a real multipart upload landing in R2 + D1 are all exercisable end to end.
+
+```jsonc
+// wrangler.e2e.jsonc -- credential-free config for CI e2e.
+// Same bindings as production, minus `ai` and `vectorize` -- both force a
+// remote proxy session that needs CLOUDFLARE_API_TOKEN, which CI doesn't have.
+{
+  "name": "my-worker-e2e",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-01-01",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "my-app-db",
+      "database_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    }
+  ],
+  "r2_buckets": [{ "binding": "UPLOADS", "bucket_name": "my-app-uploads" }]
+  // no "ai", no "vectorize" -- everything else here still emulates locally
+}
+```
+
+Point CI's `wrangler dev --config wrangler.e2e.jsonc` at this file instead of the real dev/production config, and the dev server never attempts the remote proxy session that requires a token.
+
+## Trap: `secrets.required` Bindings Need the Block Declared
+
+A `secrets.required` list is not just documentation -- it's what tells `wrangler dev` which keys to actually load from `.dev.vars` / `.env` into `env`. Setting the environment variable in your shell or CI while leaving the `secrets` block out of the config means wrangler never binds it. The symptom is silent: an auth gate reads `undefined` where it expects a token, resolves to "inert", and `GET /` returns `200` instead of `401`. A test written against that config passes -- it just isn't testing the auth gate at all.
+
+```jsonc
+// wrangler.jsonc -- without this block, AUTH_TOKEN is never bound locally
+// even if it's present in .dev.vars or the shell environment.
+{
+  "secrets": {
+    "required": ["AUTH_TOKEN"]
+  }
+}
+```
+
+## Trap: Secure Cookies Don't Round-Trip Over Wrangler Dev's Default HTTP
+
+`wrangler dev` serves plain `http://` by default. A `Secure` cookie set by the Worker is, correctly, dropped by any real cookie jar over that connection -- Playwright's included. Every assertion after login then 401s, and it reads exactly like a broken auth gate. It's easy to miss because `curl` with a hand-set `Cookie:` header bypasses the jar entirely and hides the problem; only a real jar (`curl -c/-b`, or an actual browser) reproduces it.
+
+The fix is to serve local dev over HTTPS and tell the test runner to trust the self-signed cert -- which also matches production more closely than testing over plain HTTP ever did:
+
+```bash
+wrangler dev --local-protocol https
+```
+
+```ts
+// playwright.config.ts
+export default defineConfig({
+  use: {
+    ignoreHTTPSErrors: true,
+  },
+});
+```
+
+## Local Testing Pitfalls: The workerd Orphan Leak
+
+Miniflare-backed test suites -- `vitest-pool-workers`, or Miniflare instantiated per test file -- spawn real `workerd` child processes. If the test runner dies abnormally (`SIGABRT`, an OOM kill), those children are never reaped. Left running across enough test invocations, this leaks hundreds of orphaned `workerd` processes and can exhaust the process table or file descriptor limits for the *entire host*, not just the test run.
+
+### The Normal Fix: Group-Scoped Cleanup
+
+Wrap the test command in a script that spawns it in its own process group, and on exit -- by any path, success, failure, or signal -- signals the whole group rather than the single child:
+
+```js
+// run-tests.js -- spawns the suite in its own process group so an abnormal
+// exit still leaves a group id to clean up by. detached: true + a negative
+// pid signal target is a POSIX recipe -- there's no portable Node equivalent
+// on Windows.
+import { spawn } from "node:child_process";
+
+const child = spawn("vitest", ["run"], {
+  detached: true,
+  stdio: "inherit",
+});
+
+function killGroup(signal) {
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
+    // group is already gone
+  }
+}
+
+child.on("exit", (code) => {
+  killGroup("SIGTERM");
+  setTimeout(() => killGroup("SIGKILL"), 2000);
+  process.exit(code ?? 1);
+});
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => killGroup(signal));
+}
+```
+
+Reap by process group, never by matching the process name -- a name match on a shared CI host can kill `workerd` processes that belong to someone else's job.
+
+:::danger[`pkill -9 -f workerd` is emergency recovery only]
+It kills every `workerd` process on the host, including unrelated dev servers and other people's test runs on a shared machine. Reach for it only to unstick a host that's already exhausted its process table -- never as the routine cleanup step.
+:::
+
+### Cap Parallelism, and Watch for EMFILE
+
+Vitest 4 replaced `poolOptions.forks.maxForks` with a top-level `maxWorkers` -- the old option silently no-ops instead of erroring, so a config still setting it isn't actually capping anything:
+
+```ts
+// vitest.config.ts (vitest 4+)
+export default defineConfig({
+  test: {
+    maxWorkers: 4, // poolOptions.forks.maxForks is a no-op on vitest 4+
+  },
+});
+```
+
+A suite that hangs at roughly 0% CPU instead of failing outright is the symptom of `EMFILE` / file-descriptor exhaustion, not a stuck test -- raise the shell's `ulimit -n` before assuming the code is at fault.
+
+Related pages: [Wrangler Config](./wrangler-config.mdx) for binding syntax, and [SSR Bindings via AsyncLocalStorage](../recipes/ssr-bindings-adapter.mdx) for exercising bound code without a live `wrangler dev` process at all.
