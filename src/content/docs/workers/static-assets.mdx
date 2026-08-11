@@ -186,12 +186,118 @@ curl       + sec-fetch-mode  -> 404   (header sent)
 A fetch-based post-deploy check therefore exercises a request shape no user ever produces, and stays green through this exact bug. Use `node:https` (or `undici.request`, or a real browser), which write headers verbatim.
 :::
 
+## Routing Traps
+
+The gating trap and the SSR-index outage above share one root cause: the asset layer's routing decision -- serve the file, or hand off to the Worker -- happens before your Worker code runs, and where that boundary sits depends on the request itself and on your Wrangler version. A few more traps fall out of the same mechanism.
+
+### Browser Navigation Can Bypass a Gate That `curl` Passes
+
+If a Worker script (`main`) is configured, `not_found_handling` is set, and the compatibility date is `2025-04-01` or later (or the `assets_navigation_prefers_asset_serving` compatibility flag is set), a **navigation request that matches no static asset is answered directly by `not_found_handling` and never reaches the Worker** -- regardless of `run_worker_first`'s default `false`. Non-navigation requests (no `Sec-Fetch-Mode: navigate` header -- `curl`, most server-to-server calls) still fall through to the Worker as before.
+
+If you were counting on "no asset matched -> falls through to the Worker" as an implicit backstop -- a catch-all authorization check on any path that isn't a known public file, say -- that backstop silently stops running for real browser traffic the moment the project sits on a current compatibility date. A `curl` check of the "protected" path still reaches the Worker and reports success; every actual browser visitor gets the `not_found_handling` response instead, with no gate at all.
+
+:::danger[curl passes, every browser bypasses -- this is a security gate silently left open]
+A manual `curl` check proves nothing about what a browser gets once your compatibility date crosses `2025-04-01`. Verify with a request that carries `Sec-Fetch-Mode: navigate` (see the SSR-index verification commands above), or remove the ambiguity entirely: set `run_worker_first = true` so the Worker runs regardless of request shape.
+:::
+
+### The Complete Gating Fix Pairs `run_worker_first = true` With a Worker That Serves Assets Itself
+
+`run_worker_first = true` only changes **routing** -- it makes every request reach the Worker first. It does not gate anything by itself, and it does not serve assets by itself. The Worker has to check authorization and then serve the matching asset itself via the binding:
+
+```typescript
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const authorized = await checkAuth(request, env);
+    if (!authorized) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    // Gate passed -- now serve the matching static asset ourselves.
+    return env.ASSETS.fetch(request);
+  },
+};
+```
+
+Flip the flag without adding this and the fix is incomplete: the Worker now runs for every request, but unless it explicitly authorizes and then calls `env.ASSETS.fetch()`, it has no way to actually return the site's static files. The fix is the pair -- `run_worker_first = true` **and** an authenticated `env.ASSETS.fetch(request)` call -- not the flag alone.
+
+### Array-Form `run_worker_first` Is a Cost Optimization, Not a Gate
+
+Wrangler >= 4.20.0 accepts an array of route patterns for `run_worker_first` instead of a boolean:
+
+```toml
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+# Only these paths invoke the Worker first; every path NOT listed here --
+# including paths you haven't thought of yet -- serves straight from the
+# asset layer with no Worker involvement at all.
+run_worker_first = ["/oauth/callback", "/api/*"]
+```
+
+This exists to cut billable Worker invocations for client-heavy SPAs -- most navigations serve `index.html` straight from the edge with zero Worker cost -- and it can double as a gate too, but only for a **bounded subtree** where everything outside the list is deliberately public. `run_worker_first = ["/admin/*"]` on a site where `/admin/*` is the only thing that needs auth and everything else is meant to be public is a legitimate security gate: it protects the admin subtree and avoids invoking the Worker for the public assets that don't need it.
+
+Where the array form goes wrong is a **catch-all or default-deny** requirement -- "authorize every request" or "nothing is public unless explicitly listed." There, every path outside the array has no gate whatsoever, and there is no implicit deny for paths you didn't think to list; a route added later ships ungated by default. Use `run_worker_first = true` (or gate inside the Worker itself, as above) when the requirement is default-deny. Reserve the array form for a known, bounded subtree -- whether that's for cost optimization, or as a gate over a specific set of routes with everything else intentionally public.
+
+### `not_found_handling = "single-page-application"` Always Serves the Root `index.html`
+
+For any unmatched path, the SPA fallback serves the contents of the **top-level** `dist/index.html` with a `200 OK` -- no matter how deep the path is. There is no per-directory fallback.
+
+```toml
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+# Every unmatched path -- /app-a/settings, /app-b/reports, /anything --
+# gets the SAME top-level dist/index.html. There is no per-directory variant.
+not_found_handling = "single-page-application"
+```
+
+The trap surfaces on multi-zone builds: if `dist/app-a/index.html` and `dist/app-b/index.html` ship as separate SPA shells, each expected to own its own subtree, the fallback ignores that structure entirely. A request to `/app-a/settings` that matches no real file gets the root `dist/index.html`, not `dist/app-a/index.html` -- unless the root shell's own router is what's supposed to own `/app-a/*` in the first place.
+
+### `run_worker_first` and `_redirects` See the Request Before `auto-trailing-slash` Rewrites It
+
+The default `html_handling = "auto-trailing-slash"` serves `foo/index.html` **with** a trailing slash, and redirects a bare `/foo` request to `/foo/`:
+
+```
+GET /foo   -> 307 Location: /foo/
+GET /foo/  -> 200 (serves dist/foo/index.html)
+```
+
+That redirect is the asset layer's own behavior, and it only fires once a request has already been routed there. `run_worker_first` pattern matching happens upstream of it, against the pathname as originally requested -- so a pattern written against the bare form (`/admin`, no trailing slash) does see a request for `/admin`; it isn't skipped. The same is true of `_redirects` rules, which also evaluate before `html_handling`.
+
+What the bare form alone misses is everything past it: the canonical `/admin/` destination the browser lands on after the redirect, and anything nested under it, like `/admin/settings`. A `/admin/*` entry doesn't cover the bare `/admin` request either -- the glob requires the literal `/` that follows. Cover both explicitly when the whole subtree needs the Worker:
+
+```toml
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+# "/admin" matches the request as originally made, before auto-trailing-slash
+# would redirect it. "/admin/*" covers the "/admin/" destination and every
+# path nested under it. Neither pattern covers the other -- list both.
+run_worker_first = ["/admin", "/admin/*"]
+```
+
+### `env.ASSETS.fetch()` Matches by Pathname Only
+
+`env.ASSETS.fetch(request)` -- the call the gate above uses to serve an asset after authorizing the request -- matches **only the URL pathname**. Query strings play no part in asset matching:
+
+```typescript
+// Both requests resolve to the SAME asset -- the query string is ignored
+// for matching purposes, even though it's still visible to your Worker code.
+await env.ASSETS.fetch(new Request("https://example.com/report.pdf"));
+await env.ASSETS.fetch(new Request("https://example.com/report.pdf?v=2"));
+```
+
+Do not rely on a query string to select between asset variants through the binding -- it always resolves to the same file. Versioning for hashed bundles belongs in the filename itself; see [Browser Caching for Hashed Assets](./static-assets-caching.mdx) for the `_headers` pattern that pairs with content-hashed filenames.
+
 ## Summary
 
 | Field | Default | Set it when |
 |---|---|---|
 | `binding` | -- | Worker (or its adapter) actually calls `env.ASSETS.fetch()` -> set it; Worker has `main` but only relies on asset-first routing and never touches `env.ASSETS` -> omit it; assets-only Worker (no `main`) -> omit it, wrangler hard-errors if it's set |
 | `not_found_handling` | `"none"` | SSG -> `"404-page"`; SPA -> `"single-page-application"` |
-| `run_worker_first` | `false` | The Worker must gate/authorize **every** request -> `true`; or the index is SSR with a `dist/404.html` present -> `["/", ...]` |
+| `run_worker_first` | `false` | The Worker must gate/authorize **every** request (default-deny) -> `true`; a subset of routes needs Worker-first for cost reasons, or as a gate over a bounded subtree with everything else intentionally public -> an array of patterns; or the index is SSR with a `dist/404.html` present -> `["/", ...]` |
+| `html_handling` | `"auto-trailing-slash"` | Gating a directory subtree with `run_worker_first` -> list both the bare form and the `/dir/*` form; each covers requests the other doesn't |
 | `workers_dev` | `true` | Stop serving production on `*.workers.dev` -> `false` |
 | `preview_urls` | matches `workers_dev` | Always set **explicitly** so previews survive `workers_dev = false` |
