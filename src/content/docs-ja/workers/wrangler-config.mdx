@@ -112,6 +112,20 @@ required = ["STRIPE_KEY", "SESSION_SECRET"]
 `--strict-vars`（デフォルト `true`）は `wrangler types` 用のフラグで、`[vars]` に対して生成する TypeScript の型をリテラル/ユニオン型にするか、広い primitive 型にするかを制御する。`[secrets].required` とは何の関係もない。名前が似ているだけで、まったく別の機能を指している。
 :::
 
+:::danger[`[secrets]` も名前付き環境には継承されない]
+`[vars]` やバインディングと同じく、これも Worker レベルの設定であり名前付き環境からは自動的に見えない。`wrangler deploy --env preview` は `[env.preview.secrets]` しか見ない -- そのテーブルがなければ、上で説明した必須シークレットの検証はその環境に対して一切実行されず、シークレット未設定のまま preview のデプロイが黙って成功してしまう。
+
+```toml
+[secrets]
+required = ["STRIPE_KEY", "SESSION_SECRET"]
+
+[env.preview.secrets]
+required = ["STRIPE_KEY", "SESSION_SECRET"]
+```
+
+バインディングと `[vars]` に適用される同じ罠については、[環境の非継承ルール](#名前付き環境とサービスバインディング-最大の落とし穴-バインディングと-vars-は継承されない)を参照。
+:::
+
 ### `wrangler deploy` は `[vars]` を丸ごと置き換える
 
 デフォルトでは、`wrangler deploy` のたびに**Worker 上に現在ある vars をすべて削除し、`wrangler.toml` が宣言するものだけに置き換える。**Cloudflare ダッシュボードから応急処置で var を追加していても、次の設定駆動のデプロイでそれは黙って消える -- マージは行われない。
@@ -224,7 +238,7 @@ id = "placeholder-production-kv-id"
 ```
 
 :::warning[環境ごとにすべて再宣言する -- `[assets]` を除いて]
-バインディングや vars に部分的な継承は存在しない。`[env.preview]` を作るなら、その D1、R2、KV、AI、services、そして `[env.preview.vars]` を自前で列挙しなければならない。バインディングの欠落はデプロイ時にエラーにならず、Worker 内の実行時 `undefined` として表面化する。唯一の例外が `[assets]`（Static Assets）で、以下で扱う。
+バインディング、vars、シークレットに部分的な継承は存在しない。`[env.preview]` を作るなら、その D1、R2、KV、AI、services、`[env.preview.vars]`、そして `[env.preview.secrets]` を自前で列挙しなければならない。バインディングの欠落はデプロイ時にエラーにならず、Worker 内の実行時 `undefined` として表面化する。`[env.preview.secrets]` の欠落は違う壊れ方をする -- [必須シークレットの宣言](#バインディング-必須シークレットの宣言)で説明した検証がその環境では一切実行されず、シークレットが未設定のままデプロイが成功してしまう。唯一の例外が `[assets]`（Static Assets）で、以下で扱う。
 :::
 
 :::info[唯一の例外: `[assets]` は継承される]
@@ -249,7 +263,7 @@ binding = "ASSETS"
 
 <Note>
 
-`workers_dev` や `preview_urls` といったバインディングではない*設定*は、トップレベルから名前付き環境へ継承される。継承されないルールはバインディングと `[vars]` に適用される -- 上で述べた `[assets]` という唯一の例外を除いて。可読性のために環境ごとに明示的に設定することも依然として一般的。
+`workers_dev` や `preview_urls` といったバインディングではない*設定*は、トップレベルから名前付き環境へ継承される。継承されないルールはバインディング、`[vars]`、`[secrets]` に適用される -- 上で述べた `[assets]` という唯一の例外を除いて。可読性のために環境ごとに明示的に設定することも依然として一般的。
 
 </Note>
 

@@ -120,21 +120,22 @@ If a `waitUntil()` promise hasn't settled when the 30-second window closes, it's
 
 Work that needs a stronger guarantee than "best effort within 30 seconds" has to move into its own invocation, decoupled from the request that triggered it:
 
-- **Queues** -- enqueue a message and let a separate consumer Worker do the work, with its own budget and built-in retries.
+- **Queues** -- await `send()` so the message is actually enqueued before responding, then let a separate consumer Worker do the work, with its own budget and built-in retries.
 - **Durable Object alarms** -- schedule the follow-up as a DO alarm, which gets up to 15 minutes of wall-clock time on its own schedule, independent of any request's lifecycle.
 - **Tail Workers** -- for logging and exception-capture work specifically, a Tail Worker runs on the producing Worker's completion even if that Worker's own execution was cut short or threw.
 
 ```ts
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const response = new Response("ok");
+    // Await the enqueue itself -- don't wrap it in waitUntil(). The response
+    // promises the message was queued, but a canceled or late-running
+    // waitUntil() would let "ok" go out with nothing actually sent, and once
+    // the request is gone there's no message left for Queues' own retries to
+    // act on. The retries below cover what the consumer does with the
+    // message, not whether it got enqueued in the first place.
+    await env.WEBHOOK_QUEUE.send({ orderId: request.headers.get("x-order-id") });
 
-    // Needs a stronger guarantee than "best effort in 30s" -- hand it to a
-    // Queue consumer instead, which runs as its own invocation with its own
-    // budget and retries rather than borrowing this one's 30-second window.
-    ctx.waitUntil(env.WEBHOOK_QUEUE.send({ orderId: request.headers.get("x-order-id") }));
-
-    return response;
+    return new Response("ok");
   },
 };
 ```
@@ -289,7 +290,7 @@ Origin restriction for WebSocket has to be enforced explicitly, server-side, bef
 
 ```ts
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (request.headers.get("Upgrade") === "websocket") {
       if (request.headers.get("Origin") !== ALLOWED_ORIGIN) {
         return new Response("Forbidden", { status: 403 });
@@ -299,7 +300,10 @@ export default {
       server.accept();
       return new Response(null, { status: 101, webSocket: client });
     }
-    return withCors(routeHandler)(request, env);
+    // Forward ctx through -- withCors() calls routeHandler(request, env, ctx),
+    // so dropping it here leaves ctx undefined for every ordinary HTTP route
+    // and ctx.waitUntil() throws the moment routeHandler tries to use it.
+    return withCors(routeHandler)(request, env, ctx);
   },
 };
 ```

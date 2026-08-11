@@ -112,6 +112,20 @@ This does not set values -- it is a checklist wrangler enforces at dev and deplo
 `--strict-vars` (default `true`) is a flag for `wrangler types` -- it controls whether generated TypeScript types for `[vars]` are literal/union types or widened primitives. It has nothing to do with `[secrets].required`; the similar-sounding names describe two unrelated features.
 :::
 
+:::danger[`[secrets]` does not inherit into named environments either]
+Like `[vars]` and bindings, this is Worker-level config that named environments don't see automatically. `wrangler deploy --env preview` checks only `[env.preview.secrets]` -- without that table, the required-secret validation above never runs for that environment, and a preview deploy with the secret unset succeeds silently.
+
+```toml
+[secrets]
+required = ["STRIPE_KEY", "SESSION_SECRET"]
+
+[env.preview.secrets]
+required = ["STRIPE_KEY", "SESSION_SECRET"]
+```
+
+See [the environments non-inheritance rule](#named-environments-service-bindings-the-1-silent-bug-bindings-and-vars-are-not-inherited) for the same trap applied to bindings and `[vars]`.
+:::
+
 ### `wrangler deploy` Replaces `[vars]` Wholesale
 
 By default, every `wrangler deploy` **deletes all vars currently live on the Worker and replaces them with exactly what `wrangler.toml` declares.** If a var was added through the Cloudflare dashboard for a quick fix, the next config-driven deploy silently removes it -- there is no merge.
@@ -228,7 +242,7 @@ id = "placeholder-production-kv-id"
 ```
 
 :::warning[Re-declare everything per environment -- except `[assets]`]
-There is no partial inheritance for bindings or vars. If `[env.preview]` exists, it must list its own D1, R2, KV, AI, services, and `[env.preview.vars]`. A missing binding does not error at deploy — it surfaces as a runtime `undefined` inside the Worker. The one exception is `[assets]` (Static Assets), covered below.
+There is no partial inheritance for bindings, vars, or secrets. If `[env.preview]` exists, it must list its own D1, R2, KV, AI, services, `[env.preview.vars]`, and `[env.preview.secrets]`. A missing binding does not error at deploy — it surfaces as a runtime `undefined` inside the Worker. A missing `[env.preview.secrets]` fails differently: the required-secret check from [Declaring Required Secrets](#bindings-declaring-required-secrets) simply doesn't run for that environment, so the deploy succeeds even with the secret unset. The one exception is `[assets]` (Static Assets), covered below.
 :::
 
 :::info[The one exception: `[assets]` IS inherited]
@@ -253,7 +267,7 @@ The inheritance is all-or-nothing per environment: the moment `[env.preview.asse
 
 <Note>
 
-Non-binding *settings* such as `workers_dev` and `preview_urls` DO inherit from the top level into named environments. The non-inheritance rule applies to bindings and `[vars]` -- with the single exception of `[assets]` noted above. Setting things explicitly per environment is still common for legibility.
+Non-binding *settings* such as `workers_dev` and `preview_urls` DO inherit from the top level into named environments. The non-inheritance rule applies to bindings, `[vars]`, and `[secrets]` -- with the single exception of `[assets]` noted above. Setting things explicitly per environment is still common for legibility.
 
 </Note>
 

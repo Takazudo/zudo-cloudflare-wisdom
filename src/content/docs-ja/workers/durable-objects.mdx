@@ -233,8 +233,8 @@ WebSocket のクローズは通知される。ランタイムは、Hibernation �
 ```typescript
 const HEARTBEAT_INTERVAL_MS = 25_000;
 
-private scheduleHeartbeat(): void {
-  this.state.storage.setAlarm(Date.now() + HEARTBEAT_INTERVAL_MS);
+private async scheduleHeartbeat(): Promise<void> {
+  await this.state.storage.setAlarm(Date.now() + HEARTBEAT_INTERVAL_MS);
 }
 
 // The alarm handler doubles as the heartbeat sweep.
@@ -243,7 +243,7 @@ async alarm(): Promise<void> {
     await this.write(id, conn, `: heartbeat\n\n`);
   }
   if (this.connections.size > 0) {
-    this.scheduleHeartbeat();
+    await this.scheduleHeartbeat();
   }
 }
 ```
@@ -255,6 +255,13 @@ async alarm(): Promise<void> {
 `webSocketClose` が同じ切断をいずれ独立に報告してくれるからだ。SSE の接続にはその
 バックストップがなく、失敗したハートビートの書き込みだけが唯一のクリーンアップの
 発生源になる。
+
+`scheduleHeartbeat()` は `async` にして、すべての呼び出し箇所で await しなければ
+ならない。`setAlarm()` が失敗しても誰もそれを await していなければ、`alarm()` は
+そのまま成功として解決してしまう — ランタイムからはスローではなく正常終了に見える
+ため、自動的なアラームの再試行が働かない。保留中のアラームも再試行もない状態になり、
+ハートビートは静かに止まり、この節でちょうど確立したはずの唯一の切断検知手段が
+無効化されてしまう。
 
 ### 接続ごとに書き込みを直列化する
 
@@ -269,25 +276,35 @@ catch とが、同じ `Map` のエントリを取り合ってしまう。代わ�
 interface Connection {
   controller: ReadableStreamDefaultController<Uint8Array>;
   writeQueue: Promise<void>;
+  closed: boolean;
 }
 
 private write(id: string, conn: Connection, chunk: string): Promise<void> {
   conn.writeQueue = conn.writeQueue
     .then(() => {
+      if (conn.closed) return;
       conn.controller.enqueue(this.encoder.encode(chunk));
     })
     .catch(() => {
-      // First failed write on this connection — treat it as dead.
-      this.connections.delete(id);
+      // First failed write on this connection — mark it closed so every
+      // write already queued behind this one no-ops instead of retrying
+      // against the dead controller.
+      conn.closed = true;
+      // Only remove this exact connection object — a reconnect that took
+      // the same id after this one failed must not be deleted.
+      if (this.connections.get(id) === conn) {
+        this.connections.delete(id);
+      }
     });
   return conn.writeQueue;
 }
 ```
 
 `broadcast()`、ハートビートの掃引、個別の `send()` といったすべての呼び出し元は、
-同じこの `write()` と同じキューを通る。最初に失敗した書き込みが接続を削除し、
-キュー自身の `.catch` は、その後ろに並んでいたすでにキュー済みの書き込みを、
-二度目のスローではなく no-op に変える。
+同じこの `write()` と同じキューを通る。最初に失敗した書き込みが `closed` を立てて
+接続を削除する。その後ろにすでにキュー済みだった書き込みは、自分の番が来たときに
+`closed` を見て、死んだコントローラーに対して再試行しクリーンアップを再発生させる
+代わりに no-op になる。
 
 ## Alarms によるセルフスケジュール TTL スイープ
 
