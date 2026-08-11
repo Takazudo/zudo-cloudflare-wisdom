@@ -8,7 +8,7 @@ Cloudflare Workers looks like ordinary JavaScript running on a server, but `work
 
 ## Self-Fetch and Service Bindings: the Hostname Is Inert
 
-A Worker calling itself or another Worker through a [service binding](./wrangler-config.mdx#service-bindings-one-worker-calling-another) still has to pass `fetch()` a syntactically valid absolute URL -- but Cloudflare does not use that URL's hostname for routing. Only the method, path, headers, and body reach the bound Worker; the binding itself decides which Worker receives the call, the same way `env.SELF.fetch(...)` never touches DNS or a public route.
+A Worker calling itself or another Worker through a [service binding](./wrangler-config.mdx#named-environments-service-bindings-service-bindings-one-worker-calling-another) still has to pass `fetch()` a syntactically valid absolute URL -- but Cloudflare does not use that URL's hostname for routing. Only the method, path, headers, and body reach the bound Worker; the binding itself decides which Worker receives the call, the same way `env.SELF.fetch(...)` never touches DNS or a public route.
 
 ```jsonc
 // wrangler.jsonc -- binds this Worker to itself under SELF
