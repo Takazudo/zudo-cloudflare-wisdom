@@ -221,3 +221,168 @@ Splitting build and deploy into separate jobs is recommended because:
 1. **Artifact inspection**: You can download and inspect the build output if needed
 2. **Retry deploys**: If the deploy fails (network issue), you can re-run just the deploy job
 3. **Test between build and deploy**: Insert test jobs (e2e, lighthouse) between build and deploy
+
+## Post-deploy Smoke Tests
+
+A deploy that completes without error and a site that's actually serving the new build are two different things. Cloudflare can return `200 OK` from a parked page, a stale `*.pages.dev` deployment still sitting behind an old route, or a domain that hasn't finished propagating yet — none of which the `deploy` job can see. A smoke-test job right after `deploy` closes that gap by checking the live production URL for the actual content of this build, not just its status code.
+
+### DNS-first: Decide Skip vs. Fail Before Touching HTTP
+
+The first question a smoke test needs to answer isn't "did the site respond correctly?" but "is there even a site to ask yet?" A brand-new custom domain can take anywhere from minutes to hours to propagate, and hitting it with `fetch()` during that window throws — but so does a genuinely broken TLS cert, a genuinely wrong hostname, or a real DNS outage. Trying to tell those apart by inspecting `fetch()`'s error shape (`TypeError: fetch failed`, an `ENOTFOUND` or `ECONNREFUSED` buried in a `cause` chain that varies between Node versions) means guessing at implementation details that were never a contract.
+
+`node:dns/promises` answers the actual question directly: does this hostname have an A or AAAA record at all?
+
+```js
+import { resolve4, resolve6 } from "node:dns/promises";
+
+async function hasDnsRecord(hostname) {
+  const results = await Promise.allSettled([resolve4(hostname), resolve6(hostname)]);
+  return results.some((r) => r.status === "fulfilled" && r.value.length > 0);
+}
+```
+
+No record yet means the domain hasn't propagated — that's a **skip**, not a failure. A record that resolves but everything downstream is wrong is a different problem, checked next.
+
+### Content Markers Beat Bare 200
+
+A `200 OK` on its own proves nothing about *which* site answered. Two situations return it just as happily as a correct deploy:
+
+- A domain still routed to Cloudflare's parked-page product answers `200` with placeholder content.
+- A custom domain still pointed at last week's Cloudflare Pages deployment answers `200` with a perfectly valid — and perfectly stale — site.
+
+Checking the status code alone passes both. The fix is to bake a literal marker into the actual build output — the deploy commit SHA in a footer comment or meta tag — and check the response body for that exact string, not for a hardcoded value that assumes the build worked:
+
+```js
+const marker = process.env.SMOKE_CONTENT_MARKER; // baked into the page at build time, e.g. the commit SHA
+const body = await res.text();
+if (!body.includes(marker)) {
+  throw new Error(`response is missing content marker "${marker}"`);
+}
+```
+
+:::warning[The Marker Has to Come From the Real Build, Not a Guess]
+Don't hardcode an expected string in the smoke-test script and hope the build matches it. Read the literal marker out of the actual HTML the build produces (or pass in the same value — e.g. `github.sha` — that the build step embedded), so the check verifies this specific build's output, not a string that happened to work once.
+:::
+
+### Don't Follow Redirects
+
+A stale custom domain doesn't always serve old content directly — sometimes it 301s to the `*.pages.dev` URL of whichever deployment currently owns the route. `fetch()` follows redirects by default, so a naive check lands on the *destination* page, reads its marker, and passes, even though the domain itself is misrouted. Pass `redirect: "manual"` and inspect the response Node actually got back from the URL under test, before anything follows the pointer elsewhere:
+
+```js
+const res = await fetch(target, { redirect: "manual" });
+if (res.status >= 300 && res.status < 400) {
+  throw new Error(`unexpected redirect (${res.status}) — check that ${target.hostname} isn't still pointed at a stale deployment`);
+}
+```
+
+### `SMOKE_REQUIRE_LIVE`: Tolerant on Day One, Strict Once Established
+
+A brand-new site's first deploy can legitimately fail every check above — DNS hasn't propagated, there's no content to match yet — and none of that means the deploy is broken. An established site failing the exact same checks means something regressed. One smoke test needs both behaviors, at different points in its life:
+
+- Unset / `false`: any failure (no DNS record, wrong status, redirect, missing marker) logs a warning and exits `0` — treated as "not live yet," not as a broken deploy.
+- `true`: the same failures exit `1` and fail the workflow.
+
+Leave it unset while a domain is new, then flip it to `true` in the repo's variables once the site is confirmed live — from that point on, the smoke test should never look away from a real regression.
+
+### The Script
+
+```js
+// scripts/smoke-test.mjs
+import { resolve4, resolve6 } from "node:dns/promises";
+
+const target = new URL(process.env.SMOKE_URL);
+const marker = process.env.SMOKE_CONTENT_MARKER;
+const requireLive = process.env.SMOKE_REQUIRE_LIVE === "true";
+
+function skipOrFail(reason) {
+  if (requireLive) {
+    console.error(`::error::${reason}`);
+    process.exit(1);
+  }
+  console.log(`::warning::${reason} -- treating as not-live-yet (SMOKE_REQUIRE_LIVE is unset)`);
+  process.exit(0);
+}
+
+async function hasDnsRecord(hostname) {
+  const results = await Promise.allSettled([resolve4(hostname), resolve6(hostname)]);
+  return results.some((r) => r.status === "fulfilled" && r.value.length > 0);
+}
+
+if (!(await hasDnsRecord(target.hostname))) {
+  skipOrFail(`${target.hostname} has no A/AAAA record yet`);
+}
+
+const res = await fetch(target, { redirect: "manual" });
+
+if (res.status >= 300 && res.status < 400) {
+  skipOrFail(`${target} redirected (${res.status}) instead of serving directly`);
+} else if (res.status !== 200) {
+  skipOrFail(`${target} returned HTTP ${res.status}`);
+} else if (!(await res.text()).includes(marker)) {
+  skipOrFail(`${target} is missing content marker "${marker}"`);
+} else {
+  console.log(`smoke test passed: ${target} is serving ${marker}`);
+}
+```
+
+### Wiring It Into the Workflow
+
+```yaml
+  smoke-test:
+    name: Post-deploy Smoke Test
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Run smoke test
+        run: node scripts/smoke-test.mjs
+        env:
+          SMOKE_URL: https://my-site.example.com
+          SMOKE_CONTENT_MARKER: ${{ github.sha }}
+          SMOKE_REQUIRE_LIVE: ${{ vars.SMOKE_REQUIRE_LIVE }}
+```
+
+`SMOKE_REQUIRE_LIVE` reads from `vars`, not `secrets` — it's a plain repository variable the team flips once the domain is confirmed live, not a credential.
+
+### API Worker Variant: Auth, Create, Verify, Delete
+
+A static site's smoke test is a single `GET`. An API Worker's smoke test needs to prove the whole write path works, which means actually calling it: authenticate, create a record, verify it comes back correctly, then delete it. Two details make this safe to run on every deploy:
+
+- **A unique identity per run** — a timestamp plus a random suffix — so concurrent runs (two quick pushes) never collide on the same resource, and any record left behind is traceable back to the run that created it.
+- **`trap ... EXIT` for cleanup** — so the created record is deleted whether the script succeeds, fails at the verify step, or is killed by the job's `timeout-minutes`, not just on the happy path.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUN_ID="smoke-$(date +%s)-$RANDOM"
+ITEM_ID=""
+
+cleanup() {
+  [ -n "$ITEM_ID" ] && curl -fsS -X DELETE "$API_URL/items/$ITEM_ID" \
+    -H "Authorization: Bearer $API_TOKEN" >/dev/null
+  return 0
+}
+trap cleanup EXIT
+
+curl -fsS "$API_URL/auth/verify" -H "Authorization: Bearer $API_TOKEN" >/dev/null
+
+ITEM_ID=$(curl -fsS -X POST "$API_URL/items" \
+  -H "Authorization: Bearer $API_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"name\":\"$RUN_ID\"}" | jq -r '.id')
+
+curl -fsS "$API_URL/items/$ITEM_ID" -H "Authorization: Bearer $API_TOKEN" \
+  | jq -e --arg name "$RUN_ID" '.name == $name' >/dev/null
+
+echo "API smoke test passed for $RUN_ID"
+```
+
+:::warning[`trap ... EXIT` Only Survives Ordinary Failures]
+`trap ... EXIT` runs on a normal exit, an `exit` call, or `set -e` aborting the script — covering every failure path above. It does **not** run if the process is killed with `SIGKILL`, which is how some CI runners enforce a hard timeout. Keep `timeout-minutes` generous enough that the script's own logic is what ends the job, not the outer limit.
+:::
+
+Swap the `run:` step for this script in the API Worker's `smoke-test` job in place of the DNS/fetch version above; the surrounding job (`needs: [deploy]`, `timeout-minutes`) stays the same.
