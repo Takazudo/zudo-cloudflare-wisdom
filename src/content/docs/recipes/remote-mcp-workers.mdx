@@ -73,9 +73,11 @@ Creating a new server object for every request looks wasteful if the mental mode
 
 This is also why the stateless design fits the platform: Workers can route a request to any warm isolate handling this script, anywhere at the edge, with no affinity to "the one that has the session." A session-based design would need to pin a client to one Durable Object instance to keep that guarantee; the stateless design here has no guarantee to keep, so any isolate can answer any request.
 
+None of this is free, though -- it's cheap, not zero, and worth measuring against an actual ceiling rather than just "it's free." The Free plan's CPU-time budget is [10ms per request](https://developers.cloudflare.com/workers/platform/limits/); `buildServer()` plus a handful of synchronous `registerTool()` calls is a small fraction of that on a warm isolate. A `tools/call` that does real work is a different story: an outbound `fetch()`, a KV read, or a heavier registered tool adds its own CPU time on top of the near-free construction cost above, and any outbound call also counts against the Worker's per-invocation subrequest cap. "Cheap to construct" is a claim about the object graph built in this section, not about whatever a specific registered tool goes on to do once `tools/call` reaches it.
+
 ## The Request Gate: POST-Only, 405 + Allow Header
 
-The Streamable HTTP transport's own `handleRequest` routes `GET` to an SSE stream and `DELETE` to session termination -- both meaningful only when a session exists. This recipe's transport has no session (`sessionIdGenerator: undefined`), so neither verb has anything to do here; letting the transport handle them anyway means a `GET` or `DELETE` falls through to the transport's own missing-session-id error instead of a clean, predictable response. Gate the method **before** the transport ever sees the request instead, and answer everything but `POST` the same way:
+The Streamable HTTP transport's own `handleRequest` routes `GET` to an SSE stream and `DELETE` to session termination -- both meaningful only when a session exists. This recipe's transport has no session (`sessionIdGenerator: undefined`), so neither verb has anything to do here; letting the transport handle them anyway means a `GET` or `DELETE` falls through to the transport's own missing-session-id error instead of a clean, predictable response. Gate the method **before** the transport ever sees the request instead: give `OPTIONS` its own branch first -- a browser's CORS preflight arrives as an `OPTIONS` request, and folding it into the generic 405 below would fail every preflight before the browser ever sends the real request, which would quietly break the browser access the "CORS and Auth" section further down describes enabling -- then answer everything else but `POST` the same way:
 
 ```typescript
 function jsonRpcError(
@@ -90,13 +92,18 @@ function jsonRpcError(
   });
 }
 
-// Inside the fetch handler, before any body is read:
+// Inside the fetch handler, before any body is read. OPTIONS is a CORS
+// preflight, not a method to reject -- see "CORS and Auth" for what this
+// branch needs to add if browser access to this endpoint is enabled.
+if (request.method === "OPTIONS") {
+  return new Response(null, { status: 204, headers: { Allow: "POST, OPTIONS" } });
+}
 if (request.method !== "POST") {
-  return jsonRpcError(405, -32000, "Method not allowed", { Allow: "POST" });
+  return jsonRpcError(405, -32000, "Method not allowed", { Allow: "POST, OPTIONS" });
 }
 ```
 
-The response body is still a valid JSON-RPC error envelope (`code: -32000`, the same generic server-error code the SDK itself uses for its own method-not-allowed case), so a client that always tries to parse the body as JSON-RPC gets something coherent either way -- it just also gets a stable `405` and `Allow: POST` from a check that runs before the SDK is involved at all.
+The response body is still a valid JSON-RPC error envelope (`code: -32000`, the same generic server-error code the SDK itself uses for its own method-not-allowed case), so a client that always tries to parse the body as JSON-RPC gets something coherent either way -- it just also gets a stable `405` and `Allow: POST, OPTIONS` from a check that runs before the SDK is involved at all.
 
 ## The Body Cap: Enforced Before Any JSON Parsing
 
@@ -146,13 +153,25 @@ async function readBodyWithCap(request: Request, maxBytes: number): Promise<stri
 
 The `Content-Length` check is a cheap first pass that rejects an honestly-labeled oversized request without touching the body at all. It cannot be the only check: `Content-Length` is absent on a chunked request, and nothing stops a client from sending a small declared length and a larger actual stream (or vice versa). The streaming loop is the real boundary -- it counts bytes as they arrive and cancels the reader the moment the running total crosses the cap, so the worst case is buffering `maxBytes` plus one chunk, never an unbounded body.
 
+One ordering note for when these pieces are assembled: in the full handler further down, this cap runs *after* the `Content-Type` check covered next, not before -- there is no reason to stream-count a body that was never going to be JSON in the first place. The sections on this page are ordered by concept, not by the sequence the assembled handler actually executes; see [Content-Type and the JSON-RPC Error Shape](#content-type-and-the-json-rpc-error-shape) below for the real order.
+
 ## Content-Type and the JSON-RPC Error Shape
 
 Validate `Content-Type` before the body cap even runs -- there is no reason to read a single byte of a request that was never going to be JSON:
 
 ```typescript
+function isJsonContentType(contentType: string): boolean {
+  // Parse the media type -- the part before any `;` parameter -- instead
+  // of a substring match. The SDK's own transport does the same (its
+  // internal `isJsonContentType` explicitly rejects substring matching),
+  // and a plain `.includes("application/json")` also passes something like
+  // `text/plain; charset=application/json`, which is not JSON.
+  const mediaType = contentType.split(";", 1)[0].trim().toLowerCase();
+  return mediaType === "application/json";
+}
+
 const contentType = request.headers.get("content-type") ?? "";
-if (!contentType.includes("application/json")) {
+if (!isJsonContentType(contentType)) {
   return jsonRpcError(415, -32000, "Content-Type must be application/json");
 }
 ```
@@ -173,10 +192,12 @@ Every rejection this recipe's own gate produces -- method, content-type, body si
 Putting the gate together, in the order each check actually runs:
 
 ```typescript
-interface Env {
-  // no bindings required for this minimal example -- add KV, D1, or secrets
-  // as your registered tools need them
-}
+// No bindings required for this minimal example. `Record<string, never>`
+// (not an empty `interface Env {}`) types "no properties" without tripping
+// the no-empty-object-type lint rule most configs enable -- switch to a
+// real `interface Env { ... }` once your registered tools need KV, D1, or
+// secrets.
+type Env = Record<string, never>;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -185,12 +206,15 @@ export default {
       return new Response("Not found", { status: 404 });
     }
 
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: { Allow: "POST, OPTIONS" } });
+    }
     if (request.method !== "POST") {
-      return jsonRpcError(405, -32000, "Method not allowed", { Allow: "POST" });
+      return jsonRpcError(405, -32000, "Method not allowed", { Allow: "POST, OPTIONS" });
     }
 
     const contentType = request.headers.get("content-type") ?? "";
-    if (!contentType.includes("application/json")) {
+    if (!isJsonContentType(contentType)) {
       return jsonRpcError(415, -32000, "Content-Type must be application/json");
     }
 
@@ -223,6 +247,8 @@ export default {
   },
 };
 ```
+
+Neither `server` nor `transport` is explicitly closed anywhere above, and that is deliberate rather than an oversight. Both are function-local objects with no persistent handle attached -- no open socket, no timer, no Durable Object connection -- so there is nothing outside normal garbage collection for a `close()` call to release once `fetch()` returns. The SDK's own Node-based examples close both because a long-lived Node process has to explicitly tear down per-connection state before the next request reuses the same server object; a Worker's `fetch()` handler simply returns and lets its request-scoped objects go, the same way it would for any other function-local value with no external resource attached.
 
 ## Pin the SDK to an Exact Version
 
@@ -321,18 +347,20 @@ curl -s -i -X GET https://your-worker.example.workers.dev/mcp
 
 ```
 HTTP/1.1 405 Method Not Allowed
-Allow: POST
+Allow: POST, OPTIONS
 content-type: application/json
 
 {"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"Method not allowed"}}
 ```
 
-This response comes from this recipe's own gate, before the SDK transport ever runs -- confirm that by checking it also fires for `PUT` and `DELETE`, not just `GET`.
+This response comes from this recipe's own gate, before the SDK transport ever runs -- confirm that by checking it also fires for `PUT` and `DELETE`, not just `GET`, and that `OPTIONS` gets its own `204` with the same `Allow` header instead of falling into this `405` branch.
 
 ```mermaid
 graph TB
-  Req[POST /mcp] --> Method{"Method is POST?"}
-  Method -->|No| M405["405 + Allow: POST"]
+  Req[POST /mcp] --> Opt{"Method is OPTIONS?"}
+  Opt -->|Yes| O204["204 + Allow: POST, OPTIONS"]
+  Opt -->|No| Method{"Method is POST?"}
+  Method -->|No| M405["405 + Allow: POST, OPTIONS"]
   Method -->|Yes| CT{"Content-Type is application/json?"}
   CT -->|No| CT415["415 Unsupported Media Type"]
   CT -->|Yes| Cap["readBodyWithCap(): Content-Length check, then stream-count"]
@@ -346,4 +374,4 @@ graph TB
 
 ## Related
 
-[Personal API Tokens](./personal-api-tokens.mdx) covers the bearer-token auth shape referenced above. For a session-based MCP server -- OAuth-authenticated clients, server-initiated notifications, state that outlives one request -- reach for a Durable-Object-backed `McpAgent` from Cloudflare's Agents SDK instead of this stateless pattern; the two are different tools for different session requirements, not two ways to do the same thing.
+[Personal API Tokens](./personal-api-tokens.mdx) covers the bearer-token auth shape referenced above. For a session-based MCP server -- OAuth-authenticated clients, server-initiated notifications, state that outlives one request -- reach for a Durable-Object-backed `McpAgent` from Cloudflare's Agents SDK instead of this stateless pattern; see [Durable Objects](../workers/durable-objects.mdx) for the state-persistence model that pattern relies on. The two are different tools for different session requirements, not two ways to do the same thing.

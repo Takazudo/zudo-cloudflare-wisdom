@@ -4,11 +4,11 @@ description: The edge-level cache.enabled / ctx.cache feature -- version floor, 
 sidebar_position: 11
 ---
 
-Workers Cache puts an edge-level HTTP cache directly in front of a Worker's own code: enable `cache.enabled` in the config, return an ordinary `Cache-Control` header, and matching requests get served from Cloudflare's edge without your Worker running at all. It's a different mechanism from the [Cache API](./local-dev-bindings.mdx) (`caches.default`) -- the Cache API is what emulates locally under `wrangler dev`, Workers Cache does not -- and a different concern from the client-facing headers on [Browser Caching for Hashed Assets](./static-assets-caching.mdx), covered in the last section below. This page covers enabling Workers Cache, the headers that drive it, `ctx.cache.purge()`, `Cf-Cache-Status`, and why verification only happens against a deployed Worker.
+Workers Cache puts an edge-level HTTP cache directly in front of a Worker's own code: enable `cache.enabled` in the config, return an ordinary `Cache-Control` header, and matching requests get served from Cloudflare's edge without your Worker running at all. It's a different mechanism from the [Cache API](./local-dev-bindings.mdx#the-cache-api-emulates-locally-workers-cache-doesn-t) (`caches.default`) -- the Cache API is what emulates locally under `wrangler dev`, Workers Cache does not -- and a different concern from the client-facing headers on [Browser Caching for Hashed Assets](./static-assets-caching.mdx), covered in the last section below. This page covers enabling Workers Cache, the headers that drive it, `ctx.cache.purge()`, `Cf-Cache-Status`, and why verification only happens against a deployed Worker.
 
 ## Enabling Workers Cache: the 4.69.0 Version Floor
 
-Workers Cache needs [Wrangler 4.69.0 or above](https://developers.cloudflare.com/workers/cache/configuration/) -- if a `[cache]` block "does nothing," check `npx wrangler --version` before assuming it's a config mistake rather than a stale CLI. Per-entrypoint caching -- a Worker exporting multiple `WorkerEntrypoint` classes, each with its own cache -- needs a higher floor: Wrangler 4.107.0.
+Workers Cache needs [Wrangler 4.69.0 or above](https://developers.cloudflare.com/workers/cache/configuration/) -- if a `[cache]` block "does nothing," check `npx wrangler --version` before assuming it's a config mistake rather than a stale CLI. Per-entrypoint caching -- a Worker exporting multiple `WorkerEntrypoint` classes, each with its own cache -- needs a higher floor: Wrangler 4.107.0. The Wrangler version is the floor this page can confirm; if enabling `cache.enabled` also depends on a minimum `compatibility_date`, check that the same way you'd check any other dated feature -- see [Compatibility Dates](./compatibility-dates.mdx).
 
 ```jsonc
 // wrangler.jsonc -- the only field this table accepts is `enabled`.
@@ -59,14 +59,25 @@ Only `GET` and `HEAD` requests are ever cached; `POST`/`PUT`/`PATCH` and the res
 
 A Worker can [invalidate its own cache](https://developers.cloudflare.com/workers/cache/purge/) from inside its own code, with no separate Cloudflare API token and no `Zone.Cache Purge` permission to provision -- `ctx.cache.purge()` runs in the same execution context as the request that calls it, authenticated by simply being that Worker.
 
+:::warning[That's authentication for the Worker, not for whoever hits this route]
+"No separate token to provision" is exactly why a route like the one below needs its own gate: the usual thing that stops a stranger from purging your cache -- not having a token -- has been removed by design, so nothing stops them unless a check replaces it. The bearer comparison below is the minimal version; [Personal API Tokens](../recipes/personal-api-tokens.mdx) covers a real token system with hashing, revocation, and expiry if this route needs more than a single shared secret.
+:::
+
 ```ts
+export interface Env {
+  CACHE_PURGE_TOKEN: string; // shared secret -- see Personal API Tokens for a real token system
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (new URL(request.url).pathname === "/admin/purge") {
+      if (request.headers.get("authorization") !== `Bearer ${env.CACHE_PURGE_TOKEN}`) {
+        return new Response("Unauthorized", { status: 401 });
+      }
       await ctx.cache.purge({ tags: ["blog-posts"] });
       return new Response("purged");
     }
-    // ...
+    return new Response("Not found", { status: 404 });
   },
 };
 ```
@@ -128,6 +139,8 @@ curl -sI https://<worker>.<subdomain>.workers.dev/admin/purge
 curl -sI https://<worker>.<subdomain>.workers.dev/ | grep -i cf-cache-status
 # -> cf-cache-status: MISS
 ```
+
+`purge()` is itself rate-limited and only eventually consistent across Cloudflare's PoPs, so step 4 is not as deterministic as the sequence above implies -- consecutive `curl` requests can land on different colos, and one that hasn't yet seen the purge can legitimately still answer `HIT`. Retry after a short delay before concluding the purge isn't wired up correctly.
 
 A passing unit test proves the handler returns the right headers; it proves nothing about whether Cloudflare actually cached and served from the edge. This sequence is the only check that does.
 

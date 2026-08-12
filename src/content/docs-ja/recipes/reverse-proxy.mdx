@@ -86,21 +86,64 @@ function stripHopByHopHeaders(headers: Headers): Headers {
 
 ## アウトバウンドリクエストの構築
 
+:::danger[2 引数版の new URL() はここでは SSRF の穴になる]
+パスとベースを組み合わせる自然な書き方は `new URL(requestUrl.pathname + requestUrl.search, env.UPSTREAM_ORIGIN)` のように見える -- 両方を `new URL()` に渡してそれに解決させる、というものだ。それはやってはいけない。`//` で始まる相対参照は URL 仕様上 **スキーム相対** であり、それをベースに対して解決すると、パスだけでなくベースの *オーソリティ全体* が置き換わる。`URL.pathname` は先頭の二重スラッシュをそのまま保持するので、`https://proxy.example.com//evil.example.com/x` へのリクエストは `requestUrl.pathname === "//evil.example.com/x"` になり、`new URL("//evil.example.com/x", "https://upstream.example.com").href` は `"https://evil.example.com/x"` になる -- 呼び出し元は、このレシピ全体が拠って立つ固定オリジンという保証から、スラッシュ 1 つ分だけ離れたところでアップストリームを選び直せてしまう。（パーセントエンコードされた形、`/%2F%2Fevil.example.com/x` はこれを引き起こさない -- リテラルな `//` だけがスキーム相対として解決される -- これがテストで見落としやすい理由でもある。）
+
+対象は、すでにアップストリームに固定された URL を書き換えることで組み立てる。呼び出し元が制御できる相対参照をそれに対して解決するのでは決してない。`env.UPSTREAM_ORIGIN` だけからパースされた `URL` に `.pathname` / `.search` を代入しても、渡されたパス文字列の中身にかかわらず、そのオリジンを変えることはできない。
+:::
+
 ```typescript
-const upstreamTarget = new URL(requestUrl.pathname + requestUrl.search, env.UPSTREAM_ORIGIN);
+const upstreamTarget = new URL(env.UPSTREAM_ORIGIN);
+upstreamTarget.pathname = requestUrl.pathname;
+upstreamTarget.search = requestUrl.search;
 
 const upstreamResponse = await fetch(upstreamTarget, {
   method: request.method,
-  headers: stripHopByHopHeaders(request.headers),
+  headers: buildOutboundHeaders(request, requestUrl),
   body: request.body, // streamed through unread -- see "Pass-Through Body Rule" below
   redirect: "manual", // see "Manual Redirects" below
 });
 ```
 
-最初の実装でつまずきがちな点がいくつかある。
+上の `stripHopByHopHeaders` は、リクエストヘッダーを正しくするための前半にすぎない。あと 3 つのヘッダーには日常的なストリップではなく能動的な訂正が必要だ -- クライアントが送ってきたとおりに残しておくと、嘘を転送するか、このレシピ自身のトラストモデルを壊すかのどちらかになる。
 
-- **クライアントの `Host` ヘッダーは転送できないし、その必要もない。** `Host` は Fetch API における禁止ヘッダー名だ -- Workers は fetch の送信先 URL からそれを導出し、明示的に設定しようとしても黙って無視される。固定アップストリームプロキシの要点は、アウトバウンドリクエストが常に `env.UPSTREAM_ORIGIN` を宛先にすることなので、正しいアウトバウンドの `Host` はそのオリジンのホスト名そのものであり、転送すべきものは何もない。アップストリーム側の下流コードがクライアントが接続してきた本来の公開ホスト名を知る必要があるなら、`Host` をめぐってランタイムと争う代わりに、`X-Forwarded-Host`（および `X-Forwarded-Proto`、`X-Forwarded-For`）として明示的に送るべきだ。
+```typescript
+function buildOutboundHeaders(request: Request, requestUrl: URL): Headers {
+  const headers = stripHopByHopHeaders(request.headers);
+
+  // Overwrite, never merely forward -- nothing upstream of this function
+  // strips an inbound X-Forwarded-For, so a caller who sends
+  // `X-Forwarded-For: 10.0.0.1` would otherwise have the proxy launder it
+  // straight through to an upstream that trusts that header for IP
+  // allowlisting or rate limiting.
+  headers.set("x-forwarded-for", request.headers.get("cf-connecting-ip") ?? "");
+  headers.set("x-forwarded-host", requestUrl.host);
+  headers.set("x-forwarded-proto", requestUrl.protocol.replace(":", ""));
+
+  // This recipe's trust model treats the proxy's own origin as
+  // authoritative for session state -- see "The Response Leg" below, which
+  // strips Set-Cookie for the same reason. A cookie scoped to the proxy's
+  // own domain means nothing to the upstream, so it is stripped here too
+  // rather than crossing the trust boundary. The intentionally-transparent
+  // proxy that section describes should forward it instead.
+  headers.delete("cookie");
+
+  return headers;
+}
+```
+
+最初の実装でつまずきがちな、残りの点がいくつかある。
+
+- **クライアントの `Host` ヘッダーは転送できないし、その必要もない。** `Host` は Fetch API における禁止ヘッダー名だ -- Workers は fetch の送信先 URL からそれを導出し、明示的に設定しようとしても黙って無視される。固定アップストリームプロキシの要点は、アウトバウンドリクエストが常に `env.UPSTREAM_ORIGIN` を宛先にすることなので、正しいアウトバウンドの `Host` はそのオリジンのホスト名そのものであり、転送すべきものは何もない。上の `X-Forwarded-Host` が、代わりに本来の公開ホスト名をアップストリームへ運ぶ。
 - **`duplex` オプションは不要。** ブラウザや Node の `fetch()` はボディが `ReadableStream` の場合に `duplex: "half"` を要求するが、Workers の `fetch()` にはその要件がないので、`body: request.body` はストリーミングリクエストボディに対してそのまま動作する。
+
+## WebSocket アップグレードは対象外
+
+このレシピはプレーンな HTTP のリクエスト/レスポンスのペアをプロキシするものであり、WebSocket のハンドシェイクは扱わない。WebSocket トラフィックも配信する本物のオリジンの前段にこれを置くと、派手にではなく静かに壊れる。
+
+:::note[なぜここで WebSocket が壊れるのか、代わりにどんな修正が必要か]
+上で行った 2 つの選択は、それぞれ HTTP にとっては正しく、WebSocket にとっては間違っている。`stripHopByHopHeaders` はリクエストレグで `Connection` と `Upgrade` を取り除く -- これはまさに WebSocket のハンドシェイクがアップストリームへ届くために必要なヘッダーだ -- そして（後述の）レスポンスレグは素の `new Response(body, { status })` を組み立てるが、これは `101 Switching Protocols` ステータスに対して例外を投げる。WebSocket トラフィックをプロキシする Worker はまったく別の形を取る： ハンドシェイクリクエストは `Connection`/`Upgrade` をそのまま残して通過させ、新しい `Response` を組み立てる代わりにアップストリームのレスポンスの `webSocket` プロパティを返す。[Runtime Gotchas の CORS と WebSocket のセクション](../workers/runtime-gotchas.mdx#cors-と-websocket-ショートサーキットと-exposeheaders)が、このレシピが扱わない仕組みをカバーしている。
+:::
 
 ## 手動リダイレクト：Location の書き換えとチェーンの上限設定
 
@@ -157,6 +200,8 @@ function currentHopCount(url: URL): number {
 ```
 
 このカウンタはプロキシ内部の帳簿であり -- ホップバイホップヘッダーがホップを越える前に取り除かれるのと同じように、アップストリームへ届く前に URL から取り除く。
+
+これは行儀の良いクライアント向けの助言的な帳簿であって、セキュリティ制御ではない -- `HOP_COUNT_PARAM` はクエリパラメータの中にあり、クライアントがすべてのリクエストでそれを `0` にリセットしてこの上限を完全に無効化するのを止めるものは何もない。そうしたところで損をするのはそのクライアント自身だけで、自分自身のリクエストをループし続けることになる -- しかし上限があろうとなかろうと、各ホップは新たに課金対象になる Worker 呼び出しだ。だからこの上限は、悪意あるクライアントからプロキシを守るためではなく、行儀の良いクライアント自身のリソース消費に上限を設けるために存在する。
 
 ```mermaid
 graph TB
@@ -247,18 +292,21 @@ function isCacheableRequest(request: Request): boolean {
 ```typescript
 const upstreamResponse = await fetch(upstreamTarget, {
   method: request.method,
-  headers: stripHopByHopHeaders(request.headers),
+  headers: buildOutboundHeaders(request, requestUrl),
   body: request.body,
   redirect: "manual",
-  cf: isCacheableRequest(request)
-    ? { cacheEverything: true, cacheTtl: 300 }
-    : { cacheTtl: 0 },
+  // Omit `cf` entirely to opt out of caching -- `cacheTtl: 0` reads as
+  // "cache for zero seconds," but the documented bypass is not sending
+  // the caching options at all.
+  ...(isCacheableRequest(request) ? { cf: { cacheEverything: true, cacheTtl: 300 } } : {}),
 });
 ```
 
 :::warning[デフォルトのキャッシュキーは、レスポンスが他に何によって変化するかを知らない]
 上のチェックは、キャッシュが資格情報の漏洩に変わる唯一のケースを防ぐものだ。それはすべてのレスポンスに対してキャッシュを安全にするわけではない。Cloudflare のデフォルトのキャッシュキーは URL から導出されるものであり、`Accept-Language` や、モバイル / デスクトップを分ける `User-Agent`、あるいはアップストリームのレスポンスが変化しうる他のどんなリクエストプロパティからも導出されない。そうした軸のどれかに沿って変化するレスポンスが、すべてのバリアントと同じキャッシュキーを共有してしまうと、一部の訪問者に間違ったコンテンツが配信される -- 漏洩ではなく正しさの問題だが、それでもバグだ。これを直すにはキャッシュキーをカスタマイズする（あるいは何らかの形で `Vary` を考慮させる）ことでアップストリームが実際に何によって変化するかを捉える必要があり、それはここでは対象外だ。
 :::
+
+さらに、これがそもそも観測可能かどうかについて、もう 2 つの注意点がある。`cf` の fetch オプションは `wrangler dev` の下では一切効かない -- ローカルにはキャッシュすべきエッジが存在しないからだ -- そして Worker 自身と同じ Cloudflare ゾーンにフェッチ先がある場合も無視される。これは同一ゾーンのアップストリームに対して `cacheEverything` を静かに no-op にしてしまう。どちらも、[Workers Cache](../workers/cache-api.mdx) の `ctx.cache.purge()` と同様に、このセクションはデプロイ済みの Worker が別ゾーンにアクセスする場合にしか検証できないことを意味する -- ローカルテストと同一ゾーンへのデプロイは、キャッシュが正しく配線されていてもいなくても同じに見える。
 
 ## すべてを組み合わせる
 
@@ -275,22 +323,29 @@ export default {
     const requestUrl = new URL(request.url);
 
     const hopCount = currentHopCount(requestUrl);
-    if (hopCount > MAX_REDIRECT_HOPS) {
+    if (hopCount >= MAX_REDIRECT_HOPS) {
       return new Response("Redirect loop detected", { status: 508 });
     }
 
     // Hop counter is this proxy's own bookkeeping -- never forward it upstream.
     requestUrl.searchParams.delete(HOP_COUNT_PARAM);
-    const upstreamTarget = new URL(requestUrl.pathname + requestUrl.search, env.UPSTREAM_ORIGIN);
+    const upstreamTarget = new URL(env.UPSTREAM_ORIGIN);
+    upstreamTarget.pathname = requestUrl.pathname;
+    upstreamTarget.search = requestUrl.search;
+    if (upstreamTarget.origin !== upstreamOrigin) {
+      // Cannot actually happen -- assigning .pathname/.search can't change
+      // an already-parsed URL's origin -- but the check is cheap insurance
+      // against a future refactor reintroducing the two-argument new URL()
+      // trap from "Building the Outbound Request" above.
+      return new Response("Upstream target resolution error", { status: 500 });
+    }
 
     const upstreamResponse = await fetch(upstreamTarget, {
       method: request.method,
-      headers: stripHopByHopHeaders(request.headers),
+      headers: buildOutboundHeaders(request, requestUrl),
       body: request.body,
       redirect: "manual",
-      cf: isCacheableRequest(request)
-        ? { cacheEverything: true, cacheTtl: 300 }
-        : { cacheTtl: 0 },
+      ...(isCacheableRequest(request) ? { cf: { cacheEverything: true, cacheTtl: 300 } } : {}),
     });
 
     const location = upstreamResponse.headers.get("location");
@@ -305,6 +360,11 @@ export default {
       const headers = stripHopByHopHeaders(upstreamResponse.headers);
       for (const name of STRIPPED_RESPONSE_HEADERS) headers.delete(name);
       headers.set("location", rewritten);
+      // The upstream's 3xx usually carries a small HTML body and a
+      // matching Content-Length -- stale once the body is dropped for this
+      // null-bodied response. Same discipline as the Content-Encoding trap
+      // above: never forward a byte-count header for a body you didn't send.
+      headers.delete("content-length");
       return new Response(null, { status: upstreamResponse.status, headers });
     }
 

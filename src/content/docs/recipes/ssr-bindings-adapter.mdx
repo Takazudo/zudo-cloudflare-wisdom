@@ -478,7 +478,10 @@ Both checks are header-only — neither function reads the response body.
 That matters because the Workers Static Assets binding streams every
 response and never sends a `content-length` header, so content-type is the
 only signal available before deciding, and whichever response wins still
-needs its one-shot stream returned intact.
+needs its one-shot stream returned intact. The response that loses the
+arbitration is never read either — its body is simply left unconsumed, and
+the runtime reclaims it like any other unreferenced object once the losing
+`Response` falls out of scope, with no explicit cleanup required.
 
 :::warning[The trap: a JSON API 404 without an explicit content-type gets silently overridden]
 An `application/json` inner 404 only wins if your handler actually sets
