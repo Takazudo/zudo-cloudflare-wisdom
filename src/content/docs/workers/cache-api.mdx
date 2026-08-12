@@ -1,0 +1,157 @@
+---
+title: Workers Cache (ctx.cache)
+description: The edge-level cache.enabled / ctx.cache feature -- version floor, Cache-Control/Cache-Tag/Vary, ctx.cache.purge scoping, Cf-Cache-Status, the Next.js ISR question, and why verification only works against a deployed Worker
+sidebar_position: 11
+---
+
+Workers Cache puts an edge-level HTTP cache directly in front of a Worker's own code: enable `cache.enabled` in the config, return an ordinary `Cache-Control` header, and matching requests get served from Cloudflare's edge without your Worker running at all. It's a different mechanism from the [Cache API](./local-dev-bindings.mdx#the-cache-api-emulates-locally-workers-cache-doesn-t) (`caches.default`) -- the Cache API is what emulates locally under `wrangler dev`, Workers Cache does not -- and a different concern from the client-facing headers on [Browser Caching for Hashed Assets](./static-assets-caching.mdx), covered in the last section below. This page covers enabling Workers Cache, the headers that drive it, `ctx.cache.purge()`, `Cf-Cache-Status`, and why verification only happens against a deployed Worker.
+
+## Enabling Workers Cache: the 4.69.0 Version Floor
+
+Workers Cache needs [Wrangler 4.69.0 or above](https://developers.cloudflare.com/workers/cache/configuration/) -- if a `[cache]` block "does nothing," check `npx wrangler --version` before assuming it's a config mistake rather than a stale CLI. Per-entrypoint caching -- a Worker exporting multiple `WorkerEntrypoint` classes, each with its own cache -- needs a higher floor: Wrangler 4.107.0. The Wrangler version is the floor this page can confirm; if enabling `cache.enabled` also depends on a minimum `compatibility_date`, check that the same way you'd check any other dated feature -- see [Compatibility Dates](./compatibility-dates.mdx).
+
+```jsonc
+// wrangler.jsonc -- the only field this table accepts is `enabled`.
+{
+  "cache": {
+    "enabled": true
+  }
+}
+```
+
+Unlike the Cache API, which only does functional work on a custom domain (see [Local Dev: Binding Support Matrix](./local-dev-bindings.mdx)), Workers Cache is zoneless -- [it follows the Worker wherever it runs](https://blog.cloudflare.com/workers-cache/): on `*.workers.dev`, on preview URLs, behind a service binding, and inside a Workers for Platforms tenant, not only on a zone-attached custom domain.
+
+## Cache-Control, Cache-Tag, and Vary
+
+`Cache-Control` on the response your Worker returns is what Workers Cache reads to decide whether -- and for how long -- to cache it. A response with no explicit `Cache-Control` still gets cached, under a [status-code-based default TTL](https://developers.cloudflare.com/workers/cache/configuration/) (two hours for `200`, three minutes for `404`), not skipped outright.
+
+```ts
+return new Response(body, {
+  headers: {
+    "content-type": "text/html",
+    // 1h fresh, then serve the stale copy immediately while regenerating
+    // in the background for up to 24h.
+    "cache-control": "public, max-age=3600, stale-while-revalidate=86400",
+    // Tags this response for later bulk purge -- see ctx.cache.purge() below.
+    "cache-tag": "blog-posts,blog-post-42",
+  },
+});
+```
+
+`Cache-Tag` attaches labels for bulk purge later. Tags are printable ASCII, capped at 1024 characters each and 1000 tags per response -- and Cloudflare strips the header before the response reaches a browser or another Worker, so end users never see it.
+
+`Vary` splits the cache into per-header-value variants:
+
+```ts
+return new Response(body, {
+  headers: {
+    "cache-control": "public, max-age=3600",
+    vary: "Accept-Language",
+  },
+});
+```
+
+Cloudflare stores a separate cached copy per distinct combination of the listed header's values, and compares those values verbatim -- `Accept-Language: en-US` and `en-us` are different variants, not normalized to one. `Vary: *` is a special case: it disables caching for that response entirely, not "vary on everything."
+
+Only `GET` and `HEAD` requests are ever cached; `POST`/`PUT`/`PATCH` and the rest always reach the Worker. Responses with status `206` or `520`-`526` are never cached either, regardless of the headers above ([full limitations list](https://developers.cloudflare.com/workers/cache/limitations/)).
+
+## ctx.cache.purge(): Scoping and the Zero-Token Note
+
+A Worker can [invalidate its own cache](https://developers.cloudflare.com/workers/cache/purge/) from inside its own code, with no separate Cloudflare API token and no `Zone.Cache Purge` permission to provision -- `ctx.cache.purge()` runs in the same execution context as the request that calls it, authenticated by simply being that Worker.
+
+:::warning[That's authentication for the Worker, not for whoever hits this route]
+"No separate token to provision" is exactly why a route like the one below needs its own gate: the usual thing that stops a stranger from purging your cache -- not having a token -- has been removed by design, so nothing stops them unless a check replaces it. The bearer comparison below is the minimal version; [Personal API Tokens](../recipes/personal-api-tokens.mdx) covers a real token system with hashing, revocation, and expiry if this route needs more than a single shared secret.
+:::
+
+```ts
+export interface Env {
+  CACHE_PURGE_TOKEN: string; // shared secret -- see Personal API Tokens for a real token system
+}
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    if (new URL(request.url).pathname === "/admin/purge") {
+      if (request.headers.get("authorization") !== `Bearer ${env.CACHE_PURGE_TOKEN}`) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      await ctx.cache.purge({ tags: ["blog-posts"] });
+      return new Response("purged");
+    }
+    return new Response("Not found", { status: 404 });
+  },
+};
+```
+
+The same call is available without `ctx`, imported from `cloudflare:workers`:
+
+```ts
+import { cache } from "cloudflare:workers";
+
+await cache.purge({ pathPrefixes: ["/blog/"] });
+```
+
+`purge()` takes exactly one of three mutually exclusive options -- `tags`, `pathPrefixes`, or `purgeEverything: true` -- and `pathPrefixes` matches on path only, with no hostname or scheme filtering available. Scoping is strict in the other direction too: a purge only reaches the calling entrypoint's own cached responses. A Worker cannot purge another Worker's cache, and one `WorkerEntrypoint` cannot purge a sibling entrypoint's cache in the same Worker. There is also no "purge by host" mode at all -- the cache belongs to the Worker, not to a domain, so there's nothing to scope a purge to besides tags, path prefixes, or everything.
+
+## Cf-Cache-Status
+
+`Cf-Cache-Status` on the response says what actually happened for that request ([full reference](https://developers.cloudflare.com/workers/cache/debugging/)):
+
+| Value | Meaning |
+| --- | --- |
+| `MISS` | Not cached (or the entry expired) -- the Worker ran and the response was stored |
+| `HIT` | Served straight from the edge -- the Worker did not run |
+| `EXPIRED` | A cached entry existed but its TTL had passed |
+| `REVALIDATED` | A stale entry was checked and confirmed still fresh |
+| `UPDATING` | A stale entry was served while a background refresh runs (`stale-while-revalidate`) |
+| `STALE` | A stale entry was served with no refresh in flight |
+| `BYPASS` | The response's own `Cache-Control` opted it out of caching |
+| `DYNAMIC` | Not eligible for caching at all -- wrong method, excluded status code, or similar |
+
+## Next.js and ISR: What This Replaces, What It Doesn't
+
+Cloudflare positions Workers Cache as a direct substitute for Incremental Static Regeneration's machinery, not an integration with it: "[No framework-specific machinery like Incremental Static Regeneration. Just HTTP caching, working the way it was designed to work.](https://blog.cloudflare.com/workers-cache/)" The `stale-while-revalidate` directive from the section above -- serve the stale copy immediately, regenerate in the background -- is that substitute: it reproduces ISR's user-facing behavior with a plain `Cache-Control` value and no separate ISR runtime.
+
+That framing only applies to a Worker that owns its own responses directly. A Next.js app deployed through [OpenNext's Cloudflare adapter](https://opennext.js.org/cloudflare/caching) gets its ISR support from OpenNext's own incremental cache -- backed by R2 or KV, sometimes fronted by the legacy Cache API (`caches.default`) as a regional read-through layer -- which predates `cache.enabled` and doesn't currently plug into it. `ctx.cache.purge()` on this page does not invalidate OpenNext-managed ISR pages; that revalidation path is OpenNext's own, driven by its incremental cache, not by this feature.
+
+As of this writing, [Astro is the only framework whose Cloudflare adapter wires up Workers Cache out of the box](https://blog.cloudflare.com/workers-cache/); Cloudflare has said more framework integrations are coming. For a Next.js Worker that bypasses OpenNext's ISR path entirely -- a route your own code renders and returns -- `Cache-Control: stale-while-revalidate` plus `cache.enabled` is the direct equivalent covered above.
+
+## No Local Simulation
+
+Workers Cache does not run under `wrangler dev` at all -- `Cf-Cache-Status` never appears on a local response, no matter what the Worker returns, because it's a deploy-time-only feature. [Local Dev: Binding Support Matrix](./local-dev-bindings.mdx) has the full picture of what does and doesn't emulate locally; the short version is that this is the one line in that table with zero local path, which is why the next section verifies against a deployed Worker instead.
+
+## Verify After Deploy: MISS -> HIT -> Purge -> MISS
+
+Because nothing above is observable locally, the only way to confirm `cache.enabled`, the response's `Cache-Control`, and `ctx.cache.purge()` are actually wired together is a four-request sequence against the deployed Worker:
+
+```bash
+# 1. Cold, or right after a purge -- the Worker runs and the response is stored.
+curl -sI https://<worker>.<subdomain>.workers.dev/ | grep -i cf-cache-status
+# -> cf-cache-status: MISS
+
+# 2. Same URL again -- served from the edge, the Worker does not run.
+curl -sI https://<worker>.<subdomain>.workers.dev/ | grep -i cf-cache-status
+# -> cf-cache-status: HIT
+
+# 3. Hit a route that calls ctx.cache.purge() server-side.
+curl -sI https://<worker>.<subdomain>.workers.dev/admin/purge
+
+# 4. Same URL as steps 1-2 -- the purge cleared the entry, so the Worker runs again.
+curl -sI https://<worker>.<subdomain>.workers.dev/ | grep -i cf-cache-status
+# -> cf-cache-status: MISS
+```
+
+`purge()` is itself rate-limited and only eventually consistent across Cloudflare's PoPs, so step 4 is not as deterministic as the sequence above implies -- consecutive `curl` requests can land on different colos, and one that hasn't yet seen the purge can legitimately still answer `HIT`. Retry after a short delay before concluding the purge isn't wired up correctly.
+
+A passing unit test proves the handler returns the right headers; it proves nothing about whether Cloudflare actually cached and served from the edge. This sequence is the only check that does.
+
+## Editor Red Squiggle on `[cache]`
+
+Some editors' generic TOML/JSON schema linters flag `[cache]` / `"cache"` as an unknown key, because the table is newer than their bundled wrangler schema. It's a stale linter, not a real error -- see [the `[cache]` table note on Wrangler Config](./wrangler-config.mdx#the-cache-table) for the same trap already documented for that table, and confirm against `npx wrangler deploy --dry-run` rather than the editor's underline.
+
+## Workers Cache vs. Browser Caching for Hashed Assets
+
+[Browser Caching for Hashed Assets](./static-assets-caching.mdx) and this page are about the same header, `Cache-Control`, read by two different layers. The browser reads it to decide whether to reuse its own local copy without asking -- that's the `_headers` `immutable` rule and the 304-per-navigation tax covered there. Workers Cache reads the very same header to decide whether *Cloudflare's edge* reuses a copy without ever invoking your Worker. One value, two independent consumers, one hop apart: a response can be `immutable` in the browser and `stale-while-revalidate` at the edge at the same time, because setting one doesn't imply the other.
+
+The practical difference: a browser-cache miss still costs a request to Cloudflare's edge (cheap, but not free); an edge-cache `HIT` costs nothing beyond the edge response itself, because your Worker's code never runs. They solve different problems -- avoiding a client round trip versus avoiding a Worker invocation -- and a response can opt into both, either, or neither independently.
+
+Related pages: [Local Dev: Binding Support Matrix](./local-dev-bindings.mdx) for what does and doesn't emulate under `wrangler dev`, and [Wrangler Config](./wrangler-config.mdx#the-cache-table) for the `[cache]` table's editor false-positive.
