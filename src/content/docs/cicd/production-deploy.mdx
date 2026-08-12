@@ -109,8 +109,13 @@ The workaround is a dedicated job that reads the secrets where it's allowed to, 
           else
             echo "ok=false" >> "$GITHUB_OUTPUT"
             echo "::error::Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID"
+            exit 1
           fi
 ```
+
+:::warning[This Job Is Supposed to Fail Red When Secrets Are Missing]
+The `exit 1` matters here in a way it wouldn't on [Template Repo CI](./template-repo-ci.mdx)'s preflight job. A template repo's whole point is that a fresh, unconfigured clone stays green -- missing secrets there is the expected first-run state. This is the opposite: it's the production workflow, secrets are supposed to already be configured, and a missing token means something regressed (an expired token, a deleted secret). Without `exit 1`, this step writes `ok=false` and still exits `0` -- `check-secrets` shows green, `migrate-d1` and `deploy` skip via their `if:` gates, and the whole run finishes green having deployed nothing. `exit 1` makes the job itself fail, which turns the run red and is what should page someone.
+:::
 
 Downstream jobs can then gate on that output, since `needs.<job>.outputs.*` (unlike `secrets`) is allowed in a job's `if:`:
 
@@ -134,7 +139,7 @@ If your Worker depends on D1 schema changes, apply migrations before the new cod
 ```yaml
   migrate-d1:
     name: Apply D1 Migrations
-    needs: [check-secrets]
+    needs: [build-site, check-secrets]
     if: needs.check-secrets.outputs.ok == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -149,6 +154,8 @@ If your Worker depends on D1 schema changes, apply migrations before the new cod
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 ```
+
+`needs: [build-site, check-secrets]` isn't just about the token gate. Gating on `check-secrets` alone lets the migration start as soon as secrets are confirmed present, in parallel with a `build-site` that's still running -- or that goes on to fail. Adding `build-site` to `needs:` keeps the schema from advancing ahead of code that might not even make it to deploy.
 
 :::warning[Migrate Before Deploy, Not After]
 List `migrate-d1` in the deploy job's `needs:` so the workflow fails fast if a migration errors, before any new code that expects the new schema goes live. Running migrations after deploy leaves a window where already-live code queries columns or tables that don't exist yet.
@@ -279,7 +286,7 @@ if (res.status >= 300 && res.status < 400) {
 
 A brand-new site's first deploy can legitimately fail every check above — DNS hasn't propagated, there's no content to match yet — and none of that means the deploy is broken. An established site failing the exact same checks means something regressed. One smoke test needs both behaviors, at different points in its life:
 
-- Unset / `false`: any failure (no DNS record, wrong status, redirect, missing marker) logs a warning and exits `0` — treated as "not live yet," not as a broken deploy.
+- Unset / `false`: any failure (no DNS record, a failed request, wrong status, redirect, missing marker) logs a warning and exits `0` — treated as "not live yet," not as a broken deploy.
 - `true`: the same failures exit `1` and fail the workflow.
 
 Leave it unset while a domain is new, then flip it to `true` in the repo's variables once the site is confirmed live — from that point on, the smoke test should never look away from a real regression.
@@ -312,7 +319,12 @@ if (!(await hasDnsRecord(target.hostname))) {
   skipOrFail(`${target.hostname} has no A/AAAA record yet`);
 }
 
-const res = await fetch(target, { redirect: "manual" });
+let res;
+try {
+  res = await fetch(target, { redirect: "manual" });
+} catch (err) {
+  skipOrFail(`request to ${target} failed: ${err.message}`);
+}
 
 if (res.status >= 300 && res.status < 400) {
   skipOrFail(`${target} redirected (${res.status}) instead of serving directly`);
@@ -324,6 +336,10 @@ if (res.status >= 300 && res.status < 400) {
   console.log(`smoke test passed: ${target} is serving ${marker}`);
 }
 ```
+
+:::tip[The DNS Check Doesn't Cover Every Way `fetch()` Can Throw]
+A resolvable A/AAAA record only proves the domain is routable -- it says nothing about whether TLS is provisioned yet or the route behind it is actually serving. `fetch()` still throws (rejects) for a cert that hasn't issued, a connection that's refused, or a route that's mid-propagation, and an uncaught rejection here crashes the script with a non-zero exit regardless of `SMOKE_REQUIRE_LIVE` -- bypassing `skipOrFail` entirely and hard-failing even in tolerant mode. Wrapping the `fetch()` call in `try`/`catch` and routing the error through `skipOrFail` keeps every failure mode, not just DNS, subject to the same tolerant-vs-strict switch.
+:::
 
 ### Wiring It Into the Workflow
 
@@ -353,7 +369,7 @@ if (res.status >= 300 && res.status < 400) {
 A static site's smoke test is a single `GET`. An API Worker's smoke test needs to prove the whole write path works, which means actually calling it: authenticate, create a record, verify it comes back correctly, then delete it. Two details make this safe to run on every deploy:
 
 - **A unique identity per run** — a timestamp plus a random suffix — so concurrent runs (two quick pushes) never collide on the same resource, and any record left behind is traceable back to the run that created it.
-- **`trap ... EXIT` for cleanup** — so the created record is deleted whether the script succeeds, fails at the verify step, or is killed by the job's `timeout-minutes`, not just on the happy path.
+- **`trap ... EXIT` for cleanup** — so the created record is deleted whether the script succeeds, fails at the verify step, or is killed by the job's `timeout-minutes`, not just on the happy path. The cleanup itself has to fail loudly too: a `DELETE` that silently no-ops leaves the test record behind with nothing in the job log saying so.
 
 ```bash
 #!/usr/bin/env bash
@@ -363,9 +379,15 @@ RUN_ID="smoke-$(date +%s)-$RANDOM"
 ITEM_ID=""
 
 cleanup() {
-  [ -n "$ITEM_ID" ] && curl -fsS -X DELETE "$API_URL/items/$ITEM_ID" \
-    -H "Authorization: Bearer $API_TOKEN" >/dev/null
-  return 0
+  local exit_code=$?
+  if [ -n "$ITEM_ID" ]; then
+    if ! curl -fsS -X DELETE "$API_URL/items/$ITEM_ID" \
+      -H "Authorization: Bearer $API_TOKEN" >/dev/null; then
+      echo "::error::cleanup failed to delete $ITEM_ID -- test record left behind"
+      [ "$exit_code" -eq 0 ] && exit_code=1
+    fi
+  fi
+  exit "$exit_code"
 }
 trap cleanup EXIT
 
@@ -380,6 +402,10 @@ curl -fsS "$API_URL/items/$ITEM_ID" -H "Authorization: Bearer $API_TOKEN" \
 
 echo "API smoke test passed for $RUN_ID"
 ```
+
+:::warning[A Cleanup Failure Can't Be Allowed to Look Like Success]
+`[ -n "$ITEM_ID" ] && curl ... ; return 0` -- the naive version of this trap -- always returns `0` from `cleanup`, no matter what the `curl -X DELETE` did. A failed delete (auth expired, network blip, the item already gone) then vanishes without a trace: the job goes green, and the test record stays in the database forever. `cleanup` captures `$?` on entry (`exit_code=$?`), so a failure earlier in the script — the verify step, the create step — is preserved and still exits the job non-zero, exactly as before. What's new is the other direction: if the script itself succeeded but the `DELETE` failed, `exit_code` gets bumped from `0` to `1` so a broken cleanup can't hide behind an otherwise-passing run. Either way, the explicit `exit "$exit_code"` at the end is what actually sets the job's outcome, not whatever bash would infer from the trap's own last command.
+:::
 
 :::warning[`trap ... EXIT` Only Survives Ordinary Failures]
 `trap ... EXIT` runs on a normal exit, an `exit` call, or `set -e` aborting the script — covering every failure path above. It does **not** run if the process is killed with `SIGKILL`, which is how some CI runners enforce a hard timeout. Keep `timeout-minutes` generous enough that the script's own logic is what ends the job, not the outer limit.
