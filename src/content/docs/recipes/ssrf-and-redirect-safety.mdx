@@ -30,9 +30,11 @@ The check below runs against `url.hostname` -- a string parsed out of the URL be
 | Blocked value | Why |
 | --- | --- |
 | `localhost` (hostname) and `127.0.0.0/8` (its IPv4 loopback range) | Loopback -- reaches the Worker's own runtime or a co-located service |
+| `0.0.0.0/8`, including bare `http://0/` | IPv4 unspecified address -- on many networking stacks this resolves locally, to "this host," the same class of target as loopback. `new URL()` normalizes the bare literal `0` to `0.0.0.0`, so `http://0/` reaches this range without ever writing a dotted-decimal IP |
 | `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | RFC 1918 private address ranges |
 | `169.254.0.0/16`, including `169.254.169.254` | Link-local range; `169.254.169.254` specifically is the well-known cloud instance-metadata endpoint on AWS, GCP, and Azure |
 | `::1` | IPv6 loopback |
+| `::` | IPv6 unspecified address -- the IPv6 analogue of `0.0.0.0` above |
 | `fc00::/7` | IPv6 unique local address (ULA) range -- the IPv6 analogue of RFC 1918 |
 | `fe80::/10` | IPv6 link-local range |
 | `::ffff:a.b.c.d` (IPv4-mapped IPv6) | An IPv4 address wrapped in IPv6 syntax -- must be unwrapped and re-checked, not treated as a distinct address family |
@@ -50,6 +52,7 @@ new URL("http://2130706433/").hostname; // "127.0.0.1" -- bare decimal integer
 new URL("http://0x7f000001/").hostname; // "127.0.0.1" -- bare hex integer
 new URL("http://017700000001/").hostname; // "127.0.0.1" -- bare octal integer
 new URL("http://127.1/").hostname; // "127.0.0.1" -- shorthand IPv4
+new URL("http://0/").hostname; // "0.0.0.0" -- bare zero, the unspecified address
 ```
 
 That last block is the reason the bare-integer row in the blocklist table matters: `2130706433`, `0x7f000001`, and `017700000001` are all valid URL host syntax for `127.0.0.1`, and `new URL()` folds every one of them into the same canonical dotted-decimal string. A naive guard that runs a dotted-decimal regex like `/^(\d{1,3}\.){3}\d{1,3}$/` against the **raw, unparsed** host string never matches `2130706433` at all -- it falls through as if it were an ordinary hostname, neither rejected nor recognized as an IP literal to range-check. Calling `new URL()` first and checking `.hostname` closes that gap by construction: by the time your code looks at it, every one of those forms has already become `127.0.0.1`.
@@ -74,6 +77,7 @@ interface Ipv4Range {
 // directly in a URL -- a DNS name that later resolves to one of these is a
 // different problem, covered above.
 const BLOCKED_IPV4_RANGES: Ipv4Range[] = [
+  { base: "0.0.0.0", bits: 8 }, // unspecified -- many stacks route this to "this host"
   { base: "127.0.0.0", bits: 8 }, // loopback
   { base: "10.0.0.0", bits: 8 }, // RFC1918 private
   { base: "172.16.0.0", bits: 12 }, // RFC1918 private
@@ -148,6 +152,7 @@ function isBlockedHost(hostname: string): boolean {
     const groups = expandIpv6(host);
     if (!groups) return true; // unparsable IPv6 literal -- fail closed
 
+    if (groups.every((g) => g === 0)) return true; // :: unspecified address
     if (groups.every((g, i) => g === (i === 7 ? 1 : 0))) return true; // ::1
     if ((groups[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 ULA
     if ((groups[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
@@ -191,17 +196,49 @@ Validating the entry URL is not enough. A URL that passes the check can still 30
 With the default redirect mode, `fetch()` resolves the whole redirect chain itself and hands back only the final response. Your `assertNotBlocked()` call never sees the intermediate hop, so a validated entry URL that redirects to a blocked host reaches it anyway. `redirect: "manual"` is what makes the redirect visible as a `Response` your code inspects before deciding whether to follow it.
 :::
 
+### Cross-Origin Hops Must Not Carry the Original Credentials or Body
+
+`redirect: "manual"` does not just make the redirect visible -- it also opts the guard out of everything native `fetch()` normally does when it follows a redirect for you: stripping `Authorization` and `Cookie` before crossing to a different origin, and downgrading a `301`/`302`/`303` to a bodyless `GET` when the original method was neither `GET` nor `HEAD`. A guard that re-fetches each hop by hand has to reimplement both, or `init` -- whatever the caller passed in, credentials and body included -- gets replayed unchanged against every hop, including one an attacker chose. Skipping this is exactly how a validated webhook URL that 302s to `https://attacker.example/collect` hands the attacker the caller's own `Authorization` header or session cookie.
+
 ```typescript
 const MAX_REDIRECTS = 5;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+// Headers that must never cross to a different origin on a redirect --
+// mirrors the Fetch standard's own cross-origin-redirect header stripping,
+// which redirect: "manual" opts this guard out of.
+const CROSS_ORIGIN_STRIPPED_HEADERS = ["authorization", "cookie"];
+
+function rebuildForRedirect(init: RequestInit, status: number): RequestInit {
+  const headers = new Headers(init.headers);
+  for (const name of CROSS_ORIGIN_STRIPPED_HEADERS) headers.delete(name);
+
+  const next: RequestInit = { ...init, headers };
+  const method = (init.method ?? "GET").toUpperCase();
+
+  // 301/302/303 downgrade any non-GET/HEAD method to GET and drop the body,
+  // the same as a browser and native fetch() -- 307/308 preserve both by design.
+  if (
+    (status === 301 || status === 302 || status === 303) &&
+    method !== "GET" &&
+    method !== "HEAD"
+  ) {
+    next.method = "GET";
+    next.body = undefined;
+  }
+
+  return next;
+}
 
 export async function fetchGuarded(input: string, init: RequestInit = {}): Promise<Response> {
   let currentUrl = validateOutboundUrl(input);
+  let currentOrigin = new URL(currentUrl).origin;
+  let currentInit = init;
 
   for (let redirectCount = 0; ; redirectCount++) {
-    const res = await fetch(currentUrl, { ...init, redirect: "manual" });
+    const res = await fetch(currentUrl, { ...currentInit, redirect: "manual" });
 
-    const isRedirect = res.status >= 300 && res.status < 400 && res.status !== 304;
-    if (!isRedirect) return res;
+    if (!REDIRECT_STATUSES.has(res.status)) return res;
 
     if (redirectCount >= MAX_REDIRECTS) {
       throw new Error(`SSRF guard: exceeded ${MAX_REDIRECTS} redirects fetching ${input}`);
@@ -222,17 +259,31 @@ export async function fetchGuarded(input: string, init: RequestInit = {}): Promi
     }
 
     assertNotBlocked(nextUrl); // same checks as the entry guard, every hop
+
+    if (nextUrl.origin !== currentOrigin) {
+      // Cross-origin hop: strip credentials and downgrade per Fetch's own
+      // redirect rules before following, so a validated entry URL that
+      // redirects off-origin can't hand the receiver an Authorization
+      // header, a session cookie, or a POST body it was never meant to see.
+      currentInit = rebuildForRedirect(currentInit, res.status);
+    }
+
     currentUrl = nextUrl.href;
+    currentOrigin = nextUrl.origin;
   }
 }
 ```
+
+:::tip[The alternative is rejecting cross-origin redirects outright]
+This recipe rebuilds the request instead of refusing to follow a cross-origin hop at all, because a link-preview generator or webhook-target guard often has a legitimate reason to follow a redirect onto a different host -- a URL shortener, a CDN, a signed-URL redirect -- and rejecting those outright would make the guard reject links that were never a threat. The cost is silence: a caller that actually needed `Authorization` or `Cookie` to reach the cross-origin target gets whatever unauthenticated response that origin returns, not an error from this guard. If the legitimate cross-origin destinations are known ahead of time, rejecting any redirect outside that allowlist -- the same allowlist argument made for the blocklist itself, above -- is the stronger choice.
+:::
 
 ```mermaid
 graph TB
   Start[Caller-supplied URL] --> Validate["validateOutboundUrl() -- new URL() + assertNotBlocked()"]
   Validate -->|blocked or malformed| Reject[Throw, never fetch]
   Validate -->|ok| Fetch["fetch(url, redirect: 'manual')"]
-  Fetch --> Status{3xx redirect?}
+  Fetch --> Status{"Redirect status (301/302/303/307/308)?"}
   Status -->|No| Return[Return response to caller]
   Status -->|Yes| Cap{redirectCount over limit?}
   Cap -->|Yes| RejectCap[Throw: too many redirects]
@@ -240,10 +291,12 @@ graph TB
   Loc -->|No| RejectLoc[Throw: malformed/missing Location]
   Loc -->|Yes| Recheck[assertNotBlocked on next hop]
   Recheck -->|blocked| RejectHop[Throw, stop following]
-  Recheck -->|ok| Fetch
+  Recheck -->|same origin| Fetch
+  Recheck -->|cross-origin| Rebuild["Strip Authorization/Cookie; GET + no body for 301/302/303"]
+  Rebuild --> Fetch
 ```
 
-Every hop -- including the first -- goes through the exact same `assertNotBlocked()`, so there is only one place the blocklist logic lives.
+Every hop -- including the first -- goes through the exact same `assertNotBlocked()`, so there is only one place the blocklist logic lives. A cross-origin hop additionally goes through `rebuildForRedirect()`, so the credentials the caller sent to the origin it explicitly chose never travel further than that origin.
 
 ## Part 2: Redirect-Target Sanitizer
 
@@ -254,11 +307,13 @@ A "redirect back to where you came from" flow -- most commonly a post-login `?ne
 - **Open redirect:** the value points off-site, and the login flow becomes a trusted-looking bounce to an attacker's page.
 - **Response splitting:** the value contains characters that corrupt the response the Worker itself sends -- most dangerously, embedded CR/LF bytes that inject additional header lines if the `Location` value ever ends up concatenated into a raw header string instead of going through the platform's `Headers` API.
 
-### Validate After Percent-Decoding, Exactly Once
+### Decode Exactly Once -- and That Decode Already Happened Upstream
 
-A check that scans the **raw, still-encoded** query value never sees the dangerous bytes -- `%0d%0a` reads as four harmless ASCII characters until it is decoded into an actual CR/LF pair. Validation has to run on the decoded string.
+A check that scans the **raw, still-encoded** query value never sees the dangerous bytes -- `%0d%0a` reads as four harmless ASCII characters until it is decoded into an actual CR/LF pair. Validation has to run on the decoded string, decoded **exactly once**: never decode in a loop until the string stops changing. Repeated decoding lets the attacker choose how many layers deep the real payload sits -- a value like `%250d%250a` should decode once to the literal four characters `%0d%0a` (harmless, no control bytes present) and stay that way; decoding it a second time turns it into a real CR/LF.
 
-Decode **exactly once**, and validate that single result -- never decode in a loop until the string stops changing. Repeated decoding lets the attacker choose how many layers deep the real payload sits: a value like `%250d%250a` decodes once to the literal four characters `%0d%0a` (harmless, no control bytes present) and should stay that way. Decoding it a second time turns it into real CR/LF -- a bug the sanitizer must not introduce by over-decoding what it was only ever supposed to check once.
+That one required decode already happens before `sanitizeRedirectTarget` ever sees the value: `URLSearchParams.get()` (a query parameter) and `request.formData().get()` (a POST field, as in [Password Gate](./password-gate.mdx#login-is-post-only-with-a-fixed-delay-on-failure)) both percent-decode their input once, as part of parsing the query string or form body. `sanitizeRedirectTarget` must treat what it receives as that one decode's result and validate it directly -- it must not call `decodeURIComponent()` on it again. Doing so is the same bug as the decode-loop above, just introduced by the sanitizer itself instead of a caller.
+
+Concretely: a destination whose own query string carries an encoded value -- say `/search?q=a%26role%3Dadmin`, where `%26` and `%3D` are that destination's own escaped `&` and `=` -- has to arrive double-escaped in the outer `next` parameter (`%2526`, `%253D`) to survive the trip through the outer query string. `URLSearchParams.get()` performs its one decode and hands `sanitizeRedirectTarget` exactly `/search?q=a%26role%3Dadmin`, the destination's own encoding intact. A second `decodeURIComponent()` call inside the sanitizer decodes that too, turning it into `/search?q=a&role=admin` -- a second query parameter, `role=admin`, injected into the URL the sanitizer hands back, that was never part of the original destination.
 
 ### Reject Control Characters and Backslash, Anchor to a Fixed Origin
 
@@ -266,38 +321,32 @@ Decode **exactly once**, and validate that single result -- never decode in a lo
 const SITE_ORIGIN = "https://app.example.com";
 
 /**
- * Sanitize a client-supplied redirect target (?next=, ?returnTo=, etc.) into
- * a same-origin path safe to send back in a Location header.
+ * Sanitize a redirect target (?next=, ?returnTo=, etc.) into a same-origin
+ * path safe to send back in a Location header. `next` must already be
+ * decoded by the caller -- e.g. `url.searchParams.get("next")` or
+ * `(await request.formData()).get("next")` -- this function does not
+ * decode it again.
  */
-export function sanitizeRedirectTarget(raw: string | null): string {
+export function sanitizeRedirectTarget(next: string | null): string {
   const FALLBACK = "/";
-  if (!raw) return FALLBACK;
-
-  // Decode percent-encoding exactly once, then validate this result and
-  // never decode again downstream.
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(raw);
-  } catch {
-    return FALLBACK; // malformed percent-encoding
-  }
+  if (!next) return FALLBACK;
 
   // Reject C0 control characters (includes CR and LF) and backslash.
   // Response-splitting needs CR/LF; the WHATWG URL parser treats "\" as a
   // path separator for special schemes, which is its own bypass -- see below.
-  if (/[\x00-\x1f\x7f\\]/.test(decoded)) {
+  if (/[\x00-\x1f\x7f\\]/.test(next)) {
     return FALLBACK;
   }
 
   // Must be a same-origin path. A protocol-relative "//host" is not fixed up
   // -- it is rejected outright, because a browser resolves it as absolute.
-  if (!decoded.startsWith("/") || decoded.startsWith("//")) {
+  if (!next.startsWith("/") || next.startsWith("//")) {
     return FALLBACK;
   }
 
   // Build the final URL against a fixed, hardcoded origin -- never against
   // request.url or a Host header, both of which are attacker-influenced.
-  const target = new URL(decoded, SITE_ORIGIN);
+  const target = new URL(next, SITE_ORIGIN);
   if (target.origin !== SITE_ORIGIN) {
     return FALLBACK; // defense in depth; unreachable given the checks above
   }
@@ -312,7 +361,7 @@ Constructing a `Headers` object with a raw CR/LF in a value throws (`TypeError: 
 
 ### Three Attack Shapes, Worked
 
-| Raw `next` value | After one percent-decode | What happens |
+| As written in the URL's query string | As received by `sanitizeRedirectTarget` (after `URLSearchParams`' one decode) | What happens |
 | --- | --- | --- |
 | `//evil.example/steal` | `//evil.example/steal` (nothing encoded) | Starts with `//`, rejected before `new URL()` runs. A browser resolves a protocol-relative `//evil.example` as `https://evil.example` -- same scheme, different origin -- which is exactly why this is refused outright rather than "fixed up" by prepending a slash. |
 | `%2Fdashboard%0D%0ASet-Cookie:%20evil=1` | `/dashboard\r\nSet-Cookie: evil=1` | The decoded string contains real CR/LF bytes, matched by the control-character check and rejected. Checking the raw, still-encoded value would have missed this entirely. |

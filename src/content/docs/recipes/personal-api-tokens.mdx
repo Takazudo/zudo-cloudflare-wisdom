@@ -211,7 +211,11 @@ export async function listTokens(env: Env, principal: string): Promise<TokenSumm
 
 The `/account/tokens` routes -- mint, list, revoke -- must authenticate the caller with their session, never with the API token itself. This is a separate rule from the double guard above, and it closes a different hole: even a token that is unexpired and unrevoked must never be accepted as credentials for managing tokens.
 
+A session cookie is authentication, not CSRF protection. It is ambient -- a browser attaches it to a cross-site request exactly as it does to a same-site one -- so `authenticate` below confirms the caller *has a valid session*, not that the caller *meant to make this request*. Every state-changing route here layers the Origin-tuple gate from [HTTP-only Cookie Sessions' CSRF section](./cookie-sessions.mdx#csrf-the-cookie-is-ambient) on top of that, checked only after the session is confirmed valid: no session yet -> `401` immediately, before there is any ambient credential worth protecting; valid session but the wrong `Origin` -> `403`.
+
 ```typescript
+import { isTrustedOrigin, requiresCsrfCheck } from "./csrf"; // see HTTP-only Cookie Sessions, CSRF section
+
 type AuthResult =
   | { kind: "session"; principal: string }
   | { kind: "token"; principal: string; tokenId: string };
@@ -245,6 +249,13 @@ export async function handleCreateToken(
     return new Response("Unauthorized", { status: 401 });
   }
 
+  // Session confirmed -- now confirm the request itself is trusted before
+  // it mutates anything. A crafted cross-site form POST rides the same
+  // ambient cookie `authenticate` just accepted; this is what stops it.
+  if (requiresCsrfCheck(request) && !isTrustedOrigin(request)) {
+    return new Response("Forbidden", { status: 403 });
+  }
+
   const { name } = (await request.json()) as { name: string };
   const minted = await mintToken(env, auth.principal, name);
 
@@ -259,26 +270,35 @@ export async function handleCreateToken(
 If a leaked token could authenticate to its own management routes, it would stop being a single, revocable credential and become a self-perpetuating one. An attacker holding one stolen token could list every other token's metadata to pick a target, mint new tokens that survive the owner revoking the one that leaked, or revoke the owner's own tokens to lock them out of the very API they need to clean up the breach. Requiring a session -- something an attacker holding only a leaked token does not have -- is what keeps a single compromised token a single, contained incident.
 :::
 
-`handleListTokens` and `handleRevokeToken` follow the identical shape: call `authenticate`, reject anything that isn't `kind === "session"`, only then touch `listTokens` / `revokeToken`.
+:::note[Why this route is reachable without a CORS preflight]
+`request.json()` parses the body regardless of the request's `Content-Type` header -- it happens to be JSON here, but nothing checks that the header actually said so. A cross-site `<form>` POST with `enctype="text/plain"` never triggers a CORS preflight, and its body can still be crafted to parse as the JSON this handler expects. A form is all a CSRF attempt needs here -- no `fetch()`, no custom headers, nothing a browser would flag before the request goes out. The Origin check above is what actually stops it; Content-Type sniffing would not.
+:::
+
+`handleListTokens` and `handleRevokeToken` follow the identical shape: call `authenticate`, reject anything that isn't `kind === "session"`. `handleRevokeToken` -- the other state-changing route here -- also applies the same `requiresCsrfCheck` / `isTrustedOrigin` gate before it touches `revokeToken`; `handleListTokens` is a `GET` and skips it, since `requiresCsrfCheck` already excludes safe methods.
 
 ## Tracking `last_used_at` Without a Race
 
 `verifyToken` above calls `ctx.waitUntil(touchLastUsed(...))` after the row is found -- the update happens after the response has already started, so it costs nothing on the request's critical path.
 
 ```typescript
+const LAST_USED_MIN_INTERVAL_MS = 60_000; // coalesce writes to at most once a minute per token
+
 async function touchLastUsed(db: D1Database, id: string, now: number): Promise<void> {
   await db
     .prepare(
       `UPDATE api_tokens
        SET last_used_at = ?
-       WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)`,
+       WHERE id = ?
+         AND (last_used_at IS NULL OR (last_used_at < ? AND ? - last_used_at > ?))`,
     )
-    .bind(now, id, now)
+    .bind(now, id, now, now, LAST_USED_MIN_INTERVAL_MS)
     .run();
 }
 ```
 
-The `WHERE last_used_at IS NULL OR last_used_at < ?` clause is not optional. A token used for automated, high-frequency API calls will have many requests in flight concurrently, each firing its own `waitUntil` write with its own `now` timestamp -- and `waitUntil` callbacks are not guaranteed to complete in the order the requests that scheduled them arrived. Without the monotonic guard, a request that started earlier (and so carries an earlier `now`) can have its write land *after* a request that started later, silently overwriting a fresher `last_used_at` with a stale one. With the guard, a write only ever moves the timestamp forward -- an out-of-order completion targeting an already-newer row simply matches zero rows and does nothing, exactly the same fenced-write shape as the completion write in [Idempotency-Key Ledger on D1](./idempotency-ledger.mdx#fencing-a-pending-reservation-takeover).
+The `last_used_at IS NULL OR last_used_at < ?` half of the predicate is not optional. A token used for automated, high-frequency API calls will have many requests in flight concurrently, each firing its own `waitUntil` write with its own `now` timestamp -- and `waitUntil` callbacks are not guaranteed to complete in the order the requests that scheduled them arrived. Without the monotonic guard, a request that started earlier (and so carries an earlier `now`) can have its write land *after* a request that started later, silently overwriting a fresher `last_used_at` with a stale one. With the guard, a write only ever moves the timestamp forward -- an out-of-order completion targeting an already-newer row simply matches zero rows and does nothing, exactly the same fenced-write shape as the completion write in [Idempotency-Key Ledger on D1](./idempotency-ledger.mdx#fencing-a-pending-reservation-takeover).
+
+The monotonic guard alone does not bound how *often* the row is written, only the order writes are allowed to land in. The same high-frequency token has a distinct `now` on nearly every request, so without a further check `touchLastUsed` would run a D1 write on almost every request that touches it -- `ctx.waitUntil` takes the write off the response's critical path, but does nothing to reduce the write volume D1 itself has to serialize, and that volume is what actually bottlenecks under enough traffic. The `? - last_used_at > ?` half of the predicate adds a floor: once `last_used_at` has been set inside the last `LAST_USED_MIN_INTERVAL_MS`, further writes are skipped until that window elapses, coalescing a token used many times a second down to one write per minute. This folds into the same `WHERE` clause rather than replacing the monotonic check -- monotonicity is what makes a stale write safe to skip, the interval is what makes skipping the common case instead of the exception.
 
 ## Route Table
 
@@ -301,7 +321,7 @@ graph TB
   Lookup -->|Row found| Guard{"revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now)"}
   Guard -->|Either predicate fails| Reject
   Guard -->|Both pass| Allow[Request authenticated as principal]
-  Allow --> Touch["ctx.waitUntil: monotonic last_used_at UPDATE"]
+  Allow --> Touch["ctx.waitUntil: monotonic, interval-throttled last_used_at UPDATE"]
   Touch --> Respond[Handle the request]
 ```
 
@@ -336,6 +356,6 @@ export default {
 
 ## See also
 
-- [HTTP-only Cookie Sessions](./cookie-sessions.mdx) -- the session-cookie auth that management routes require here.
+- [HTTP-only Cookie Sessions](./cookie-sessions.mdx) -- the session-cookie auth that management routes require here, and the source of the [Origin-tuple CSRF gate](./cookie-sessions.mdx#csrf-the-cookie-is-ambient) they layer on top of it.
 - [Idempotency-Key Ledger on D1](./idempotency-ledger.mdx) -- the same D1 fundamentals (conditional `UPDATE ... RETURNING`, fenced writes) applied to a different problem.
 - [Signing Webhooks with HMAC-SHA256](./webhook-signing.mdx) -- the other place this site hashes with Web Crypto, and why that one needs a constant-time compare while this one doesn't.

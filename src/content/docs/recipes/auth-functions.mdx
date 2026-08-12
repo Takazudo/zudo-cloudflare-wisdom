@@ -55,11 +55,12 @@ A JWT has three base64url parts: `header.payload.signature`. Verification means:
 
 Define the cache at module scope so it **survives across requests in the same isolate**. It refetches only when the 1-hour TTL expires or when a token references a `kid` not in the cache (key rotation).
 
-Three things keep this safe under load and with more than one issuer:
+Four things keep this safe under load and with more than one issuer:
 
 - **Keyed per issuer.** The cache, the in-flight fetch, and the forced-refetch cooldown are all keyed by the issuer domain (equivalently, the JWKS URL), so one isolate can safely serve several IdPs without their state colliding.
 - **In-flight dedup.** If several requests hit a cold or expiring cache at the same time, they share one outstanding fetch instead of each firing a separate request at the IdP.
 - **Forced-refetch cooldown.** A `kid` miss forces a refetch to pick up key rotation -- but without a limit, a stream of tokens carrying bogus `kid`s would force a refetch on every single request. The cooldown is gated on the last fetch **attempt**, not the last success, so a run of failed refetches doesn't reset the clock and let an attacker keep forcing new ones. A failed in-flight fetch is cleared immediately rather than cached, so a transient IdP outage doesn't get stuck failing forever.
+- **The cleanup chain's own rejection is consumed.** `.finally()` returns a second promise, separate from `inFlight`, and that second promise rejects too whenever the fetch fails -- nothing here awaits or catches it. Left alone, that is an unhandled rejection inside the Worker even when the caller of `fetchJwks` catches the original failure correctly, turning a handled IdP outage into an unrelated crash. A no-op `.catch()` on the `.finally()` chain consumes it without changing what the caller receives; `inFlight` itself, returned unwrapped below, still carries the real rejection.
 
 ```typescript
 // functions/auth/jwks.ts
@@ -134,7 +135,11 @@ export async function fetchJwks(
   inFlightFetches.set(domain, inFlight);
   // Clear on success AND failure -- a failed fetch must not be cached
   // forever, or every future call would replay the same rejection.
-  inFlight.finally(() => inFlightFetches.delete(domain));
+  // .finally() returns its own promise, which also rejects when `inFlight`
+  // does; the no-op .catch() consumes that second rejection so it never
+  // surfaces as unhandled. `inFlight` below is still the original, unwrapped
+  // promise, so the caller's own catch/try still sees the real failure.
+  inFlight.finally(() => inFlightFetches.delete(domain)).catch(() => {});
 
   return inFlight;
 }
