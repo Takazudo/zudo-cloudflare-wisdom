@@ -246,7 +246,7 @@ R2 keys built from client-influenced input need the same validation discipline a
 
 ### Charset and length
 
-Constrain any client-influenced portion of a key to a safe allowlist (`[a-zA-Z0-9_-]`, no `..`, no leading `/`, no control characters) before it becomes part of an R2 key. Validate length against the **UTF-8 byte count**, not the character count — R2 keys can be up to 1024 bytes, and multi-byte characters (CJK, emoji) can blow that budget well before 1024 *characters*. Prefer generating the key server-side (see [Immutable UUID keys](#immutable-uuid-keys)) and storing any client-supplied name as `customMetadata` instead of trusting it in the key path at all.
+Constrain any client-influenced portion of a key to a safe allowlist (`[a-zA-Z0-9_-]`, no `..`, no leading `/`, no control characters) before it becomes part of an R2 key. Validate length against the **UTF-8 byte count**, not the character count — R2 keys can be up to 1024 bytes, and multi-byte characters (CJK, emoji) can blow that budget well before 1024 *characters*. Prefer generating the key server-side (see [Immutable UUID keys](#pairing-r2-with-d1-immutable-uuid-keys)) and storing any client-supplied name as `customMetadata` instead of trusting it in the key path at all.
 
 ### Content-addressing and its encryption caveat
 
