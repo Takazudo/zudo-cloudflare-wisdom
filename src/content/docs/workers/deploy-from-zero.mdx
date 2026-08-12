@@ -217,7 +217,7 @@ Retry-and-tolerate is correct only for the **first** probe, and only until it su
 
 ## CI Deploys from the Committed Config
 
-CI redeploys on push to `main` using the **committed** `wrangler.jsonc` / `wrangler.toml` -- editing the file locally is not enough. If the committed config still contains `REPLACE_WITH_*` placeholders, CI keeps failing no matter how correct your local file is.
+CI redeploys on push to `main` using the **committed** `wrangler.jsonc` / `wrangler.toml` -- editing the file locally is not enough. If the committed config still contains `REPLACE_WITH_*` placeholders, CI keeps failing no matter how correct your local file is. That hard failure is the default behavior, not a platform requirement -- a template or fork repo can opt into failing gracefully instead; see [Template Repo CI](../cicd/template-repo-ci.mdx) for the self-skip preflight pattern.
 
 :::warning[Commit the real ids -- but never secrets]
 What belongs in the committed config: binding ids (D1 `database_id`, KV namespace `id`), public `vars` (e.g. a Firebase Web API key -- it's public by design), the Worker `name`, the `compatibility_date`.

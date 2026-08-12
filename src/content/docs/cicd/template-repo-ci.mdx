@@ -1,0 +1,226 @@
+---
+title: Template Repo CI
+description: A preflight pattern that skips deploy gracefully instead of failing when a template or fork repo has no Cloudflare secrets yet
+sidebar_position: 5
+---
+
+A template repo is designed to be cloned by people who haven't configured anything yet. If the deploy workflow just runs as written, its first CI run on every fresh clone fails -- not because anything is wrong, but because no one has added secrets or replaced the placeholder ids in the committed config. This page covers a preflight pattern that turns that unavoidable first-run gap into a graceful skip instead of a red X, plus a companion pattern for provisioning the resources a contributor needs without asking them to set up `wrangler` locally.
+
+## The Problem: A Red X Nobody Caused
+
+Template repos and boilerplate projects ship with an empty `CLOUDFLARE_API_TOKEN` and a committed `wrangler.jsonc` full of `REPLACE_WITH_*` placeholders -- see [Deploy from Zero](../workers/deploy-from-zero.mdx) for where those placeholders come from. Click "Use this template", push the very first commit, and the deploy job runs on schedule, hits the missing token or the placeholder id, and fails.
+
+Nothing is actually broken. The new owner hasn't done anything wrong -- they just haven't gotten to the configuration step yet. But the CI badge is red, and a red badge on commit one reads as "this template is broken" long before anyone has a chance to prove otherwise.
+
+## The Self-Skip Preflight Pattern
+
+The fix is a `preflight` job that runs ahead of deploy and checks two independent gates: is the token empty, or does the committed config still carry a placeholder. Either one failing means "not ready" -- the deploy job is skipped outright, while the build job, which needs no credentials, keeps running and stays green regardless.
+
+```yaml
+name: Production Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Check deploy readiness
+        id: check
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          READY=true
+
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            READY=false
+            echo "::notice::CLOUDFLARE_API_TOKEN is not set -- skipping deploy (template/fork repo)"
+          fi
+
+          if grep -q "REPLACE_WITH" wrangler.jsonc; then
+            READY=false
+            echo "::notice::wrangler.jsonc still has REPLACE_WITH_* placeholders -- skipping deploy"
+          fi
+
+          echo "ready=$READY" >> "$GITHUB_OUTPUT"
+
+  build-site:
+    name: Build Site
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build site
+        run: pnpm build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-out
+          path: dist/
+          retention-days: 1
+
+  deploy:
+    name: Deploy to Cloudflare Workers
+    needs: [preflight, build-site]
+    if: needs.preflight.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download site artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: dist-out
+          path: dist/
+
+      - name: Deploy to Cloudflare Workers
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+```
+
+:::tip[Match the grep target to your config dialect]
+The example greps `wrangler.jsonc`. If your project uses `wrangler.toml` instead, grep that file -- and if placeholders can also land in other committed files, list every file the preflight step needs to check.
+:::
+
+Three things make this work:
+
+- **Two independent gates, either one skips.** A missing token and a leftover placeholder are different failure modes with different fixes, but both mean "not ready to deploy" -- so both set `READY=false` and both get their own `::notice::` line. The contributor doesn't have to guess which one is the problem.
+- **`::notice::` puts the reason in the log, not just in a boolean.** GitHub Actions renders `::notice::` lines as annotations on the run summary -- visible without expanding a single step. The person reading it usually knows nothing about this repo's CI, so the message has to stand on its own.
+- **The `ready` output gates the deploy job, not a step inside it.** Because `deploy` declares `needs: [preflight, build-site]` and reads `needs.preflight.outputs.ready`, GitHub Actions marks the whole job **skipped** rather than running it partway and letting individual steps no-op. A skipped job renders as a neutral gray icon in the checks list, not red.
+- **The build job carries no credentials at all.** `build-site` never references `secrets.*`, so it succeeds identically whether or not the repo has been configured yet. That's what keeps the overall run green even before any secrets exist -- the thing that's actually not ready (the deploy) is the only thing that shows as skipped, and nothing shows as failed.
+
+## Why Green-With-Skipped-Deploy Beats a Red X
+
+GitHub Actions jobs have three terminal states: success (green check), failure (red X), and skipped (gray dash). Only failure blocks a required check -- to a human scanning the PR checks list or the repo badge, skipped and success both read as "did not block anything."
+
+A template repo that hard-fails the deploy job on every fresh clone teaches its own worst lesson: the very first CI run a new owner ever sees is red, for a reason that has nothing to do with anything they wrote. That sets a baseline of "red is normal here" -- exactly the condition under which a real break later goes unnoticed, because the signal has already been spent.
+
+Skipping instead of failing keeps the semantics honest: red still means "something is actually broken," skipped means "this step doesn't apply to you yet," and the `::notice::` annotation tells the new owner precisely what to do next -- set two secrets, replace one placeholder -- without them needing to read the workflow file to find out.
+
+:::info[Skipped jobs satisfy branch protection]
+A required check that resolves to `skipped` via a job-level `if:` is treated as passing by GitHub's branch protection rules, the same as `success`. Only `failure` blocks a merge, which is what makes this pattern safe to combine with required status checks on `main`.
+:::
+
+## Bootstrapping Resources via workflow_dispatch
+
+The preflight gate above assumes the contributor can produce a real KV namespace id (or D1 database id, R2 bucket, and so on) to paste over the `REPLACE_WITH_*` placeholder. But creating that resource with `wrangler kv namespace create` normally requires a locally authenticated `wrangler` -- one more setup step for someone who may not have Cloudflare credentials on their machine at all, even after they've added the two secrets to the repo.
+
+Since the repo's GitHub Actions secrets already hold working Cloudflare credentials (that's what made the preflight gate pass), a committed `workflow_dispatch` workflow can run the provisioning command in CI instead, using those same secrets, and print the resulting id in the job log for the contributor to copy:
+
+```yaml
+name: Bootstrap KV Namespace
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  create-namespace:
+    name: Create KV Namespace
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Create KV namespace
+        run: npx wrangler kv namespace create my-app-cache
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+```
+
+Run it from the **Actions** tab (`workflow_dispatch` only runs on demand, never on push or PR), then open the run's log. `wrangler kv namespace create` prints the id it just created:
+
+```
+Creating namespace with title "my-app-cache"
+Success!
+Add the following to your configuration file:
+{
+  "kv_namespaces": [
+    { "binding": "CACHE", "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }
+  ]
+}
+```
+
+The contributor's only manual step is copying that `id` into the binding already present in the committed `wrangler.jsonc`, replacing the placeholder, and committing. Nothing about the credentials ever leaves CI -- the contributor never sees the token, never installs `wrangler` locally, and never runs an authenticated command on their own machine.
+
+CI has no TTY to prompt against, so wrangler never asks to "add it on your behalf" here -- it just prints the id. That's the right outcome anyway: the write-back into the committed config should be a deliberate, reviewed commit, not the CLI editing the repo mid-workflow.
+
+:::warning[Re-running creates a new namespace, not an idempotent lookup]
+`wrangler kv namespace create` makes a new namespace on every run -- it doesn't check whether one with that title already exists. Treat the bootstrap workflow as a one-time step per resource, and delete any duplicates created by accidental re-runs from the Cloudflare dashboard.
+:::
+
+## Fork PRs Skip at the Job Level Too
+
+The preflight pattern above targets pushes to `main` on the repo itself, where secrets exist as soon as the owner adds them. Pull requests **from a fork** are a different situation: GitHub never injects repository secrets into a `pull_request`-triggered workflow run when the PR's head branch lives in a fork, regardless of whether the base repo has those secrets configured. That's a fixed platform security behavior, not something the workflow controls.
+
+For a PR-preview workflow that deploys per PR, the equivalent gate doesn't need to check for an empty token at all -- it can check whether the PR came from a fork directly, and skip the deploy job before it ever runs:
+
+```yaml
+  preview:
+    name: Preview Deploy
+    needs: [build-site]
+    if: github.event.pull_request.head.repo.fork == false && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # ...
+```
+
+This is the same shape as the preflight gate -- a job-level `if:` that resolves to `skipped` rather than `failure` -- applied to a condition GitHub already exposes on the event payload instead of one your own workflow has to compute. Combine it with the preflight pattern for the deploy job: fork PRs skip here for a different reason (no secrets were ever going to be present), same-repo pushes skip there when the repo genuinely isn't configured yet.
+
+:::warning[Dependabot PRs pass the fork check and still have no secrets]
+`head.repo.fork == false` is true for a Dependabot PR -- it's opened against the same repository, not a fork. But GitHub treats workflow runs triggered by Dependabot the same as fork PRs for secrets purposes regardless: `CLOUDFLARE_API_TOKEN` still resolves empty, and without the `github.actor != 'dependabot[bot]'` clause the preview job would run anyway and fail red on every dependency-bump PR. [GitHub's Dependabot documentation](https://docs.github.com/en/code-security/dependabot/working-with-dependabot/automating-dependabot-with-github-actions#accessing-secrets) covers the underlying restriction and the alternative of storing a separate Dependabot secret with the same name if those PRs genuinely need one.
+:::
+
+Related: [Deploy from Zero](../workers/deploy-from-zero.mdx) for the placeholder-config lifecycle this pattern reacts to, and [Production Deploy](./production-deploy.mdx) for the baseline workflow this preflight job extends.

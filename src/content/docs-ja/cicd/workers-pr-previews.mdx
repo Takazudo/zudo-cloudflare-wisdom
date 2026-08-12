@@ -1,0 +1,302 @@
+---
+title: Workers PR プレビュー
+description: スタンドアロン Workers 向けの PR ごとのプレビューデプロイ -- バージョンエイリアスを使う、Pages のブランチデプロイモデルとは別物
+sidebar_position: 7
+---
+
+[PR プレビュー](./pr-preview.mdx) は Pages のブランチデプロイモデルを扱っている -- push のたびに `--branch` 名から作られる URL が割り当てられ、ブランチと URL のマッピングは Cloudflare が管理する。スタンドアロン Workers にはこれに相当するフラグがない -- `wrangler deploy` に `--branch` は存在しない。このページは Workers ネイティブなレシピだ: バージョンをアップロードするが昇格はさせず、そのバージョンに PR ごとの安定したエイリアスを与える。
+
+## `wrangler deploy --env preview` が同時並行の PR に対応できない理由
+
+`--env preview` は固定された、名前の変わらないひとつの環境にデプロイする -- 常に同じ Worker、同じ URL。長期稼働するステージング環境がひとつだけならこれで問題ない。しかし PR プレビューが必要としているのは、開いている PR の数だけ並行して存在する、互いに独立した N 個のデプロイ先であり、`--env preview` が与えてくれるのは常にひとつだけだ。
+
+2 つ目の PR が並行して `wrangler deploy --env preview` を実行しても、2 つ目のプレビューが生まれるわけではない -- まったく同じ環境の上に、1 つ目の PR のコードを上書きするだけだ。最後にデプロイした PR が勝ち、それ以外の開いている PR の「プレビュー」は、誰か他の人のブランチを黙って配信するようになる。エラーは何も出ない。起きるのは、誰であれ先にプレビュータブをリロードした人が、間違ったアプリを目にするというだけのことだ。
+
+## デプロイではなくバージョンをアップロードする
+
+`wrangler versions upload` は新しい Worker の**バージョン**をアップロードするが、昇格はさせない -- `workers_dev` 経由であれ、カスタムドメイン経由であれ、gradual deployments 経由であれ、そこにトラフィックはルーティングされない。「コードを Cloudflare に置く」ことと「それをライブにする」ことを分離するのは、まさにプレビューが必要としているものだ: 開いている PR はそれぞれ自分のバージョンを並べてアップロードでき、どれが現在デプロイされているかを奪い合うことがない。
+
+それだけでは、アップロードされたバージョンの唯一のアドレスはバージョン id に紐づいたハッシュベースのプレビュー URL であり、覚えやすくはなく、push のたびに変わる。`--preview-alias` は、人間が選んだ安定した名前でこれを解決する:
+
+```bash
+npx wrangler versions upload \
+  --env preview \
+  --preview-alias "pr-${PR_NUMBER}" \
+  --message "Preview: PR #${PR_NUMBER}"
+```
+
+このエイリアスは `pr-<N>-<worker-name>.<subdomain>.workers.dev` に解決される。キーになっているのはバージョンではなく名前だ: 同じ PR に新しいコミットを push するたびにこのコマンドを再実行すれば、`pr-<N>` は新しいバージョンを指し直す。PR は push のたびに同じプレビュー URL を保ち続ける -- コメントへのリンクは一度貼れば、二度と更新する必要がない。
+
+これを「もうひとつの本番」ではなく「プレビュー」にしているのが `--env preview` だ: バインディングをトップレベルではなく `[env.preview.*]` から解決する。`[env.preview]` に専用の D1 データベース、KV ネームスペース、R2 バケットの id を持たせれば、エイリアスは本番データからも切り離される -- これを可能にしている非継承ルールについては [名前付き環境とサービスバインディング](../workers/wrangler-config.mdx#名前付き環境とサービスバインディング) を参照。これを省略するとどうなるかは、下の Danger を参照。
+
+## エイリアス URL は NDJSON から取り出す、標準出力からではなく
+
+PR コメントのステップに必要なのは値としてのエイリアス URL であって、CI ログを目で追って見つけるものではない。wrangler の人間向けの標準出力を URL っぽい文字列で grep するのは脆い -- 正確な文言も、前後の行も、ANSI カラーコードも、wrangler のリリースごとに予告なく変わる。そのテキストに依存した CI ステップは、次のバージョンアップで黙って壊れる。
+
+代わりに `WRANGLER_OUTPUT_FILE_PATH` でファイルを指定する。構造化出力に対応したコマンドはすべて、自分が行ったことを表す JSON オブジェクトを 1 行ずつ（ND-JSON）そのファイルに追記する。`versions upload` の行には、ここで必要になるフィールドがそのまま含まれている:
+
+```jsonc
+{"type":"version-upload","version":1,"worker_name":"my-worker","version_id":"...","preview_url":"...","preview_alias_url":"https://pr-41-my-worker.example.workers.dev","wrangler_environment":"preview","timestamp":"..."}
+```
+
+`preview_alias_url` が安定したエイリアス側のアドレスで、`preview_url` はそのバージョン自身のハッシュベースのアドレスだ。文章を解析するのではなく `jq` でフィールドを取り出す:
+
+```yaml
+- name: Upload preview version
+  id: preview
+  run: |
+    OUTPUT_FILE="$(mktemp)"
+    WRANGLER_OUTPUT_FILE_PATH="$OUTPUT_FILE" npx wrangler versions upload \
+      --env preview \
+      --preview-alias "pr-${PR_NUMBER}" \
+      --message "Preview: PR #${PR_NUMBER}"
+
+    PREVIEW_URL=$(jq -er 'select(.type == "version-upload") | .preview_alias_url' "$OUTPUT_FILE")
+    if [ -z "$PREVIEW_URL" ] || [ "$PREVIEW_URL" = "null" ]; then
+      echo "::error::wrangler did not emit a preview_alias_url -- check WRANGLER_OUTPUT_FILE_PATH output"
+      exit 1
+    fi
+    echo "preview_url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
+  env:
+    CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    PR_NUMBER: ${{ github.event.pull_request.number }}
+```
+
+:::tip[`type` でフィルタする]
+`WRANGLER_OUTPUT_FILE_PATH` は 1 回の実行で複数行たまることがある（ビルドのメタ情報や警告など）。1 行目だと決めつけず、常に欲しいエントリーの type を `select()` すること。
+:::
+
+:::warning[エイリアスが無いなら `null` を出力するのではなく、そのステップを失敗させる]
+素の `jq -r` は `preview_alias_url` が無いとき、リテラルな文字列 `null`（あるいは `select()` が何にもマッチしなければ何も出力しない）を出力しつつ、それでも `0` で終了する -- [上の前提条件](#エイリアス-url-が解決するまでに、3-つのことが揃っていなければならない)にある通り、これは Worker に保存されている subdomain の状態で `previews_enabled` が実際にはセットされていないときにいつでも起こりうる。チェックしないままだと、その `null` がそのまま `$GITHUB_OUTPUT` に書き込まれ、PR のプレビューリンクとして投稿されてしまう。`-er` は `null`/`false` という結果、あるいはマッチが 1 件もない場合に `jq` 自身を非ゼロで終了させ、その後の明示的な `if` は、周囲のシェルのエラー伝播がどう設定されていようと両方の形を捕まえる -- こうして壊れたアップロードは、死んだリンクを配ってしまう代わりに、このステップを大きな音を立てて失敗させる。
+:::
+
+## エイリアス URL が解決するまでに、3 つのことが揃っていなければならない
+
+このうちどれかひとつでも欠けていると、失敗は設定漏れではなく Workers の障害のように見える。
+
+**本当のゲートは Worker の subdomain 状態として保存されている `previews_enabled` フラグであって、設定ファイルに書かれている `workers_dev` / `preview_urls` の値そのものではない。** Cloudflare は Worker ごとに 1 つの API リソース（`.../workers/scripts/<name>/subdomain`）を持ち、そこに 2 つのフラグがある：`enabled` は本番の workers.dev ルートをゲートし、`previews_enabled` はすべてのエイリアス URL をゲートする。エイリアスが解決するのは、*保存されている* `previews_enabled` の値が `true` のときだけだ -- コミット済みの設定が今どう書かれているかと、Cloudflare がその Worker について現在ファイルに持っている値とは別の話だ。この保存された値を間違えると、単なる設定ミスより始末が悪くなる: `wrangler versions upload` は成功したままだし、エイリアス URL も表示され続け、ND-JSON の出力にも `preview_alias_url` は書き込まれる -- それなのに、その URL へのリクエストはすべて Cloudflare のエラー 1042 として返ってくる。アップロードのステップはそのフラグを*読む*だけで、誰かが本当にその URL を有効にしたいと思っているかどうかは一切確認しないからだ。
+
+**その保存状態を設定から書き込むのは `wrangler deploy` だけであり、このレシピの CI ステップが実際に実行している `wrangler versions upload` は決して書き込まない。** `deploy` は実行のたびに `workers_dev` / `preview_urls` から `enabled` / `previews_enabled` を計算し、両方を subdomain リソースに push する。一方 `versions upload --preview-alias` はエイリアス URL を出力するかどうかを決めるために*現在の* `previews_enabled` を読むだけで、どちらの値も書き換えない。`workers_dev = false` と `preview_urls = true` の組み合わせは、まさにこの理由で支持される意図的な設定だ -- 本番は workers.dev から外しつつ、プレビューは解決し続ける。ここで実際に人がハマる罠については [プレビュー URL が消える罠](../workers/static-assets.mdx#プレビュー-url-が消える罠) を参照：`preview_urls` は黙って `workers_dev` に合わせてデフォルト値を決めるので、`workers_dev = false` の横で `preview_urls` を未設定のままにしておくと、プレビューもデフォルトで無効になってしまう。設定を正しくし、それを push するために `wrangler deploy` を一度実行すれば（あるいは、一度もデプロイされたことのない Worker については下のブートストラップ呼び出しを使えば）、それ以降 CI が実行する `versions upload --preview-alias` は、その後 `workers_dev` が設定でどう書かれていようと影響を受けずに、同じ保存状態のまま解決し続ける -- `versions upload` はそもそもそのフィールドを二度と読まないからだ。上のエラー 1042 のケースが起きるのは、その push が一度も行われていない場合（まだ一度もデプロイされていない Worker。下のブートストラップの節を参照）、`deploy` が `workers_dev = false` かつ `preview_urls = true` を明示しないまま実行された場合、あるいはこのパイプラインの外側で何か -- ダッシュボードのクリック、生の API 呼び出し -- が `previews_enabled` をオフに切り替え、それ以降再デプロイされていない場合だ。
+
+**最初のバージョンが存在する前の 404 は想定内であり、ルーティングの失敗ではない。** そのエイリアスの下にまだ一度もバージョンをアップロードしていない Worker / 環境の組み合わせに対するエイリアス URL は、素の 404 を返す -- その背後にまだスクリプトがないだけだ。その PR に対する最初の `versions upload --preview-alias` が完了した瞬間に解消するので、バグとして追いかける必要はない。
+
+:::note[previews を有効化した直後の一時的な `10056` は許容する]
+このサイトの他の場所にある [CI トークンの落とし穴](../workers/deploy-from-zero.mdx) と同じルールだ: Cloudflare の正確なエラーコードは API のバージョンをまたいで変動するので、本当のシグナルは番号ではなくメッセージの方だ。`previews_enabled` を有効にした直後は、設定が伝播するまでの短い時間、エイリアス URL へのリクエストが `10056` を返すことがある。これは「まだ準備できていない」と捉えて 1 回だけリトライする -- [割り当て直後のカスタムドメイン](../workers/deploy-from-zero.mdx#割り当て直後のカスタムドメインはすぐには使えない) と同じ、最初の 1 回目のプローブに限定した寛容さであって、以降のすべてのリクエストに対する無条件の許容ではない。
+:::
+
+## 一度もデプロイされたことがない Worker で、プレビューをブートストラップする
+
+作られたばかりの Worker -- 初めての CI 実行で、まだ何もアップロードしていない -- には、プレビューエイリアスをぶら下げる先の workers.dev サブドメインとの関係がまだ存在しない。subdomain のエンドポイントは `.../workers/scripts/<name>/subdomain` というスクリプト単位のパスの下にあるので、そのスクリプトがすでに存在していることが前提になる -- Cloudflare がまだ見たことのない名前に対して呼び出すと、スクリプトが見つからないというエラーになる。まず Worker をアップロードし（この一度きりの呼び出しには `versions upload` を素のまま実行するだけでよく、エイリアスは不要）、それから subdomain の状態を明示的に登録する:
+
+```bash
+npx wrangler versions upload --env preview --message "Bootstrap: initial version"
+
+RESPONSE=$(curl -s -w '\n%{http_code}' -X POST \
+  "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${WORKER_NAME}/subdomain" \
+  -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data '{"enabled": true, "previews_enabled": true}')
+HTTP_STATUS=$(echo "$RESPONSE" | tail -n1)
+BODY=$(echo "$RESPONSE" | sed '$d')
+
+if [ "$HTTP_STATUS" -ge 400 ] || [ "$(echo "$BODY" | jq -r '.success')" != "true" ]; then
+  echo "::error::Failed to enable Worker subdomain/previews (HTTP ${HTTP_STATUS}): ${BODY}"
+  exit 1
+fi
+```
+
+「これが初回デプロイかどうか」を判定しようとするより、この subdomain 呼び出しを冪等にして毎回の CI 実行で走らせる方がいい: すでに登録済みの Worker に対して再度呼び出しても、それはエラーではなく現在の状態を返すだけの no-op になる。レスポンスボディの中の `10056`、`100116`、`100122` に注意しつつ、それでジョブを失敗させないこと -- この 3 つはいずれも、作られたばかりの Worker で subdomain の関係がまだ落ち着く途中の間、一時的に現れる。上の `10056` のときと同じく、正確なコードそのものより「1 回リトライして先に進む」ことの方が重要だ。それ以外で `success` チェックに失敗するものは一時的なものではなく本物の失敗であり、素の `curl -s` の中に消えてしまう代わりに、今は大きな音を立てて失敗するようになっている。
+
+## プレビューはデータのサンドボックスではない
+
+:::danger[プレビューが本番のデータを共有するのは、`[env.preview]` がそう再宣言したときだけだ]
+`wrangler versions upload` が分離するのは*コード*であって*データ*ではない -- そもそも名前付き環境の間でバインディングは継承されない。`[env.preview]` がバインディングを丸ごと宣言しなければ、そのバインディングは `--env preview` のもとで単に利用不可になる：実行時に undefined になるだけで、黙って本番に向けられるわけではない（この非継承ルールについては [名前付き環境とサービスバインディング](../workers/wrangler-config.mdx#名前付き環境とサービスバインディング) を参照）。本当に危険なのはその逆のミスだ：`[env.preview]` が D1 データベースや KV ネームスペース、R2 バケットを*再宣言している*のに、その id を本番自身のリソース id にしてしまっている場合 -- これは下の [共有された本番データベース](#d1-マイグレーションとプレビュー-共有された本番データベース-マージされていないマイグレーションが本番に着地する) の節が D1 について説明しているのとまったく同じパターンだ。どのバインディングであれこれをやってしまうと、エイリアスは本番が使っているのと同じ生きた行、同じ生きたキー、同じ本物のシークレットを通して解決されるようになる。書き込み経路にバグを抱えたレビュー前の PR ブランチは、サンドボックスを壊すのではなく、誰も本番だと思っていない URL 経由で本番を壊す。
+
+エイリアスを以前のバージョンに戻すのは、それが配信する*コード*を戻すことでしかない。そのバージョンがすでに行った書き込みまでは戻らない -- 付随するデータのロールバックは存在しない。`[env.preview]` のバインディングに、本番とは別のリソース id を与えることだけが緩和策であり、それは任意のハードニングではなく、「プレビュー」という言葉の意味そのものを成立させているものだ。
+:::
+
+分離はオール・オア・ナッシングではなく、バインディングごとに行うものだ。D1 と KV は分離しつつ、決済やメール送信のバインディングだけ、便宜上、本番と同じ id で再宣言されて本物のプロバイダーを指したまま、ということも十分にあり得る。真っ先に思い浮かぶものだけでなく、`[env.preview]` が宣言しているすべてのバインディングを、それが実際にどの id を指しているかまで含めて監査すること -- `[env.preview]` がそもそも宣言していないバインディングはデータ共有のリスクではなく、`--env preview` のもとで単に利用不可になっているだけであり、それは別途捕まえるべき別のバグだ。
+
+## D1 マイグレーションとプレビュー
+
+プレビューエイリアスの有用さは、それが見ているスキーマ次第で決まる。マイグレーションをどうやってそこに反映するかは、上で説明した 2 つのバインディング構成のどちらを選んだかに完全に依存する。
+
+### 分離されたプレビューデータベース: プレビューだけをマイグレーションし、本番には触れない
+
+`[env.preview]` の D1 バインディングが自分専用の `database_id` を指しているなら、その PR のマイグレーションはそこに適用すればよく、本番が影響範囲に入ることはない:
+
+```bash
+# Applies to env.preview's own database -- production is never touched.
+npx wrangler d1 migrations apply DB --env preview --remote
+```
+
+`--env preview` フラグは飾りではなく、構造を支えている部分だ。バインディングは環境ごとに存在するので（[名前付き環境とサービスバインディング](../workers/wrangler-config.mdx#名前付き環境とサービスバインディング) を参照）、これを落としてもエラーにはならない -- 代わりに `DB` が黙ってトップレベルのバインディングに対して解決されるだけだ:
+
+```bash
+# Missing --env: resolves DB against the TOP-LEVEL binding, i.e. production's
+# database, not the PR's isolated preview one. This applies the PR's
+# unreviewed migrations to production and reports success.
+npx wrangler d1 migrations apply DB --remote
+```
+
+:::warning[プレビューデータベースは 1 つだけで、PR ごとには無い]
+`[env.preview]` の `database_id` はコミット済み設定の中の単一の静的な値だ -- 開いているすべての PR のエイリアスは、この同じ 1 つのプレビューデータベースを通して解決され、PR ごとの専用コピーではない。ここでの「分離」は*本番から*分離されているという意味であって、同時に走る PR 同士の間で分離されているという意味ではない：同時に開いている 2 つの PR はこの 1 つの D1 を共有するので、PR #41 のマイグレーションや悪い書き込みが、その日のうちに PR #42 のプレビューに影響することがありうる -- たとえエイリアスやコードのバージョンが衝突することは一度もなくても。回避策は、どれだけ同時実行 PR 間の分離にコストをかける価値があるかによって 2 つある：プレビューデータベースに対するマイグレーションを直列化する（エイリアスのアップロードだけでなく、マイグレーションのジョブ自体をスコープにした `concurrency:` グループを使い、一度に 1 つの PR のマイグレーションしか走らないようにする）、あるいは PR ごとに新しいプレビュー用 D1 をプロビジョニングする（ワークフロー内で `wrangler d1 create` し、PR に合わせてマイグレーションと後片付けを行う）ことだ。独立したプレビューデータの方が、増えるプロビジョニングと後片付けの手間より価値があるならこちらを選ぶ。
+:::
+
+### 共有された本番データベース: マージされていないマイグレーションが本番に着地する
+
+もうひとつの正当な構成は、`[env.preview]` が D1 バインディングを再宣言しつつ、意図的に本番と**同じ** `database_id` を指すというものだ -- 2 つ目の D1 をプロビジョニングして同期し続けたくないチームもある:
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "app-db"
+database_id = "prod-db-id"
+
+[env.preview]
+[[env.preview.d1_databases]]
+binding = "DB"
+database_name = "app-db"
+# Same database_id as the top-level DB above -- deliberate, not an omission.
+# This is what makes the database "shared" rather than isolated.
+database_id = "prod-db-id"
+```
+
+この構成では、CI がその PR の**マージされていない**マイグレーションを、PR がマージされる前に本番へ直接適用しない限り、PR のプレビューは正しいスキーマを表示できない -- 代わりに着地させる、別のプレビューデータベースは存在しないからだ。この一点こそが、下で説明する additive-only の規律がここでは「あればいい」ものではなく必須である理由だ: レビュー前のブランチのマイグレーションが本物のデータベースに対して実行され、その PR が後でマージされずに放棄されたとしても、すでに適用されたものはそのまま適用され続ける。フレームワークレベルの取り消しは存在しない。
+
+### Additive-Only のガードと、その抜け道
+
+「Additive-only（追加のみ）」とは、PR のマイグレーションが追加すること -- 新しいテーブル、デフォルト値付きの新しい列、新しいインデックス -- しか許されず、現在デプロイされているコードが依存している何かを削除・リネーム・縮小することは決してない、という意味だ。これを慣習ではなく CI で強制する。ただし、メンテナーが実際に破壊的変更をレビュー済みという稀なケースのために、明示的な抜け道は用意しておく:
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - "migrations/**"
+
+jobs:
+  guard-migrations:
+    name: Additive-Only Migration Guard
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'allow-breaking-migration') }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Reject destructive statements in new migrations
+        run: |
+          NEW_FILES=$(git diff --name-only --diff-filter=A "${{ github.event.pull_request.base.sha }}...HEAD" -- migrations/)
+          for f in $NEW_FILES; do
+            if grep -Eiq '\bDROP (TABLE|COLUMN)\b|\bALTER TABLE .* RENAME\b|\bDELETE FROM\b' "$f"; then
+              echo "::error file=$f::Destructive statement in an additive-only migration set. Label the PR 'allow-breaking-migration' to override."
+              exit 1
+            fi
+          done
+```
+
+:::warning[`labeled` と `unlabeled` はトリガーに明示的に含める必要がある]
+`types:` を指定しない `pull_request` は `opened`、`synchronize`、`reopened` がデフォルトになる -- すでに開いている PR にラベルを追加する操作はこのセットに含まれないため、メンテナーが `allow-breaking-migration` を付けただけでは GitHub Actions はガードを再実行してくれない。次に push されるまで、チェックは赤いまま固まってしまう。抜け道用のラベルを付けた（あるいは外した）ときにガードが自律的に再評価されるよう、`labeled` と `unlabeled` を明示的にリストしておくこと。
+:::
+
+### 共有データベースへの適用は、毎回バックアップしてから
+
+ガードが捕まえるのは明らかに破壊的な SQL であって、マイグレーションが本物のデータに対しておかしくなり得るすべてのパターンではない。共有データベースに対する悪いマイグレーションにも復旧経路が残るよう、適用の前には毎回エクスポートする -- そして、ジョブより長生きする場所にエクスポートする。ランナーのディスクに置くだけでは足りない:
+
+```yaml
+- name: Back up shared database before migration
+  run: npx wrangler d1 export DB --remote --output "backup-pr-${PR_NUMBER}-$(date +%s).sql"
+  env:
+    CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    PR_NUMBER: ${{ github.event.pull_request.number }}
+
+- name: Upload backup artifact
+  uses: actions/upload-artifact@v7
+  with:
+    name: d1-backup-pr-${{ github.event.pull_request.number }}
+    path: "backup-pr-*.sql"
+    retention-days: 7
+
+- name: Apply migration
+  run: npx wrangler d1 migrations apply DB --remote
+  env:
+    CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+```
+
+アップロードのステップがない `wrangler d1 export` は、ジョブが動いている間だけ存在するエフェメラルなランナーのディスクに書き込むだけで、ランナーが破棄されればそれも一緒に消える。マイグレーションが何かを壊したと誰かが気づいたときには、もう復元できるものが何も残っていない。アップロードのステップがあってはじめて、「一瞬だけ存在したファイル」が実際の復旧経路になる。
+
+:::warning[共有データベースのエクスポートには本物の本番データが含まれうる]
+これは D1 構成のうち共有データベース側の話であり、このエクスポートはプレビュー用のコピーではなく本番のデータだ。GitHub Actions のアーティファクトはリポジトリへの読み取り権限を持つ人なら誰でも見える（パブリックリポジトリなら誰でも見える）ので、`retention-days` とリポジトリの可視性は、後回しにできるおまけではなくこの判断の一部として扱うこと。データベースに機微な情報が含まれるなら、ワークフローのアーティファクトではなく、アクセスが管理された安全な保存先にアップロードすること -- `git clone` できる人なら誰でも覗ける場所ではなく、チームがすでにアクセスを制限しているプライベートなクラウドストレージのバケットのような場所に。
+:::
+
+### `NOT NULL` にはやはり `DEFAULT` が要る
+
+`ADD COLUMN` は一見すると純粋に追加的に見えるが、それでも*現在デプロイされている*コード -- まだ生きていて、新しい列のことを一切知らない古いバージョン -- を壊すことがある:
+
+```sql
+-- Breaks the currently-deployed Worker: its INSERTs don't set `status`, and
+-- SQLite rejects the row because there's no DEFAULT to fall back on.
+ALTER TABLE orders ADD COLUMN status TEXT NOT NULL;
+
+-- Additive and backward-compatible: the currently-deployed Worker's INSERTs
+-- succeed by falling back to the default.
+ALTER TABLE orders ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';
+```
+
+上の grep ガードはこれを捕まえない -- `ADD COLUMN` は破壊的キーワードのリストに入っていないし、入れるべきでもない。ほとんどの `ADD COLUMN` 文こそが「additive」の意味そのものだからだ。これはレビュー時にチェックすべきものであり、CI で自動化できる種類のものではない。
+
+### 2 つのブランチが、同じマイグレーション番号を持つ
+
+`wrangler d1 migrations create` は `migrations/` にすでに存在するものを基準に、連番を振っていく。同じベースコミットから切られた 2 つの PR ブランチは、どちらも「次の番号」を受け取ることになる:
+
+```bash
+# Branch A (PR #41), created off main at commit X
+npx wrangler d1 migrations create DB "add-status-column"
+# -> migrations/0007_add-status-column.sql
+
+# Branch B (PR #42), created off the same commit X
+npx wrangler d1 migrations create DB "add-priority-column"
+# -> migrations/0007_add-priority-column.sql
+```
+
+どちらの PR にも git のコンフリクトは起きない -- ファイル名が違うからだ -- ので両方ともクリーンにマージされ、`main` には `0007` という番号を持つファイルが 2 つ存在することになる。wrangler がディレクトリ一覧をソートしたときに後にくる方が、もう一方の後に適用される。それを決めるのはファイル名であって、マージした順序でも、どちらのマイグレーションがもう一方に実際に依存しているかでもない。マージの直前にリベースして番号を振り直すか、PR のマイグレーション番号がベースブランチにすでに存在する場合に失敗する CI チェックを追加すること。
+
+## プレビューのライフサイクル: PR がクローズされると何が起きるか
+
+PR をクローズしてもマージしても、そのエイリアスは削除されない。このレシピのどこにもクリーンアップの呼び出しは存在せず、wrangler には `versions delete` に相当するコマンドもない -- エイリアスを早期に消すために手を伸ばせるコマンドがそもそもないということだ。`pr-41-my-worker.<subdomain>.workers.dev` は存在し続ける限り解決され続け、最後に指していたバージョンを配信し続け、`[env.preview]` が持つバインディングを通してデータを読み続ける。
+
+最終的にそれを回収するのは PR の状態ではなく、固定された上限だ: Cloudflare は Worker ごとに直近でデプロイされたエイリアスを最大 1,000 個まで保持し、新しいエイリアスがその数を超えるときに、最も長くデプロイされていないものから追い出していく。活発なリポジトリではこれが実質的な安全弁として働くが、静かなリポジトリでは、何か月も前にクローズされた PR のエイリアスが、いまだに生きてリクエストに応え続けていることもある。
+
+後から気づくのではなく、最初から設計に織り込んでおく価値がある含意が 2 つある。残り続けるエイリアスは、上の Danger で説明した危険性をそのまま抱えている -- `[env.preview]` のバインディングが分離されていなければ、古びて忘れられた PR プレビューは、無害な残骸ではなく本番への生きた扉のままだ。そして、エイリアスが期限切れになった後で PR が再オープンされてもエラーにはならない -- 次の `versions upload --preview-alias pr-<N>` が、最初のときとまったく同じように、そのエイリアスを新しく作り直すだけだ。
+
+## フォークからの PR: デプロイのステップだけでなく、ジョブ全体をスキップする
+
+[PR プレビュー](./pr-preview.mdx) では Pages 側の話を扱っている: PR がフォークからのものだと、GitHub は `pull_request` トリガーのワークフローにリポジトリのシークレットを渡さないため、`CLOUDFLARE_API_TOKEN` は空文字列になりデプロイのステップが失敗する。これは本物の失敗だ -- フォークからの貢献者の PR すべてに、その人のコードとは何の関係もない理由で赤い X が付く。
+
+その状態に失敗させるのではなく、ジョブそのものをスキップする:
+
+```yaml
+jobs:
+  preview:
+    name: Preview Deploy
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      # ...versions upload, migration apply, PR comment
+```
+
+ジョブレベルの `if:` は、チェックアウト、ビルド、versions upload、D1 マイグレーションの適用など、`CLOUDFLARE_API_TOKEN` に触れるものすべてを含むジョブ全体が、フォークからの PR に対しては一切開始されないことを意味する。表示は failed ではなく skipped になり、その中の何ひとつとして、実際の認証情報がスコープに入った状態で信頼できないコードに対して実行されることはない。
+
+`github.actor != 'dependabot[bot]'` の節は、フォークのチェックだけでは丸ごと見逃してしまうケースをカバーしている：Dependabot の PR は `head.repo.full_name == github.repository` を通過してしまう -- フォークではなくこのリポジトリに対して開かれる PR だからだ -- が、GitHub はフォークのときと同じように、Dependabot がトリガーしたワークフロー実行にはリポジトリのシークレットを渡さない。この actor のチェックがなければ、依存関係を上げる PR はすべてフォークのゲートを通過してジョブが走り、`CLOUDFLARE_API_TOKEN` が空のまま赤く失敗してしまう。
+
+:::warning[「フォークにはプレビューがない」ことへの修正は `pull_request_target` ではない]
+次にやってしまいがちなのが、トリガーを `pull_request_target` に切り替えることだ。これはフォークからの PR に対してもベースリポジトリのシークレットを使って実行される。これでシークレットが空になる症状は解消するが、ジョブがビルドのためにフォークの HEAD ref をチェックアウトし続けていると、はるかに悪い穴が開く: `pull_request_target` はワークフローにシークレットを渡し、そのコンテキストの中で攻撃者が制御できるコードをチェックアウトするということは、その install スクリプトやビルドステップ、テストコードがそのシークレットをスコープに入れたまま実行されるということだ。これは実際に起きた数多くのサプライチェーン侵害の背後にある、いわゆる「pwn request」の典型的なパターンだ。フォークからの貢献者に本当にプレビューが必要なら、それには意図的な二段階の設計が必要になる -- `pull_request` ではシークレットなしで信頼できないコードをビルドし、シークレットを持つ 2 つ目のジョブはメンテナーの承認の後ろにゲートする -- トリガーを一行書き換えるだけでは済まない。
+:::
+
+関連ページ: このレシピが依存している環境とバインディングのルールについては [Wrangler 設定](../workers/wrangler-config.mdx)、`preview_urls` の仕組みについては [Workers Static Assets](../workers/static-assets.mdx)、マイグレーションの一般的な使い方については [D1](../storage/d1.mdx)、Pages のブランチデプロイに相当するものについては [PR プレビュー](./pr-preview.mdx) を参照。

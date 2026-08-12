@@ -96,7 +96,7 @@ jobs:
 
 Until the `WORKERS_MIGRATION_ACTIVE` repository variable is set to `true`, `preflight` runs, evaluates to `active=false`, and `deploy` reports **skipped** -- not failed. The `Verify deploy credentials are set` step is why the preflight job matters and not just the flag check: a job-level `if:` skip means `deploy`'s own `env:` block is never evaluated while skipped, so a `secrets.CLOUDFLARE_API_TOKEN` reference sitting inside it proves nothing, and a missing secret resolves to an empty string rather than failing anything. Putting the presence check in the job that actually runs on every push -- `preflight` -- is what makes the claim true: that gets you a workflow that is merged, syntax-checked, and confirmed to have working deploy credentials on every push through the whole transitional window, without it being able to deploy anything by accident. Flip the variable once the token is updated and you've verified the first manual deploy, and the exact same PR-tested workflow starts deploying for real -- there's no separate "activation" code path to trust for the first time.
 
-The build/deploy job split itself follows the same shape as [Production Deploy](../cicd/production-deploy.mdx) -- only the preflight gate in front of it is new.
+The build/deploy job split itself follows the same shape as [Production Deploy](../cicd/production-deploy.mdx) -- only the preflight gate in front of it is new, and that self-skip preflight pattern is covered in more depth in [Template Repo CI](../cicd/template-repo-ci.mdx).
 
 ## DNS and Domain Cutover
 
