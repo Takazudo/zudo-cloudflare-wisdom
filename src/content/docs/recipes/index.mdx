@@ -18,3 +18,6 @@ Patterns extracted from production projects using Cloudflare Pages, Workers, and
 - [Cookie Sessions](./cookie-sessions.mdx) -- HttpOnly cookie sessions with refresh-token rotation
 - [Webhook Signing](./webhook-signing.mdx) -- HMAC-SHA256 request signing with Web Crypto
 - [Idempotency-Key Ledger on D1](./idempotency-ledger.mdx) -- claim-before-mutate idempotency keys with fingerprinting, fenced pending-reservation takeover, and a bounded ledger sweep
+- [SSRF and Redirect Safety](./ssrf-and-redirect-safety.mdx) -- an outbound-fetch SSRF guard with a full literal-host blocklist, plus percent-decode-safe sanitization for client-supplied redirect targets
+- [Password Gate for Preview and Staging Sites](./password-gate.mdx) -- a shared-password gate in front of every request, including static assets, with an integrity-checked marker cookie, POST-only login, and a brute-force delay
+- [Personal API Tokens](./personal-api-tokens.mdx) -- hash-only personal API tokens with mint-once secrets, double-guarded soft revoke, session-only management routes, and race-safe last-used tracking on D1
