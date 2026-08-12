@@ -1,0 +1,144 @@
+---
+title: Workers Cache（ctx.cache）
+description: エッジレベルの cache.enabled / ctx.cache 機能 -- バージョンの下限、Cache-Control/Cache-Tag/Vary、ctx.cache.purge のスコープ、Cf-Cache-Status、Next.js の ISR をめぐる論点、そして検証がデプロイ済み Worker に対してしか成立しない理由
+sidebar_position: 11
+---
+
+Workers Cache は Worker 自身のコードの手前に、エッジレベルの HTTP キャッシュを直接置く仕組みだ。設定で `cache.enabled` を有効にし、通常の `Cache-Control` ヘッダーを返せば、一致するリクエストは Worker を一切動かさずに Cloudflare のエッジから配信される。これは [Cache API](./local-dev-bindings.mdx)（`caches.default`）とは別の仕組みで、`wrangler dev` でローカルにエミュレートされるのは Cache API の方だけであり、Workers Cache はされない。また、[ハッシュ化アセットのブラウザキャッシュ](./static-assets-caching.mdx)にあるクライアント向けヘッダーとも別の関心事で、そちらは本ページ末尾のセクションで扱う。このページでは、Workers Cache の有効化、それを駆動するヘッダー、`ctx.cache.purge()`、`Cf-Cache-Status`、そしてなぜ検証がデプロイ済みの Worker に対してしか成立しないのかを扱う。
+
+## Workers Cache を有効にする: バージョンの下限は 4.69.0
+
+Workers Cache には [Wrangler 4.69.0 以上](https://developers.cloudflare.com/workers/cache/configuration/)が必要だ -- `[cache]` ブロックが「何も起きない」ときは、設定ミスだと決めつける前に `npx wrangler --version` で確認すること。古い CLI が原因のことがある。エントリポイントごとのキャッシュ -- 1 つの Worker が複数の `WorkerEntrypoint` クラスをエクスポートし、それぞれが自分のキャッシュを持つ構成 -- には、さらに高い下限、Wrangler 4.107.0 が必要になる。
+
+```jsonc
+// wrangler.jsonc -- the only field this table accepts is `enabled`.
+{
+  "cache": {
+    "enabled": true
+  }
+}
+```
+
+Cache API はカスタムドメインでしか機能しない（[ローカル開発: バインディング対応表](./local-dev-bindings.mdx)を参照）のに対し、Workers Cache はゾーンレスだ -- [Worker がどこで動いていようとそれに付いて回る](https://blog.cloudflare.com/workers-cache/): `*.workers.dev` でも、プレビュー URL でも、service binding の先でも、Workers for Platforms のテナント内でも、ゾーンに紐づいたカスタムドメインに限らず機能する。
+
+## Cache-Control、Cache-Tag、Vary
+
+Worker が返すレスポンスの `Cache-Control` こそが、Workers Cache がそれをキャッシュするかどうか、するとしてどれだけの期間かを判断する材料だ。明示的な `Cache-Control` がないレスポンスも丸ごとスキップされるわけではなく、[ステータスコードごとのデフォルト TTL](https://developers.cloudflare.com/workers/cache/configuration/)（`200` なら 2 時間、`404` なら 3 分）でキャッシュされる。
+
+```ts
+return new Response(body, {
+  headers: {
+    "content-type": "text/html",
+    // 1h fresh, then serve the stale copy immediately while regenerating
+    // in the background for up to 24h.
+    "cache-control": "public, max-age=3600, stale-while-revalidate=86400",
+    // Tags this response for later bulk purge -- see ctx.cache.purge() below.
+    "cache-tag": "blog-posts,blog-post-42",
+  },
+});
+```
+
+`Cache-Tag` は後でまとめてパージするためのラベルを付与する。タグは印字可能な ASCII に限られ、1 タグあたり 1024 文字、1 レスポンスあたり最大 1000 個までだ。Cloudflare はこのヘッダーをレスポンスがブラウザや別の Worker に届く前に取り除くので、エンドユーザーがこれを目にすることはない。
+
+`Vary` はキャッシュをヘッダー値ごとのバリアントに分割する:
+
+```ts
+return new Response(body, {
+  headers: {
+    "cache-control": "public, max-age=3600",
+    vary: "Accept-Language",
+  },
+});
+```
+
+Cloudflare は、列挙されたヘッダーの値の組み合わせごとに別々のキャッシュコピーを保持し、その値は正規化せずそのまま比較する -- `Accept-Language: en-US` と `en-us` は同じものに正規化されず、別のバリアントとして扱われる。`Vary: *` は特殊なケースで、「すべてに応じて分岐する」のではなく、そのレスポンスのキャッシュを完全に無効化する。
+
+キャッシュされるのは `GET` と `HEAD` のリクエストだけで、`POST` / `PUT` / `PATCH` などは常に Worker まで届く。ステータスが `206` や `520`-`526` のレスポンスも、上記のヘッダーにかかわらずキャッシュされない（[制限事項の一覧](https://developers.cloudflare.com/workers/cache/limitations/)）。
+
+## ctx.cache.purge(): スコープとトークン不要という点
+
+Worker は、[自分自身のキャッシュを](https://developers.cloudflare.com/workers/cache/purge/)自分のコードの中から無効化できる。別途 Cloudflare の API トークンも `Zone.Cache Purge` 権限のプロビジョニングも要らない -- `ctx.cache.purge()` は、それを呼び出したリクエストと同じ実行コンテキストの中で動き、その Worker であること自体が認証になる。
+
+```ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    if (new URL(request.url).pathname === "/admin/purge") {
+      await ctx.cache.purge({ tags: ["blog-posts"] });
+      return new Response("purged");
+    }
+    // ...
+  },
+};
+```
+
+同じ呼び出しは `ctx` を介さず、`cloudflare:workers` からのインポートでも使える:
+
+```ts
+import { cache } from "cloudflare:workers";
+
+await cache.purge({ pathPrefixes: ["/blog/"] });
+```
+
+`purge()` は `tags`、`pathPrefixes`、`purgeEverything: true` という互いに排他的な 3 つのオプションのうちどれか 1 つだけを受け取る。`pathPrefixes` はパスだけでマッチし、ホスト名やスキームによる絞り込みはできない。スコープは逆方向にも厳格だ -- パージは呼び出した側のエントリポイント自身がキャッシュしたレスポンスにしか届かない。ある Worker が別の Worker のキャッシュをパージすることはできず、同じ Worker 内の一方の `WorkerEntrypoint` が別のエントリポイントのキャッシュをパージすることもできない。「ホスト単位でパージする」モードも存在しない -- キャッシュはドメインではなく Worker に属するものなので、タグ、パスプレフィックス、全件のいずれかでしかスコープを絞れない。
+
+## Cf-Cache-Status
+
+レスポンスの `Cf-Cache-Status` は、そのリクエストが実際にどう扱われたかを示す（[完全なリファレンス](https://developers.cloudflare.com/workers/cache/debugging/)）:
+
+| Value | Meaning |
+| --- | --- |
+| `MISS` | Not cached (or the entry expired) -- the Worker ran and the response was stored |
+| `HIT` | Served straight from the edge -- the Worker did not run |
+| `EXPIRED` | A cached entry existed but its TTL had passed |
+| `REVALIDATED` | A stale entry was checked and confirmed still fresh |
+| `UPDATING` | A stale entry was served while a background refresh runs (`stale-while-revalidate`) |
+| `STALE` | A stale entry was served with no refresh in flight |
+| `BYPASS` | The response's own `Cache-Control` opted it out of caching |
+| `DYNAMIC` | Not eligible for caching at all -- wrong method, excluded status code, or similar |
+
+## Next.js と ISR: このページが代替するもの、しないもの
+
+Cloudflare は Workers Cache を、ISR（Incremental Static Regeneration）の仕組みと統合するものとしてではなく、それを直接置き換えるものと位置づけている: 「[Incremental Static Regeneration のようなフレームワーク固有の仕組みは要らない。本来あるべき形の、ただの HTTP キャッシュだ。](https://blog.cloudflare.com/workers-cache/)」上のセクションに出てきた `stale-while-revalidate` -- 古いコピーを即座に返しつつ、バックグラウンドで再生成する -- がまさにその代替であり、専用の ISR ランタイムなしに、素の `Cache-Control` の値だけで ISR のユーザー体験を再現する。
+
+ただし、この位置づけが当てはまるのは、自分のレスポンスを自分で所有している Worker に限られる。[OpenNext の Cloudflare アダプター](https://opennext.js.org/cloudflare/caching)経由でデプロイされた Next.js アプリの ISR は、OpenNext 自身の incremental cache によって提供されている -- R2 や KV に裏付けられ、リージョナルな読み取りスルー層として従来の Cache API（`caches.default`）を前段に置くこともある仕組みで、`cache.enabled` より前から存在し、現状ではそれと連携していない。このページの `ctx.cache.purge()` は OpenNext が管理する ISR ページを無効化しない -- そちらの再検証経路は、この機能とは別の、OpenNext 自身の incremental cache によって駆動されている。
+
+この記事の執筆時点では、[Cloudflare アダプターが標準で Workers Cache を組み込んでいるフレームワークは Astro だけ](https://blog.cloudflare.com/workers-cache/)であり、Cloudflare は今後さらにフレームワーク統合を増やすとしている。OpenNext の ISR 経路を通らない Next.js の Worker -- 自分のコードがレンダリングして返すルート -- であれば、上で扱った `Cache-Control: stale-while-revalidate` と `cache.enabled` の組み合わせが、そのまま直接的な代替になる。
+
+## ローカルシミュレーションは存在しない
+
+Workers Cache は `wrangler dev` の下では一切動かない -- Worker が何を返そうと、ローカルのレスポンスに `Cf-Cache-Status` が現れることはない。デプロイ時にしか存在しない機能だからだ。何がローカルでエミュレートされ、何がされないかの全体像は[ローカル開発: バインディング対応表](./local-dev-bindings.mdx)にまとめてある -- 要点だけ言えば、この機能はあの表の中でローカルへの経路がゼロである行の一つであり、だからこそ次のセクションではデプロイ済みの Worker に対して検証する。
+
+## デプロイ後に検証する: MISS -> HIT -> パージ -> MISS
+
+上に書いたことはどれもローカルでは観測できないので、`cache.enabled`、レスポンスの `Cache-Control`、`ctx.cache.purge()` が実際にかみ合っているかを確認する唯一の方法は、デプロイ済みの Worker に対する 4 回のリクエストの並びだ:
+
+```bash
+# 1. Cold, or right after a purge -- the Worker runs and the response is stored.
+curl -sI https://<worker>.<subdomain>.workers.dev/ | grep -i cf-cache-status
+# -> cf-cache-status: MISS
+
+# 2. Same URL again -- served from the edge, the Worker does not run.
+curl -sI https://<worker>.<subdomain>.workers.dev/ | grep -i cf-cache-status
+# -> cf-cache-status: HIT
+
+# 3. Hit a route that calls ctx.cache.purge() server-side.
+curl -sI https://<worker>.<subdomain>.workers.dev/admin/purge
+
+# 4. Same URL as steps 1-2 -- the purge cleared the entry, so the Worker runs again.
+curl -sI https://<worker>.<subdomain>.workers.dev/ | grep -i cf-cache-status
+# -> cf-cache-status: MISS
+```
+
+ユニットテストがパスしても、それが証明するのはハンドラが正しいヘッダーを返すことだけで、Cloudflare が実際にエッジでキャッシュして配信したかどうかは何も証明しない。それを確かめられるのは、この一連の手順だけだ。
+
+## `[cache]` にエディタの赤い波線が出る
+
+一部のエディタの汎用的な TOML/JSON スキーマリンターは、`[cache]` / `"cache"` を未知のキーとしてフラグを立てる。このテーブルが、エディタに同梱されたスキーマより新しいからだ。これは古びたリンターの問題であって、実際のエラーではない -- 同じテーブルについてすでに書かれている罠は [Wrangler 設定の `[cache]` テーブルの節](./wrangler-config.mdx#the-cache-table)を参照し、エディタの下線ではなく `npx wrangler deploy --dry-run` で確認すること。
+
+## Workers Cache と、ハッシュ化アセットのブラウザキャッシュの違い
+
+[ハッシュ化アセットのブラウザキャッシュ](./static-assets-caching.mdx)とこのページは、同じヘッダー `Cache-Control` を、2 つの別々のレイヤーが読んでいるという話だ。ブラウザはそれを読んで、自分のローカルコピーを問い合わせなしに再利用してよいかを判断する -- それがあちらのページで扱っている `_headers` の `immutable` ルールと、ナビゲーションのたびに発生する 304 のコストだ。Workers Cache は同じヘッダーを読んで、*Cloudflare のエッジ*が Worker を一切呼び出さずにコピーを再利用してよいかを判断する。1 つの値を、1 ホップ離れた 2 つの独立した消費者が読んでいるということだ -- あるレスポンスがブラウザでは `immutable` でありながら、エッジでは `stale-while-revalidate` である、ということが同時に成り立つ。一方を設定しても、もう一方が自動的に決まるわけではないからだ。
+
+実務上の違いはこうだ: ブラウザキャッシュがミスしても、コストは Cloudflare のエッジへのリクエスト 1 回分で済む（安くはあるが無料ではない）。エッジキャッシュの `HIT` は、エッジのレスポンスそのもの以外のコストがかからない。Worker のコードが一切動かないからだ。この 2 つは別の問題を解決している -- クライアントの往復を避けることと、Worker の呼び出しを避けること -- であり、あるレスポンスは両方に、どちらか一方だけに、あるいはどちらにも当てはまらない形で対応できる。
+
+関連ページ：[ローカル開発: バインディング対応表](./local-dev-bindings.mdx)は `wrangler dev` で何がエミュレートされ何がされないかについて、[Wrangler 設定](./wrangler-config.mdx#the-cache-table)は `[cache]` テーブルのエディタ誤検知について。
