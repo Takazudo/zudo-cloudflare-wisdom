@@ -213,7 +213,7 @@ Each layer absorbs loss from the layer below it -- list results that get filtere
 ## Gotchas
 
 - **Eventually consistent**: Reads immediately after writes may return stale data
-- **No compare-and-swap, and negative lookups are cached**: `put()` always overwrites unconditionally -- there is no atomic check-and-set, so two writers can each see a key as absent and both write, with no signal of the collision. A `get()` miss can also be cached at the edge, so a lookup can keep returning "not found" for a moment after another writer's `put()` for that key has already landed. Don't build dedupe, locking, or claim logic on KV -- that belongs in [D1's atomic dedupe & claims](./d1.mdx#atomic-dedupe-claims), which has the primitives (`ON CONFLICT`, `changes()`) this requires.
+- **No compare-and-swap, and negative lookups are cached**: `put()` always overwrites unconditionally -- there is no atomic check-and-set, so two writers can each see a key as absent and both write, with no signal of the collision. A `get()` miss can also be cached at the edge, so a lookup can keep returning "not found" for a moment after another writer's `put()` for that key has already landed. Don't build dedupe, locking, or claim logic on KV -- that belongs in [D1's atomic dedupe & claims](./d1.mdx#atomic-dedupe-and-claims), which has the primitives (`ON CONFLICT`, `changes()`) this requires.
 - **512-byte key limit**: Keys cannot exceed 512 bytes
 - **25 MiB value limit**: Values cannot exceed 25 MiB
 - **List pagination**: `list()` returns up to 1000 keys per call; use the `cursor` for pagination
