@@ -138,6 +138,18 @@ export async function sendWebhook(
 比較します。`computeHmacHex` はそのまま再利用でき、異なるのは向きだけです。
 
 ```typescript
+// Both `received` and `expected` are meant to be the same fixed-length hex
+// digest, so the length check below is safe: that length is public
+// (HMAC-SHA256's fixed digest size), not something derived from `secret`.
+function timingSafeEqualHex(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+
 /**
  * Verify an incoming webhook request.
  * Reads the RAW body once and hashes exactly those bytes.
@@ -153,15 +165,12 @@ export async function verifyWebhook(request: Request, secret: string): Promise<b
   const rawBody = await request.text();
   const expected = await computeHmacHex(rawBody, secret);
 
-  return received.length === expected.length && received === expected;
+  return timingSafeEqualHex(received, expected);
 }
 ```
 
-:::tip[一定時間での比較]
-堅牢な実装にするなら、2 つの 16 進ダイジェストを一定時間（constant time）で比較し、
-不一致がタイミングを通じて位置情報を漏らさないようにします。上記の長さチェックと
-直接の文字列比較は、多くの内部サービスでは十分です。エンドポイントが公開されている
-場合は一定時間比較の採用を検討してください。
+:::tip[ハッシュ優先の一定時間比較]
+`timingSafeEqualHex` はバイトの不一致では早期リターンしません -- 結果を決めるのはループによる一定時間の XOR だけです。対照的に素朴な `===` は 2 つの文字列が異なった瞬間にリターンしてしまうため、レスポンスのタイミングを十分な精度で計測できる攻撃者はそれを利用して正しい署名を 1 バイトずつ復元できてしまいます。これは、このサイトの他のシークレット比較レシピ全体で使われているのと同じ、ハッシュ優先・一定時間比較の形です -- 同じ手法を、すでに固定長のダイジェストではなく可変長のシークレット（パスワード）に適用した例については [パスワードゲート](./password-gate.mdx#パスワードの検証-まずハッシュ化し、それから一定時間で比較する) を参照してください。
 :::
 
 ## 関連: Workers での Web Crypto

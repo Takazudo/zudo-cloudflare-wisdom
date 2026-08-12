@@ -174,6 +174,10 @@ function timingSafeEqual(a: string, b: string): boolean {
 }
 ```
 
+:::tip[The early length check leaks nothing here -- HMAC-SHA256's digest length is public, not secret]
+`a.length !== b.length` above returns before the constant-time loop runs. That is safe specifically because both `hexSig` and `signature` are meant to be `v0=` plus a fixed 64-character SHA-256 hex digest -- the correct length is public knowledge, not something derived from the signing secret, so an early return on a length mismatch reveals nothing an attacker didn't already know. This stops holding the moment either side of the comparison is a variable-length secret instead of a public-length digest -- comparing a submitted password directly, for example, would leak the real password's length through that same early return. Hash a variable-length secret into a fixed-length digest first, then run the timing-safe compare on that -- see [Password Gate](./password-gate.mdx#verifying-the-password-hash-first-then-compare-in-constant-time) for the hash-first version of this same compare.
+:::
+
 ## Rate Limiting with KV
 
 Per-user rate limiting using KV with TTL-based expiration:
