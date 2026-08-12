@@ -6,13 +6,38 @@ sidebar_position: 1
 
 ## Pages プロジェクトの作成
 
-初回デプロイの前に、プロジェクトを作成します：
+初回デプロイの前に、プロジェクトを作成する：
 
 ```bash
-npx wrangler@4 pages project create zudo-cloudflare
+npx wrangler@4 pages project create zudo-cloudflare --production-branch=main
 ```
 
-または、最初の `pages deploy` で自動作成させることもできます。
+`--production-branch` は明示的に渡す。省略すると `project create` は本番ブランチを必要とし、本来はインタラクティブに尋ねてくる。しかし CI には尋ねる相手の TTY がないため、そこで止まるのではなく `Must specify a production branch.` で即座に失敗する。
+
+:::warning
+CI では `pages deploy` がプロジェクトを自動作成してくれると期待しないこと。Cloudflare 公式ドキュメントには `pages deploy` の自動作成パスが記載されているが、これはプロジェクト名と本番ブランチを尋ねるインタラクティブなプロンプト経由でしか発火しない。GitHub Actions のランナーには TTY がないため、そのプロンプトは表示されない。さらに悪いことに、`--project-name` を渡すと（下記の[デプロイコマンド](#デプロイコマンド)のように、CI では監査可能なログのために必要）、wrangler はプロジェクトが既存であることを前提とし、作成する代わりに `Project not found. The specified project name does not match any of your existing projects. [code: 8000007]` で失敗する。CI の初回デプロイ前には必ず `pages project create` を実行すること。これは現行の `wrangler@4` に該当する挙動で、自動作成プロンプトはインタラクティブ専用であり、非対話環境向けのフォールバックはドキュメント上存在しない。
+:::
+
+CI パイプラインでは、プロジェクトが既に存在していても再実行が失敗しないよう、作成ステップを冪等にする：
+
+```bash
+set +e
+create_output=$(npx wrangler@4 pages project create zudo-cloudflare \
+  --production-branch=main 2>&1)
+create_exit=$?
+set -e
+
+if [ "$create_exit" -ne 0 ]; then
+  if echo "$create_output" | grep -qiE "already exists|8000077|duplicate"; then
+    echo "Project already exists, continuing."
+  else
+    echo "$create_output" >&2
+    exit "$create_exit"
+  fi
+fi
+```
+
+許容するのは「既に存在する」系のシグネチャ（`already exists`、API エラーコード `8000077`、`duplicate`）のみ。認証エラー、レート制限、アカウント ID のタイプミスなど、それ以外の失敗はパイプラインを失敗させたままにする。
 
 ## デプロイコマンド
 
@@ -66,3 +91,15 @@ npx wrangler@4 pages deploy deploy --project-name=my-site --branch=main
 ```
 
 詳細は [ベースパスパターン](./base-path-pattern.mdx) を参照してください。
+
+## Pages CI のトラブルシューティング
+
+CI で `pages project create` / `pages deploy` を実行したときによく出る失敗のシグネチャと、その実際の原因：
+
+| シグネチャ | 原因 | 対処 |
+|---|---|---|
+| `[code: 10000]` / `Authentication error` | `CLOUDFLARE_API_TOKEN` が無効・期限切れ、または Pages 権限が不足している | Pages の "Edit" アカウント権限を付与したトークンを再発行し、CI のシークレットを更新する |
+| `More than one account available but unable to select one in non-interactive mode` | `CLOUDFLARE_ACCOUNT_ID` が未設定で、トークンが複数アカウントにアクセスできるため wrangler がどれか選べない | `CLOUDFLARE_ACCOUNT_ID` を明示的に設定する（上記の[環境変数](#デプロイコマンド-環境変数)参照） |
+| 冪等化した作成ステップが、プロジェクトが既に存在するのに失敗し続ける | 出力が `already exists` / `8000077` / `duplicate` のいずれにも一致しなかった | `create_output` を出力して確認する -- このパターンは意図的にこのシグネチャ群だけを許容している。それ以外（認証エラー、レート制限、クォータなど）は本物の失敗 |
+| wrangler が動く前にインストールステップが失敗する（例：`ERR_PNPM_OUTDATED_LOCKFILE`） | `package.json` がコミット済みのロックファイルから乖離しており、CI のインストールがロックファイル固定で実行されている | ローカルで `--frozen-lockfile` を外してインストールし、更新されたロックファイルをコミットする |
+| リトライを重ねてもデプロイが 5xx / ゲートウェイエラーで失敗し続ける | 設定の問題ではなく Cloudflare API 側の不安定さ | 再実行する前に [Cloudflare のステータスページ](https://www.cloudflarestatus.com/) を確認する |

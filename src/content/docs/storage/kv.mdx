@@ -148,9 +148,72 @@ async function checkRateLimit(
 KV is eventually consistent, so under high concurrency a few extra requests may pass through. This is fine for bot/API rate limiting. For precise counting, use [Durable Objects](../workers/durable-objects.mdx).
 :::
 
+## Pattern: Reverse-Chronological Feeds
+
+Building a "recent activity" or "latest posts" feed on KV means solving two problems: getting the ordering right, and not paying an unbounded fan-out cost to render it.
+
+### Sortable keys
+
+Give every feed item a key with an ISO-8601 timestamp so lexicographic key order matches chronological order:
+
+```typescript
+const key = `feed:${new Date().toISOString()}:${crypto.randomUUID()}`;
+await env.FEED.put(key, JSON.stringify(item));
+```
+
+`toISOString()` is fixed-width and zero-padded (`2026-08-12T03:15:22.123Z`), so string comparison and time comparison agree -- unlike `Date.now()` without padding or a random UUID, neither of which sorts chronologically.
+
+That gets chronological order, not *reverse*-chronological. `list()` only walks forward from the start of a prefix range -- there is no "start from the end" cursor. Left as plain ascending ISO-8601, the newest items sit at the tail of an ever-growing prefix, and reaching them means paging through the entire history first. Invert the timestamp instead, so the newest write is the smallest key and the first result from a plain `list()`:
+
+```typescript
+// Newest-first: invert the timestamp so ascending list() order is descending time order.
+const REVERSE_EPOCH_MS = 9999999999999; // safely past any real Date.now()
+function feedKey(id: string, when = new Date()): string {
+  const reversed = String(REVERSE_EPOCH_MS - when.getTime()).padStart(13, "0");
+  return `feed:${reversed}:${id}`;
+}
+```
+
+### The fan-out cost
+
+`list()` only returns key names and metadata -- never values. Rendering N feed items means N follow-up `get()` calls, and that fan-out, not the list itself, is the real cost.
+
+Layer the bound in three steps so a spike in feed volume, or a run of items that get filtered out, never turns into an unbounded burst of `get()` calls:
+
+```typescript
+interface FeedItem {
+  hidden: boolean;
+  // ...other fields
+}
+
+async function getFeed(env: Env, displayLimit = 6): Promise<FeedItem[]> {
+  // 1. List a candidate pool, oversized to absorb items filtered out in step 3.
+  const { keys } = await env.FEED.list({ prefix: "feed:", limit: 40 });
+
+  // 2. Bound the fan-out: fetch at most 20 bodies, regardless of how many
+  //    candidates step 1 returned.
+  const candidates = keys.slice(0, 20);
+  const items = await Promise.all(
+    candidates.map((k) => env.FEED.get<FeedItem>(k.name, "json")),
+  );
+
+  // 3. Bound what actually reaches the UI.
+  return items
+    .filter((item): item is FeedItem => item !== null && !item.hidden)
+    .slice(0, displayLimit);
+}
+```
+
+- **40** -- the `list()` call, sized with slack for items step 3 will drop (hidden, malformed, tombstoned)
+- **20** -- the hard ceiling on `get()` fan-out, independent of how many keys step 1 returned. This is the number that sets your worst-case subrequest count and CPU time, so pick it deliberately.
+- **6** -- what the feed actually displays, kept separate from the fan-out ceiling so a UI change (show 10 instead of 6) never touches the fetch-cost budget.
+
+Each layer absorbs loss from the layer below it -- list results that get filtered out, fetched items that turn out hidden -- without letting that loss silently balloon the number of KV operations.
+
 ## Gotchas
 
 - **Eventually consistent**: Reads immediately after writes may return stale data
+- **No compare-and-swap, and negative lookups are cached**: `put()` always overwrites unconditionally -- there is no atomic check-and-set, so two writers can each see a key as absent and both write, with no signal of the collision. A `get()` miss can also be cached at the edge, so a lookup can keep returning "not found" for a moment after another writer's `put()` for that key has already landed. Don't build dedupe, locking, or claim logic on KV -- that belongs in [D1's atomic dedupe & claims](./d1.mdx#atomic-dedupe-and-claims), which has the primitives (`ON CONFLICT`, `changes()`) this requires.
 - **512-byte key limit**: Keys cannot exceed 512 bytes
 - **25 MiB value limit**: Values cannot exceed 25 MiB
 - **List pagination**: `list()` returns up to 1000 keys per call; use the `cursor` for pagination

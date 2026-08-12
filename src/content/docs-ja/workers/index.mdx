@@ -31,4 +31,9 @@ Cloudflare Workers はエッジで実行されるサーバーレス関数。ス�
 - [互換性日付](./compatibility-dates.mdx) -- 互換性日付の理解と管理
 - [Durable Objects](./durable-objects.mdx) -- WebSocket Hibernation と SQLite バックの Durable Objects
 - [静的アセット](./static-assets.mdx) -- [assets] バインディング、run_worker_first、プレビュー URL の落とし穴
+- [ハッシュ付きアセットのブラウザキャッシュ](./static-assets-caching.mdx) -- コンテンツハッシュ付きバンドル向けの `_headers` immutable ルール、103 Early Hints、CSS 全文インライン化が誤った対処である理由
 - [ゼロからのデプロイ](./deploy-from-zero.mdx) -- リポジトリベースの Worker をゼロからプロビジョニングする際の非自明な罠
+- [ローカル開発: バインディング対応表](./local-dev-bindings.mdx) -- `wrangler dev` でどのバインディングがローカルエミュレートされるか、クレデンシャル不要な e2e 用の設定パターン
+- [ランタイムの落とし穴](./runtime-gotchas.mdx) -- self-fetch のホスト名、ストアされた fetch レスポンス、waitUntil / scheduled の予算、バインディングをラップするライブラリ、cloudflare:workers のアンビエント env、CORS と WebSocket
+- [Pages から Workers への移行](./pages-to-workers-migration.mdx) -- 最小限のダウンタイムで Pages から Workers Static Assets へライブサイトを移行し、うまくいかなかった場合にきれいにロールバックする
+- [Workers Cache（ctx.cache）](./cache-api.mdx) -- エッジレベルの cache.enabled / ctx.cache 機能 -- バージョンの下限、Cache-Control/Cache-Tag/Vary、ctx.cache.purge のスコープ、Cf-Cache-Status、Next.js の ISR をめぐる論点、そして検証がデプロイ済み Worker に対してしか成立しない理由

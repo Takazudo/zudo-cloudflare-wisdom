@@ -63,8 +63,202 @@ const batch = [
 await env.DB.batch(batch);
 ```
 
+## Multi-writer concurrency
+
+D1 executes every statement as real SQL against SQLite, but nothing about `env.DB.prepare(...).run()` stops two Worker invocations from reading the same row and writing back independently. When more than one writer can touch the same row around the same time, you need an application-level guard -- the Workers API does not hand you row locks.
+
+### Optimistic concurrency with a version column
+
+Add a `version` column, read it along with the row, and make every write conditional on that version still being what you read.
+
+```typescript
+interface Env {
+  DB: D1Database;
+}
+
+interface SeatRow {
+  id: number;
+  available: number;
+  version: number;
+}
+
+// Read
+const row = await env.DB.prepare(
+  "SELECT id, available, version FROM event_seats WHERE id = ?",
+).bind(eventId).first<SeatRow>();
+
+if (!row) throw new Error("event not found");
+
+// Guarded write -- only applies if version hasn't moved since the read
+const result = await env.DB.prepare(
+  `UPDATE event_seats
+   SET available = available - 1, version = version + 1
+   WHERE id = ? AND version = ? AND available > 0`,
+).bind(eventId, row.version).run();
+
+if (result.meta.changes === 0) {
+  // Lost the race -- another writer moved the row first. Re-read and
+  // retry, or surface a conflict to the caller.
+}
+```
+
+`meta.changes` is the number of rows the statement actually touched. A guarded UPDATE either matches your row (nobody else has written to it since your read) or matches nothing (somebody did).
+
+### The ABA problem -- why a version counter, not a value check
+
+It's tempting to skip the extra column and guard on the value you already have: `WHERE available = ?`. That works until the value revisits something it already was. If another writer decrements `available` and a later cancellation increments it back to the exact number you originally read, your `WHERE available = ?` guard matches even though the row -- and possibly other invariants -- changed in between. This is the classic ABA problem: the value looks unchanged (A) even though it went A -> B -> A while you weren't watching.
+
+A `version` column that only ever increases sidesteps this. It can only move forward, so "version still equals what I read" genuinely means "nobody has written to this row since I read it" -- no exceptions.
+
+### The zero-row-UPDATE trap
+
+An UPDATE whose WHERE clause matches zero rows is not a SQL error. D1 returns `{ success: true, meta: { changes: 0 } }` -- the same `success: true` you get when the update applies. Code that only checks `result.success`, or only checks that the call didn't throw, cannot tell a lost race from a real update.
+
+:::danger[Check meta.changes on every guarded write -- never just success]
+`result.success` means the SQL was valid and executed. It says nothing about whether your row changed. For a conditional UPDATE, or an `INSERT ... ON CONFLICT DO NOTHING` (see below), `result.meta.changes` is the only reliable signal.
+:::
+
+If you write through an ORM (Drizzle, Kysely, or similar) instead of `env.DB.prepare(...)` directly, confirm its update result actually surfaces the changed-row count before relying on it for this guard. Some query builders return only the mapped result rows, and an empty array on a zero-row match is easy to conflate with "no matching row existed at all" -- which hides exactly the case you're trying to detect. When in doubt, drop to a raw `env.DB.prepare(...).run()` for the guarded write and read `meta.changes` yourself.
+
+### Worked example: two writers racing on one row
+
+Take a seat-reservation row with one seat left: `available = 1, version = 5`. Writer A and Writer B each handle a reservation request for the same event within the same moment of network jitter.
+
+1. **Both read.** A and B each run the SELECT above and both see `{ available: 1, version: 5 }`. Neither has written anything yet -- this is the race window.
+2. **Writer A writes first.** A runs the guarded UPDATE bound to `version = 5`. The row's version is still 5, so the WHERE clause matches: `available` becomes `0`, `version` becomes `6`. A receives `{ success: true, meta: { changes: 1 } }` and confirms the reservation to its caller.
+3. **Writer B writes second.** B runs the identical UPDATE, also bound to `version = 5`. But the row's version is now `6` -- A already moved it. The WHERE clause matches zero rows. B receives `{ success: true, meta: { changes: 0 } }`.
+4. **Writer B checks its guard.** Because `meta.changes === 0`, B knows it lost the race. It re-reads the row (`available: 0, version: 6`), sees nothing left to sell, and returns "sold out" to its caller instead of a false confirmation.
+
+Had Writer B checked only `result.success`, it would have seen `true` at step 3 and confirmed a seat that no longer exists -- an overbooking bug that only shows up under concurrent load, which is exactly the failure this guard exists to catch.
+
+## Atomic dedupe and claims
+
+### Why KV can't do this
+
+Workers KV is eventually consistent -- a `put()` can take up to 60 seconds to propagate everywhere -- and it has no compare-and-swap. `put()` unconditionally overwrites whatever was there. Two Workers can both read a miss for the same key and both call `put()`; neither call fails, and there's no server-side way to ask "only write this if it doesn't already exist." KV is fine for caching, but it cannot give you an atomic first-writer-wins claim.
+
+D1 can, because SQLite gives you real constraints and transactions: a `PRIMARY KEY` or `UNIQUE` column lets an `INSERT` atomically fail or no-op when a row already exists, and you get a reliable answer to "was I first?"
+
+### Atomic dedupe with INSERT ... ON CONFLICT DO NOTHING
+
+```sql
+CREATE TABLE claims (
+  idempotency_key TEXT PRIMARY KEY,
+  claimed_by      TEXT NOT NULL,
+  claim_token     INTEGER NOT NULL DEFAULT 1,
+  lease_until     INTEGER NOT NULL
+);
+```
+
+```typescript
+const claim = await env.DB.prepare(
+  `INSERT INTO claims (idempotency_key, claimed_by, lease_until)
+   VALUES (?, ?, ?)
+   ON CONFLICT(idempotency_key) DO NOTHING`,
+).bind(key, workerId, Date.now() + LEASE_MS).run();
+
+if (claim.meta.changes === 0) {
+  // A row for this key already existed -- this is a duplicate. Skip the
+  // side-effecting work (or return the cached result of the first attempt).
+} else {
+  // We created the row -- we own this key. Proceed.
+}
+```
+
+### The ON CONFLICT + SELECT changes() same-batch rule
+
+`claim.meta.changes` above is the simplest and always-correct way to read this -- it comes back on the INSERT's own response, so use it. The trap shows up if you instead reach for SQLite's `changes()` SQL function in a follow-up statement, for example because you're chaining logic that needs to branch on the row count inside SQL rather than in JS. `changes()` reports the row count of the *immediately preceding statement on the same connection*, and D1 only guarantees that "same connection" relationship for statements sent together in one `env.DB.batch([...])` call. A `SELECT changes()` issued as its own separate `.prepare().run()` after an unrelated earlier call is not guaranteed to see that call's result.
+
+:::tip[Keep changes()-dependent statements in the same batch, or skip it entirely]
+If you need `changes()` in SQL, put the write and the `SELECT changes()` in the same `env.DB.batch([...])` array. Otherwise, don't reach for `changes()` at all -- every `D1Response` already carries `meta.changes` for its own statement.
+:::
+
+### Claim-token fencing
+
+A one-time dedupe check is enough to reject duplicates, but a claim that grants exclusive ownership over a longer piece of work needs more: you have to stop a claimant that has stalled -- a GC pause, a network partition, a retry that fires late -- from writing back after someone else has since re-claimed the same key.
+
+The fix is a fencing token: a number that only increases, handed out on every claim. The claimant carries it through every follow-up write, guarding each one with `WHERE idempotency_key = ? AND claim_token = ?`. A stale claimant's token no longer matches once someone else has re-claimed the row, so its writes become no-ops (`meta.changes === 0`) instead of clobbering the new claimant's work -- the same zero-row-UPDATE signal from the concurrency section above, reused as a fencing check.
+
+### Bounded leases
+
+An unconditional claim that never expires is a liveness hazard: if the claiming Worker crashes mid-work, the key stays claimed forever and nobody can retry it. Claims must be reclaimable once their lease has passed:
+
+```sql
+INSERT INTO claims (idempotency_key, claimed_by, claim_token, lease_until)
+VALUES (?, ?, 1, ?)
+ON CONFLICT(idempotency_key) DO UPDATE SET
+  claimed_by  = excluded.claimed_by,
+  claim_token = claims.claim_token + 1,
+  lease_until = excluded.lease_until
+WHERE claims.lease_until < ?
+RETURNING claim_token;
+```
+
+Winning the claim -- either the row was unclaimed, or you reclaimed an expired lease -- is only half of what this statement needs to hand you: the caller also needs the `claim_token` this specific claim now owns, to carry through every fenced write that follows. Reading `meta.changes === 1` tells you that you won, but not what the token became; a separate `SELECT claim_token FROM claims WHERE idempotency_key = ?` issued afterward is not safe, because another Worker's reclaim can land in the gap between your UPSERT and that `SELECT`, and you'd read its token instead of your own. `RETURNING claim_token` closes that gap by handing back the value atomically, from the same statement that produced it:
+
+```typescript
+interface ClaimRow {
+  claim_token: number;
+}
+
+const now = Date.now();
+const claimed = await env.DB.prepare(
+  `INSERT INTO claims (idempotency_key, claimed_by, claim_token, lease_until)
+   VALUES (?, ?, 1, ?)
+   ON CONFLICT(idempotency_key) DO UPDATE SET
+     claimed_by  = excluded.claimed_by,
+     claim_token = claims.claim_token + 1,
+     lease_until = excluded.lease_until
+   WHERE claims.lease_until < ?
+   RETURNING claim_token`,
+)
+  .bind(key, workerId, now + LEASE_MS, now)
+  .first<ClaimRow>();
+
+if (!claimed) {
+  // Someone else still holds an active lease -- back off.
+} else {
+  // We now own the row. claimed.claim_token is the fencing value for THIS
+  // claim -- read it here, not from a follow-up SELECT.
+  const claimToken = claimed.claim_token;
+}
+```
+
+A non-null `claimed` means you now own the row and `claimed.claim_token` is the value to fence every subsequent write on. A `null` result means someone else still holds an active lease -- back off.
+
+### Heartbeat leases -- the middle ground
+
+A fixed lease duration is a tradeoff either way: too short, and you risk reclaiming a still-healthy worker in the middle of genuinely slow work; too long, and a crash takes that long to recover from. A heartbeat splits the difference: the claimant periodically extends its own lease while it's still alive (`UPDATE claims SET lease_until = ? WHERE idempotency_key = ? AND claim_token = ?`), so the lease window only has to cover the gap *between* heartbeats, not the whole job. A crashed claimant stops heartbeating and is reclaimed quickly; a slow-but-alive one keeps renewing and is never reclaimed, no matter how long the job legitimately runs.
+
+See [Cron-Triggered D1 Work Queue](../recipes/cron-d1-queue.mdx#claiming-rows-against-overlapping-ticks) for this lease pattern applied to a real polling queue.
+
+## Time Travel backups
+
+D1's [Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/) is automatic point-in-time recovery -- there's no snapshot schedule to configure. Every write is retained so the database can be restored to any minute within the retention window: 30 days on the Workers Paid plan, 7 days on the Workers Free plan.
+
+Internally, D1 tracks restore points as "bookmarks" -- deterministically derived from a timestamp and sortable oldest to newest. Restoring to a bookmark doesn't discard the bookmarks that came before it, so a bad restore is itself recoverable by restoring again to the bookmark from just before the mistake.
+
+```bash
+# Get the current bookmark
+npx wrangler d1 time-travel info my-database
+
+# Get the bookmark for a specific past moment
+npx wrangler d1 time-travel info my-database --timestamp="2026-08-01T00:00:00Z"
+
+# Restore to a specific point in time
+npx wrangler d1 time-travel restore my-database --timestamp=1735689600
+
+# Restore to a specific bookmark
+npx wrangler d1 time-travel restore my-database --bookmark=00000041-00000000-00004c4f-f4027f22834a840cd11289ad74a30edb
+```
+
+:::warning[Restore overwrites, it doesn't branch]
+`time-travel restore` overwrites all current data in the database in place -- it is not a copy-on-write branch you can inspect side by side with production. Capture the bookmark it prints before you restore, so a restore to the wrong point can itself be undone.
+:::
+
 ## Gotchas
 
 - **SQLite syntax**: D1 uses SQLite, not PostgreSQL or MySQL. Some SQL features differ (e.g., no `ALTER TABLE ... ADD CONSTRAINT`).
 - **Size limits**: Each database has a 10 GB limit on the free plan.
+- **Row size cap**: a single row (all its columns combined) is capped at 2,000,000 bytes (2 MB) -- a byte limit, not a character limit. Multi-byte UTF-8 text (Japanese, emoji, etc.) hits the cap at a far lower character count than an equivalent-length ASCII string, so budget row size in encoded bytes, not `.length`.
 - **Migrations**: Always test migrations locally with `--local` before applying to production with `--remote`.

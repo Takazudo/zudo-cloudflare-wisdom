@@ -138,6 +138,18 @@ over the raw body and compares. `computeHmacHex` is reused unchanged — only th
 direction differs.
 
 ```typescript
+// Both `received` and `expected` are meant to be the same fixed-length hex
+// digest, so the length check below is safe: that length is public
+// (HMAC-SHA256's fixed digest size), not something derived from `secret`.
+// It also guarantees the two encoded buffers are the same length, which
+// crypto.subtle.timingSafeEqual() requires: it throws, rather than
+// returning false, on a length mismatch.
+function timingSafeEqualHex(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  const encoder = new TextEncoder();
+  return crypto.subtle.timingSafeEqual(encoder.encode(a), encoder.encode(b));
+}
+
 /**
  * Verify an incoming webhook request.
  * Reads the RAW body once and hashes exactly those bytes.
@@ -153,15 +165,24 @@ export async function verifyWebhook(request: Request, secret: string): Promise<b
   const rawBody = await request.text();
   const expected = await computeHmacHex(rawBody, secret);
 
-  return received.length === expected.length && received === expected;
+  return timingSafeEqualHex(received, expected);
 }
 ```
 
-:::tip[Constant-time comparison]
-For a hardened implementation, compare the two hex digests in constant time so a
-mismatch does not leak position information through timing. The length check
-above plus a direct string compare is adequate for many internal services; reach
-for a constant-time compare when the endpoint is publicly exposed.
+:::tip[Hash-first, timing-safe compare]
+`timingSafeEqualHex` never returns early on a byte mismatch -- only
+`crypto.subtle.timingSafeEqual()`'s constant-time comparison decides that. A
+naive `===`, by contrast, returns the moment the two strings diverge, and an
+attacker who can measure response timing precisely enough can use that to
+recover the correct signature one byte at a time.
+`crypto.subtle.timingSafeEqual()` is the Workers runtime's own primitive for
+this comparison rather than a hand-written loop -- ECMAScript makes no
+constant-time guarantee for any particular piece of JS, so a JIT-optimized
+loop is not a safe substitute. This is the same hash-first, timing-safe shape
+used throughout this site's other secret-comparison recipes -- see
+[Password Gate](./password-gate.mdx#verifying-the-password-hash-first-then-compare-in-constant-time)
+for the same technique applied to a variable-length secret (a password)
+instead of an already fixed-length digest.
 :::
 
 ## Related: Web Crypto on Workers

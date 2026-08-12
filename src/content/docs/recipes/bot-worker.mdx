@@ -153,26 +153,27 @@ async function verifySignature(
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 
-  return timingSafeEqual(hexSig, signature);
+  return timingSafeEqualHex(hexSig, signature);
 }
 ```
 
 :::tip[Use timing-safe comparison]
-Always use a constant-time comparison for signature verification. A naive `===` comparison can leak information via timing side-channels.
+Always use a constant-time comparison for signature verification -- specifically `crypto.subtle.timingSafeEqual()`, the Workers runtime's own primitive for this. A naive `===`, or a hand-rolled comparison loop that only looks constant-time, can both leak information via timing side-channels; ECMAScript gives a hand-written loop no such guarantee.
 :::
 
 ### Timing-Safe String Comparison
 
 ```typescript
-function timingSafeEqual(a: string, b: string): boolean {
+function timingSafeEqualHex(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
-  let result = 0;
-  for (let i = 0; i < a.length; i++) {
-    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return result === 0;
+  const encoder = new TextEncoder();
+  return crypto.subtle.timingSafeEqual(encoder.encode(a), encoder.encode(b));
 }
 ```
+
+:::tip[The early length check leaks nothing here -- HMAC-SHA256's digest length is public, not secret]
+`a.length !== b.length` above returns before `crypto.subtle.timingSafeEqual()` runs. That is safe specifically because both `hexSig` and `signature` are meant to be `v0=` plus a fixed 64-character SHA-256 hex digest -- the correct length is public knowledge, not something derived from the signing secret, so an early return on a length mismatch reveals nothing an attacker didn't already know. It is also required: `crypto.subtle.timingSafeEqual()` throws, rather than returning false, if the two encoded buffers are different lengths. This stops holding the moment either side of the comparison is a variable-length secret instead of a public-length digest -- comparing a submitted password directly, for example, would leak the real password's length through that same early return. Hash a variable-length secret into a fixed-length digest first, then run the timing-safe compare on that -- see [Password Gate](./password-gate.mdx#verifying-the-password-hash-first-then-compare-in-constant-time) for the hash-first version of this same compare.
+:::
 
 ## Rate Limiting with KV
 

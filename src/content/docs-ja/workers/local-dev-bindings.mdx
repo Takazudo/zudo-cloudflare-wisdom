@@ -1,0 +1,192 @@
+---
+title: "ローカル開発: バインディング対応表"
+description: wrangler dev がローカルで実際にエミュレートするものは何か -- バインディング対応表、クレデンシャル不要な e2e 設定パターン、テストが何もテストせずにパスしてしまう 2 つの静かな罠
+sidebar_position: 8
+---
+
+`wrangler dev` は本番 Worker のフルなローカルレプリカに見えるが、Worker がバインドできるものの一部しか実際にはローカルで動かない。何がエミュレートされ何がされないかのギャップが、構造的なことを左右する: Worker が `CLOUDFLARE_API_TOKEN` なしで CI 上で起動できるかどうか、つまり Cloudflare のクレデンシャルを CI に渡すことなく本物のブラウザ e2e テストが可能かどうかだ。
+
+以下のメモは、本番相当のバインディングセット -- D1、R2、Queues、Vectorize、Workers AI -- を持つ Worker をプロビジョニングし、`wrangler dev` がクラウドのクレデンシャルなしでは起動を拒否するのを目の当たりにして、実際にどのバインディングが原因だったのかを突き止めた経験から来ている。
+
+## バインディング対応表
+
+| Binding | Local emulation | Credentials required |
+| --- | --- | --- |
+| D1 | Yes | No |
+| R2 | Yes | No |
+| KV | Yes | No |
+| Queues (producer + consumer) | Yes | No |
+| Rate Limiting | Yes | No |
+| Assets | Yes | No |
+| Plain vars | Yes | No |
+| Secrets | Yes | No |
+| Cache API (`caches.default`, not a binding) | Yes | No |
+| AI (`remote: true`) | No -- proxies to the real API | Yes -- and its absence fails the *entire* dev server boot |
+| Vectorize (default config) | No -- prints `not supported`, no emulation | N/A -- binding is simply absent from `env` |
+| Vectorize (`remote: true`) | No local emulation -- proxies to the real index | Yes -- same remote-proxy path as AI |
+| Workers Cache (`cache.enabled` block, edge caching) | No -- deploy-time feature, zero local simulation | N/A -- only observable on a deployed Worker |
+
+Cache API までのブロック -- D1、R2、KV、Queues、Rate Limiting、Assets、プレーンな vars、secrets、そして Cache API 自体 -- はすべてローカルでエミュレートされ、Cloudflare のクラウド側からは何も必要としない。それより下の行はそれぞれ足りないものが違う：AI は常に有効な `CLOUDFLARE_API_TOKEN` を必要とする。Vectorize は `remote: true` を選んだ場合だけそれを必要とし、そうでなければ単に存在しない。そして Workers Cache は、設定にかかわらずローカルでは一切動かない。
+
+:::warning[`ai: { remote: true }` は AI バインディングだけでなく dev サーバー全体を落とす]
+`ai` バインディングの `remote: true` モードは、起動時にリモートプロキシセッションを強制する。`CLOUDFLARE_API_TOKEN` が設定されていないと、そのプロキシセッションの確立に失敗する -- そして `wrangler dev` は、`env.AI` に一切触れないリクエストに対してさえ、起動そのものを拒否する。
+:::
+
+## 失敗した起動ログ（一般化）
+
+`CLOUDFLARE_API_TOKEN` と `CLOUDFLARE_ACCOUNT_ID` を未設定のまま、本番相当のバインディングセットを持つ設定で `wrangler dev` を起動すると、起動そのものが失敗する：
+
+```
+env.VECTOR_INDEX (…)   Vectorize Index   not supported
+env.AI                  AI                remote
+⎔ Establishing remote connection...
+✘ [ERROR] Failed to start the remote proxy session … it's necessary to set a
+  CLOUDFLARE_API_TOKEN environment variable for wrangler to work.
+```
+
+この 1 回の起動には、別々の 2 つの問題が重なっている：
+
+- `env.VECTOR_INDEX`（Vectorize）は `not supported` と出力してそのまま進む -- ここで起動自体は失敗しないが、バインディングは `env` に存在しないため、それに触れるコードパスはリクエスト時に例外を投げる。
+- `env.AI` は `remote` と出力する。これは wrangler がこれからリモートプロキシセッションを開こうとしているサインだ。そのセッションには `CLOUDFLARE_API_TOKEN` が必要で、見つからないと*プロセス全体*が上記のエラーで終了する -- AI に依存するルートだけでなく。
+
+`not supported` というフォールバックは Vectorize の初期設定での挙動に過ぎない -- バインディングに `remote` フラグが設定されていない場合にのみ当てはまる。同じバインディングに `remote: true` を追加すると、`ai: { remote: true }` が常に取る認証済みリモートプロキシと同じ経路にオプトインすることになる：`wrangler dev` はバインディングを `env` から欠落させたままにする代わりに、実際のインデックスに接続する。その代償として `CLOUDFLARE_API_TOKEN` が必要になり、ローカル dev から実際の Vectorize サービスに触れることになる。
+
+## Cache API はローカルでエミュレートされるが、Workers Cache はされない
+
+Cloudflare Workers には無関係な 2 つのキャッシュ機構があり、そのうち `wrangler dev` に存在するのは片方だけだ。
+
+プログラマティックな Cache API（`caches.default.put()` / `.match()`、`caches.open()`）はデフォルトでローカルにシミュレートされる -- `wrangler dev` はこれを Miniflare が管理するキャッシュで裏付けており、`.wrangler/state/v3/cache` 配下に永続化され、フラグは一切不要だ。`await caches.default.match(request)` を実行してその戻り値を返すコードは、本番で見るのと同じ `CF-Cache-Status: HIT` / `MISS` ヘッダーをローカルでも目にする。
+
+:::warning[デプロイ済み Worker で検証するなら `*.workers.dev` は避ける]
+本番では、Cache API はカスタムドメインに紐づいた Worker でしか動かない -- Pages Functions は `*.pages.dev` でも同等の扱いを受けるが、素の `*.workers.dev` サブドメインにデプロイしたただの Worker では `cache` 操作が一切機能しない。ローカル dev の挙動を workers.dev の URL と比較すると、コードが正しくても「キャッシュが壊れている」ように見えてしまう。代わりにカスタムドメインで検証すること。
+:::
+
+宣言的な Workers Cache -- `wrangler.jsonc` の `cache` ブロック（`{ "cache": { "enabled": true } }`）で、`Cache-Control` ヘッダーに駆動され `ctx.cache.purge()` でパージされるもの -- はまったく別の仕組みだ：Worker 全体の手前に立つエッジレベルのキャッシュで、デプロイされた Worker バージョンに紐づいている。ローカルシミュレーションはゼロだ。Worker が何を返そうと、この面での `Cf-Cache-Status` は `wrangler dev` のレスポンスに一切現れない -- `wrangler deploy` の後にしか現れない。Cache API と違い、こちらはゾーンレスで、デプロイさえすれば `*.workers.dev` でも問題なく動く。ただローカルへの経路が単純に存在しないだけだ。
+
+## 設計上の帰結: クレデンシャル不要な e2e 用の別設定
+
+`ai: { remote: true }` が起動全体を失敗させるため、クレデンシャル不要のローカル Worker は dev 設定をそのまま再利用できない -- `ai` と `vectorize` を丸ごと省いた**別の wrangler 設定**が必要になる。そのファイルの他のバインディングはすべてローカルでエミュレートされ続けるので、Worker はクレデンシャルなしでおよそ 25 秒で起動する。この起動が動くようになれば、Cloudflare のシークレットなしで CI 上での本物の e2e が可能になる -- 認証ゲート、同一オリジンの強制、そして R2 + D1 に着地する実際のマルチパートアップロードまで、エンドツーエンドで検証できる。
+
+```jsonc
+// wrangler.e2e.jsonc -- credential-free config for CI e2e.
+// ai always forces a remote proxy session and needs CLOUDFLARE_API_TOKEN.
+// vectorize only does that if it's configured with `remote: true` -- omit
+// both here so this config never needs a token to boot.
+{
+  "name": "my-worker-e2e",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-01-01",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "my-app-db",
+      "database_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    }
+  ],
+  "r2_buckets": [{ "binding": "UPLOADS", "bucket_name": "my-app-uploads" }]
+  // no "ai", no "vectorize" -- everything else here still emulates locally
+}
+```
+
+CI の `wrangler dev --config wrangler.e2e.jsonc` を、本物の dev / 本番設定ではなくこのファイルに向ければ、dev サーバーはトークンを要求するリモートプロキシセッションを一切試みなくなる。
+
+## 罠: `secrets.required` バインディングはブロックの宣言が必要
+
+`wrangler dev` は `.dev.vars`（そしてデフォルトで読み込まれる `.env`）の中に見つけたキーを、`secrets` ブロックの有無にかかわらずすべてシークレットとしてバインドする -- そこには宣言は一切要らない。`secrets.required` が実際に変えるのはもっと狭い範囲で、逆に誤解しやすい：ブロックが存在する場合、`required` に名前が挙がったキーだけがバインドされ（`.dev.vars` / `.env` にあるそれ以外のキーは黙って除外される）、しかもブロックが存在する場合に限り、wrangler は `process.env` も読み始める -- つまりシェルでエクスポートされた、あるいは CI から注入された環境変数だけが存在するキーでも、宣言された要件を満たせるようになる。ブロックがなければ、シークレットのために `process.env` が参照されることは一切ない。
+
+これが本当の罠だ：プロセスレベルの環境変数としてしか存在しないシークレット -- シェルでエクスポートされた、あるいは `.dev.vars` の裏付けを持たない生の CI 環境変数として設定されただけのもの -- は、`secrets.required` がそれを名指ししない限り `wrangler dev` からは見えない。症状は静かだ：認証ゲートはトークンを期待する場所で `undefined` を読み、「無効」として解決し、`GET /` は `401` ではなく `200` を返す。その設定に対して書かれたテストはパスする -- ただし認証ゲートを一切テストしていないだけだ。同じシークレットを `.dev.vars` に置いていれば、`secrets` ブロックなしでもバインドされていたはずだ -- この罠は process-env 経由の場合に固有のものだ。
+
+```jsonc
+// wrangler.jsonc -- required so a shell-exported or CI-injected AUTH_TOKEN
+// (no .dev.vars entry) gets read from process.env and bound locally.
+{
+  "secrets": {
+    "required": ["AUTH_TOKEN"]
+  }
+}
+```
+
+## 罠: Secure クッキーは localhost 以外の HTTP を往復できない
+
+モダンなブラウザと `curl` はどちらも `localhost`（および `127.0.0.1` / `[::1]`）を `Secure` クッキー属性にとって信頼できるオリジンとして扱う。そのため `wrangler dev` のデフォルト設定 -- 素の `http://localhost:8787` -- では、Worker がセットした `Secure` クッキーは Playwright のものを含む本物のクッキージャーを問題なく往復する。この罠はそこでは発動しない。
+
+罠が発動するのは、対象が文字どおりの `localhost` でなくなった瞬間だ：LAN の IP アドレス、`/etc/hosts` で `127.0.0.1` に向けたカスタムの dev ホスト名、CI 上のコンテナのホスト名、その他ブラウザの固定されたループバック許可リストの外にあるものすべて。それらはどれも localhost の例外を受けられないため、本物のクッキージャーは素の HTTP 上で `Secure` クッキーを正しく破棄し、ログイン後のすべてのアサーションが 401 になり、まさに壊れた認証ゲートのように見える。見落としやすいのは、`Cookie:` ヘッダーを手で設定した `curl` はジャーを完全に迂回してしまい問題を隠すからだ -- 本物のジャー（`curl -c/-b`、あるいは実際のブラウザ）だけがこれを再現する。
+
+こうした localhost 以外の構成のために -- そして `localhost` ですでに動いている場合でも本番との整合性のために -- ローカル dev を HTTPS で配信し、テストランナーに自己署名証明書を信頼させる：
+
+```bash
+wrangler dev --local-protocol https
+```
+
+```ts
+// playwright.config.ts
+export default defineConfig({
+  use: {
+    ignoreHTTPSErrors: true,
+  },
+});
+```
+
+## ローカルテストの落とし穴: workerd の孤児プロセスリーク
+
+Miniflare を使うテストスイート -- `vitest-pool-workers`、あるいはテストファイルごとに Miniflare をインスタンス化する構成 -- は、本物の `workerd` 子プロセスを起動する。テストランナーが異常終了（`SIGABRT`、OOM kill）すると、それらの子プロセスは二度と回収されない。十分な回数のテスト実行にわたって放置すると、数百の孤児 `workerd` プロセスがリークし、テスト実行だけでなく*ホスト全体*のプロセステーブルやファイルディスクリプタの上限を枯渇させうる。
+
+### 通常の修正: グループ単位のクリーンアップ
+
+テストコマンドを、自分自身のプロセスグループで起動するスクリプトでラップし、終了時 -- 成功・失敗・シグナルのどの経路であっても -- 単一の子プロセスではなくグループ全体にシグナルを送る：
+
+```js
+// run-tests.js -- spawns the suite in its own process group so an abnormal
+// exit still leaves a group id to clean up by. detached: true + a negative
+// pid signal target is a POSIX recipe -- there's no portable Node equivalent
+// on Windows.
+import { spawn } from "node:child_process";
+
+const child = spawn("vitest", ["run"], {
+  detached: true,
+  stdio: "inherit",
+});
+
+function killGroup(signal) {
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
+    // group is already gone
+  }
+}
+
+child.on("exit", (code) => {
+  killGroup("SIGTERM");
+  setTimeout(() => {
+    killGroup("SIGKILL");
+    process.exit(code ?? 1);
+  }, 2000);
+});
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => killGroup(signal));
+}
+```
+
+回収は必ずプロセスグループ単位で行い、プロセス名の一致では絶対に行わない -- 共有 CI ホスト上での名前一致は、他人のジョブに属する `workerd` プロセスまで巻き込んで殺しかねない。
+
+:::danger[`pkill -9 -f workerd` は緊急復旧専用]
+これはホスト上のすべての `workerd` プロセスを殺す -- 無関係な dev サーバーや、共有マシン上の他人のテスト実行も含めて。使うのは、ホストのプロセステーブルがすでに枯渇して身動きが取れなくなったときのアンスタック手段としてのみで、日常的なクリーンアップ手順として使ってはならない。
+:::
+
+### 並列度に上限を設け、EMFILE に注意する
+
+Vitest 4 は `poolOptions.forks.maxForks` をトップレベルの `maxWorkers` に置き換えた -- 旧オプションはエラーにならず静かに何もしなくなるため、それを設定したままの設定ファイルは実際には何も制限していない：
+
+```ts
+// vitest.config.ts (vitest 4+)
+export default defineConfig({
+  test: {
+    maxWorkers: 4, // poolOptions.forks.maxForks is a no-op on vitest 4+
+  },
+});
+```
+
+失敗せずに CPU 使用率がおよそ 0% のまま固まるスイートは、詰まったテストではなく `EMFILE` / ファイルディスクリプタ枯渇の症状だ -- コードを疑う前に、シェルの `ulimit -n` を上げること。
+
+関連ページ：バインディングの構文は [Wrangler 設定](./wrangler-config.mdx)、ライブな `wrangler dev` プロセスなしにバインドされたコードを検証する方法は [AsyncLocalStorage による SSR バインディング](../recipes/ssr-bindings-adapter.mdx)を参照。

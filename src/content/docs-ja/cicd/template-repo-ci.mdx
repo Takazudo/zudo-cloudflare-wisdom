@@ -1,0 +1,226 @@
+---
+title: テンプレートリポジトリの CI
+description: Cloudflare のシークレットがまだ設定されていないテンプレート/フォークリポジトリで、デプロイを失敗させる代わりに優雅にスキップするプリフライトパターン
+sidebar_position: 5
+---
+
+テンプレートリポジトリは、まだ何も設定していない人にクローンされることを前提に作られている。デプロイワークフローをそのまま実行すると、フォーク直後の最初の CI 実行は必ず失敗する -- 何かが壊れているのではなく、誰もまだシークレットを追加していないし、コミット済み設定のプレースホルダー id も置き換えていないからだ。このページでは、避けられないこの最初のギャップを赤い X ではなく優雅なスキップに変えるプリフライトパターンと、コントリビューターにローカルで `wrangler` をセットアップさせずにリソースをプロビジョニングする補完パターンを扱う。
+
+## 誰のせいでもない赤い X
+
+テンプレートリポジトリやボイラープレートプロジェクトは、空の `CLOUDFLARE_API_TOKEN` と、`REPLACE_WITH_*` プレースホルダーだらけのコミット済み `wrangler.jsonc` を抱えたまま出荷される -- そのプレースホルダーがどこから来るかは[ゼロからのデプロイ](../workers/deploy-from-zero.mdx)を参照。「Use this template」をクリックして最初のコミットを push すると、デプロイジョブは予定通り実行され、トークンの欠如かプレースホルダー id にぶつかって失敗する。
+
+実際には何も壊れていない。新しいオーナーは何も間違ったことをしていない -- まだ設定のステップに辿り着いていないだけだ。それでも CI バッジは赤くなり、最初のコミットで赤いバッジが出れば、誰かがそれを覆す機会を得るより先に「このテンプレートは壊れている」と読まれてしまう。
+
+## セルフスキップ・プリフライトパターン
+
+解決策は、デプロイの前に走る `preflight` ジョブを追加し、2 つの独立したゲートをチェックすることだ：トークンが空かどうか、そしてコミット済み設定にまだプレースホルダーが残っているかどうか。どちらか一方でも失敗すれば「準備できていない」ことを意味し -- デプロイジョブは丸ごとスキップされる一方、クレデンシャルを必要としないビルドジョブはそのまま走り続けて green を保つ。
+
+```yaml
+name: Production Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Check deploy readiness
+        id: check
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          READY=true
+
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            READY=false
+            echo "::notice::CLOUDFLARE_API_TOKEN is not set -- skipping deploy (template/fork repo)"
+          fi
+
+          if grep -q "REPLACE_WITH" wrangler.jsonc; then
+            READY=false
+            echo "::notice::wrangler.jsonc still has REPLACE_WITH_* placeholders -- skipping deploy"
+          fi
+
+          echo "ready=$READY" >> "$GITHUB_OUTPUT"
+
+  build-site:
+    name: Build Site
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build site
+        run: pnpm build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-out
+          path: dist/
+          retention-days: 1
+
+  deploy:
+    name: Deploy to Cloudflare Workers
+    needs: [preflight, build-site]
+    if: needs.preflight.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download site artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: dist-out
+          path: dist/
+
+      - name: Deploy to Cloudflare Workers
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+```
+
+:::tip[grep の対象は設定ファイルの方言に合わせる]
+この例では `wrangler.jsonc` を grep している。プロジェクトが `wrangler.toml` を使っているならそちらを grep する -- プレースホルダーが他のコミット済みファイルにも残りうるなら、preflight ステップがチェックすべきファイルをすべて列挙すること。
+:::
+
+これがうまく機能するポイントは 3 つある：
+
+- **2 つの独立したゲート、どちらか一方でスキップ。** トークンの欠如とプレースホルダーの残存は原因も直し方も違う失敗モードだが、どちらも「デプロイの準備ができていない」ことを意味する -- だからどちらも `READY=false` を立て、それぞれ独自の `::notice::` 行を出す。コントリビューターはどちらが問題なのか推測する必要がない。
+- **`::notice::` は理由をブール値ではなくログに残す。** GitHub Actions は `::notice::` 行を実行サマリー上のアノテーションとして描画する -- 1 つのステップを開いて中を見なくても見える。読む人はたいていこのリポジトリの CI について何も知らないので、メッセージはそれ単体で意味が通る必要がある。
+- **`ready` 出力がゲートするのはジョブ全体であって、中の 1 ステップではない。** `deploy` は `needs: [preflight, build-site]` を宣言し `needs.preflight.outputs.ready` を読むので、GitHub Actions はジョブを途中まで走らせて個々のステップを no-op にするのではなく、ジョブ全体を **skipped** としてマークする。skipped なジョブはチェック一覧で赤ではなく、ニュートラルなグレーのアイコンとして表示される。
+- **ビルドジョブはクレデンシャルを一切持たない。** `build-site` は `secrets.*` を一切参照しないので、リポジトリがまだ設定されていようがいまいが同じように成功する。これが、シークレットが 1 つも存在しない段階でも実行全体が green を保てる理由だ -- 実際にまだ準備ができていないもの（デプロイ）だけが skipped として表示され、何も failed としては表示されない。
+
+## 赤い X より green-with-skipped-deploy が優れている理由
+
+GitHub Actions のジョブには 3 つの終端状態がある：success（緑のチェック）、failure（赤い X）、skipped（グレーのダッシュ）。必須チェックをブロックするのは failure だけで、PR のチェック一覧やリポジトリのバッジをざっと見る人間にとっては、skipped も success も「何もブロックしていない」と読める。
+
+フォークのたびにデプロイジョブをハードに失敗させるテンプレートリポジトリは、最悪のレッスンを自ら教え込む：新しいオーナーが最初に目にする CI 実行が赤いのは、自分が書いた何かのせいではまったくない。これが「ここでは赤いのが普通」というベースラインを作ってしまい、まさにその状態のもとで、後で起きる本物の破損が見過ごされる -- シグナルはすでに使い果たされているからだ。
+
+失敗させる代わりにスキップすれば、意味論が正直に保たれる：赤は依然として「実際に何かが壊れている」ことを意味し、skipped は「このステップはあなたにはまだ関係ない」ことを意味する。そして `::notice::` アノテーションが、新しいオーナーに次に何をすべきかを正確に伝える -- シークレットを 2 つ設定し、プレースホルダーを 1 つ置き換える -- ワークフローファイルを読んで確かめる必要もなく。
+
+:::info[skipped なジョブは branch protection を通過する]
+ジョブレベルの `if:` によって `skipped` に解決された必須チェックは、GitHub の branch protection ルール上 `success` と同じく通過扱いになる。マージをブロックするのは `failure` だけで、だからこそこのパターンは `main` の必須ステータスチェックと組み合わせても安全になる。
+:::
+
+## workflow_dispatch でリソースをブートストラップする
+
+上のプリフライトゲートは、コントリビューターが `REPLACE_WITH_*` プレースホルダーの代わりに貼り付けられる本物の KV ネームスペース id（あるいは D1 データベース id、R2 バケットなど）を用意できることを前提としている。しかし `wrangler kv namespace create` でそのリソースを作るには通常、ローカルで認証済みの `wrangler` が必要になる -- リポジトリに 2 つのシークレットを追加した後でさえ、自分のマシンに Cloudflare のクレデンシャルを一切持っていないかもしれないコントリビューターにとっては、もう 1 つの余計なセットアップ手順だ。
+
+リポジトリの GitHub Actions シークレットにはすでに動作する Cloudflare のクレデンシャルが入っている（それがあってこそプリフライトゲートは通る）ので、コミット済みの `workflow_dispatch` ワークフローが、同じシークレットを使って CI 側でプロビジョニングコマンドを実行し、できあがった id をジョブログに出力して、コントリビューターがコピーできるようにすればよい：
+
+```yaml
+name: Bootstrap KV Namespace
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  create-namespace:
+    name: Create KV Namespace
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Create KV namespace
+        run: npx wrangler kv namespace create my-app-cache
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+```
+
+**Actions** タブから実行し（`workflow_dispatch` はオンデマンドでのみ動き、push や PR では絶対に走らない）、実行のログを開く。`wrangler kv namespace create` は、作成したばかりの id をこう出力する：
+
+```
+Creating namespace with title "my-app-cache"
+Success!
+Add the following to your configuration file:
+{
+  "kv_namespaces": [
+    { "binding": "CACHE", "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }
+  ]
+}
+```
+
+コントリビューターの手作業はこの `id` を、コミット済み `wrangler.jsonc` にすでに存在するバインディングにコピーし、プレースホルダーを置き換えてコミットするだけだ。クレデンシャルは一切 CI の外に出ない -- コントリビューターはトークンを目にすることも、`wrangler` をローカルにインストールすることも、自分のマシンで認証済みコマンドを実行することもない。
+
+CI には対話できる TTY がないので、wrangler は「代わりに追加しましょうか」というプロンプトを一度も出さない -- id を出力するだけだ。これはまさにここで望ましい挙動でもある：書き戻しは CLI がワークフローの途中でリポジトリを編集するのではなく、意図的でレビューされたコミットであるべきだからだ。
+
+:::warning[再実行は冪等な参照ではなく新しいネームスペースを作る]
+`wrangler kv namespace create` は実行するたびに新しいネームスペースを作る -- 同じタイトルのものがすでに存在するかどうかはチェックしない。このブートストラップワークフローはリソースごとに一度だけ実行するものと考え、うっかり再実行して重複ができてしまったら Cloudflare ダッシュボードから削除すること。
+:::
+
+## フォーク PR はジョブレベルでも別の形でスキップする
+
+上のプリフライトパターンが対象にしているのは `main` へのプッシュで、オーナーがシークレットを追加すればすぐにそれが存在する状況だ。**フォークからの** プルリクエストは事情が違う：PR の head ブランチがフォークにある場合、ベースリポジトリにそのシークレットが設定されているかどうかに関わらず、GitHub は `pull_request` でトリガーされたワークフロー実行にリポジトリのシークレットを一切注入しない。これはワークフローが制御できる話ではなく、固定されたプラットフォームのセキュリティ挙動だ。
+
+PR ごとにデプロイする PR プレビューワークフローでは、同等のゲートはトークンが空かどうかをチェックする必要すらない -- PR がフォークから来ているかどうかを直接チェックし、デプロイジョブが一度も走る前にスキップできる：
+
+```yaml
+  preview:
+    name: Preview Deploy
+    needs: [build-site]
+    if: github.event.pull_request.head.repo.fork == false && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # ...
+```
+
+これはプリフライトゲートと同じ形 -- skipped に解決されるジョブレベルの `if:` -- を、自分のワークフローが計算する条件の代わりに GitHub がすでにイベントペイロードに公開している条件に適用したものだ。デプロイジョブについてはプリフライトパターンと組み合わせるとよい：フォーク PR はここで別の理由（そもそもシークレットが存在するはずがない）でスキップし、同一リポジトリからの push はリポジトリが実際にまだ設定されていないときにそちらでスキップする。
+
+:::warning[Dependabot の PR はフォークチェックを通過するのに、シークレットは無い]
+`head.repo.fork == false` は Dependabot の PR に対しても真になる -- フォークではなく同じリポジトリに対して開かれる PR だからだ。それでも GitHub は、Dependabot がトリガーしたワークフロー実行をシークレットの扱いに関してはフォーク PR と同じように扱う: `CLOUDFLARE_API_TOKEN` はやはり空文字列に解決され、`github.actor != 'dependabot[bot]'` の節がなければ、preview ジョブは普通に走ってしまい、依存関係を上げる PR のたびに赤く失敗する。根本にあるこの制限と、そうした PR にどうしてもシークレットが必要な場合に同名の Dependabot シークレットを別途登録する代替策については、[GitHub の Dependabot ドキュメント](https://docs.github.com/en/code-security/dependabot/working-with-dependabot/automating-dependabot-with-github-actions#accessing-secrets)を参照。
+:::
+
+関連ページ：このパターンが反応するプレースホルダー設定のライフサイクルについては[ゼロからのデプロイ](../workers/deploy-from-zero.mdx)、このプリフライトジョブが拡張するベースラインのワークフローについては[本番デプロイ](./production-deploy.mdx)を参照。

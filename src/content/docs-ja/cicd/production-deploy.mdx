@@ -25,8 +25,14 @@ permissions:
 ```
 
 :::warning[進行中のデプロイをキャンセルしない]
-本番デプロイでは `cancel-in-progress: false` を設定してください。短時間に2回 push された場合、最初のデプロイを途中でキャンセルせず、順番に両方を完了させたいためです。
+実際に本番へデプロイするジョブでは `cancel-in-progress: false` を設定してください。短時間に2回 push された場合、最初のジョブをデプロイ途中でキルせず、順番に両方を完了させたいためです。
 :::
+
+### デプロイ途中のキャンセルが危険な理由
+
+ワークフローランのキャンセルは残りのステップをスキップするだけではありません。GitHub Actions は現在実行中のステップも中断させます。これが `wrangler deploy` のアップロード途中で発生すると、Cloudflare 側には2つの異なるビルドが混ざったデプロイが残ってしまう可能性があります――キルされたランのアセットの一部と、その後完了する別のランのアセットの一部が混在した状態です。これは机上の空論ではなく、実際に複数回起きているインシデントです。立て続けの2回目の push が最初のデプロイジョブをアップロードステップの途中でキャンセルし、次のデプロイで直るまでサイトが新旧混在の壊れた状態で配信され続ける、という形です。
+
+これは特に **deploy** ジョブに関する懸念です。ビルドジョブやプレビューデプロイジョブでは `cancel-in-progress: true` で問題ありません――むしろ望ましいことすらあります。キャンセルされた場合の最悪の結果が、再実行すれば済む無駄なビルド1回分だからです。本番デプロイは専用の `concurrency.group` に置き、`true` を使うビルド/プレビュージョブとは分けてください。
 
 ## ビルドジョブ
 
@@ -69,14 +75,101 @@ jobs:
 ビルドに git 履歴が必要な場合（例: ドキュメントのメタ情報で作成日/更新日を表示する場合）は `fetch-depth: 0` を使用してください。
 :::
 
+## デプロイ前にシークレットを検証する
+
+:::tip[シークレットはジョブではなくステップにスコープする]
+このページ後半のデプロイステップは、`CLOUDFLARE_API_TOKEN` と `CLOUDFLARE_ACCOUNT_ID` をジョブレベルではなく、そのステップ自身の `env:` ブロックに設定しています。ジョブレベルの `env:` にしてしまうと、checkout、install、依存パッケージが実行する `postinstall` スクリプトなど、ジョブ内のすべてのステップにシークレットが渡ってしまいます。これは実際に `wrangler` を呼ぶ1ステップだけに必要な範囲よりはるかに広い露出です。シークレットは `wrangler` を呼ぶステップだけにスコープしてください。
+:::
+
+Cloudflare のシークレットを使ってデプロイする前に、そもそもそれらが設定されているかを確認したくなります。ただし、素直なやり方はうまくいきません：
+
+```yaml
+jobs:
+  deploy:
+    if: secrets.CLOUDFLARE_API_TOKEN != ''
+```
+
+GitHub Actions はこれをそもそもパースしてくれません。`secrets` コンテキストはジョブの `if:`（およびステップの `if:`）では一切利用できないため、ワークフローが実行される前に `Unrecognized named-value: 'secrets'` というエラーで失敗します。シークレットが読めるのはステップの `run:` や `env:` の中だけです。
+
+回避策は、シークレットを読み取れる場所でそれを読み、結果をシークレットではない普通のジョブ output として再公開する専用ジョブを作ることです：
+
+```yaml
+  check-secrets:
+    name: Verify Required Secrets
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.check.outputs.ok }}
+
+    steps:
+      - name: Check secrets are set
+        id: check
+        run: |
+          if [ -n "${{ secrets.CLOUDFLARE_API_TOKEN }}" ] && [ -n "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID"
+            exit 1
+          fi
+```
+
+:::warning[シークレットが欠けているときは、このジョブは赤く失敗するべきです]
+`exit 1` がここで重要な意味を持つのは、[テンプレートリポジトリの CI](./template-repo-ci.mdx) の preflight ジョブとは違う理由です。テンプレートリポジトリの狙いはまさに、まだ設定されていないフレッシュなクローンが green のままであることです -- そこでのシークレット欠如は最初の実行での想定内の状態です。こちらは逆です：これは本番用のワークフローであり、シークレットはすでに設定されているはずで、トークンが欠けているのは何かが退行した（トークンが失効した、シークレットが削除された）ことを意味します。`exit 1` がなければ、このステップは `ok=false` を書き込みつつ `0` で終了してしまいます -- `check-secrets` は green のまま表示され、`migrate-d1` と `deploy` はそれぞれの `if:` ゲートでスキップされ、ワークフロー全体が何もデプロイしないまま green で終わります。`exit 1` によってジョブ自体を失敗させることで、実行を赤くし、誰かに気づかせるべき状態にします。
+:::
+
+後続のジョブはこの output でゲートできます。`secrets` とは異なり、`needs.<job>.outputs.*` はジョブの `if:` で利用できるためです：
+
+```yaml
+  deploy:
+    name: Deploy to Cloudflare Pages
+    needs: [build-site, migrate-d1, check-secrets]
+    if: needs.check-secrets.outputs.ok == 'true'
+```
+
+ジョブの output は常に文字列なので、比較対象は真偽値ではなく文字列の `'true'` になります。
+
+:::warning[ステップごとのガードより、ジョブレベルのゲートの方が安全]
+専用ジョブを省略して、代わりに個々のステップを `if: env.CLOUDFLARE_API_TOKEN != ''` のようなガードで守りたくなるかもしれません。問題は、ステップごとのガードは fail open（防御漏れの方向に失敗する）ことです。1つのステップにガードを付け忘れる、あるいは後から追加したステップにガードを付け忘れると、そのステップは保護されないまま普通に実行されてしまいます。ジョブレベルの単一の `if:` であれば、ゲートが失敗したときにジョブ全体をブロックできるため、うっかり無防備なステップが残る心配がありません。
+:::
+
+## デプロイ前に D1 マイグレーションを適用する
+
+Worker が D1 のスキーマ変更に依存している場合、それを前提とする新しいコードが動き出す前にマイグレーションを適用してください。マイグレーションジョブをパイプラインの独立したステップとして持たせ、同じシークレットチェックでゲートします：
+
+```yaml
+  migrate-d1:
+    name: Apply D1 Migrations
+    needs: [build-site, check-secrets]
+    if: needs.check-secrets.outputs.ok == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Apply D1 migrations
+        run: npx wrangler@4 d1 migrations apply my-database --remote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+```
+
+`needs: [build-site, check-secrets]` はトークンのゲートだけの話ではありません。`check-secrets` だけでゲートすると、シークレットが確認できた時点で、まだ実行中の、あるいはこの後失敗するかもしれない `build-site` と並行してマイグレーションが走り出してしまいます。`needs:` に `build-site` を加えることで、デプロイまでたどり着かないかもしれないコードより先にスキーマが進んでしまうのを防ぎます。
+
+:::warning[デプロイの後ではなく前にマイグレーションする]
+デプロイジョブの `needs:` に `migrate-d1` を含めてください。そうすることで、新しいスキーマを前提とするコードが動き出す前に、マイグレーションがエラーになった時点でワークフローを早期に失敗させられます。デプロイの後にマイグレーションを実行すると、すでに動いているコードがまだ存在しないカラムやテーブルを問い合わせてしまう時間帯が生まれます。
+:::
+
 ## デプロイジョブ
 
 ```yaml
   deploy:
     name: Deploy to Cloudflare Pages
-    needs: [build-site]
+    needs: [build-site, migrate-d1, check-secrets]
+    if: needs.check-secrets.outputs.ok == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Download site artifact
@@ -97,15 +190,36 @@ jobs:
 
       - name: Deploy to Cloudflare Pages (production)
         run: |
-          npx wrangler@4 pages deploy deploy \
-            --project-name=my-site \
-            --branch=main \
-            --commit-hash="${GITHUB_SHA}" \
-            --commit-message="Production deploy: ${GITHUB_SHA}"
+          for attempt in 1 2 3; do
+            if npx wrangler@4 pages deploy deploy \
+              --project-name=my-site \
+              --branch=main \
+              --commit-hash="${GITHUB_SHA}" \
+              --commit-message="Production deploy: ${GITHUB_SHA}"; then
+              exit 0
+            fi
+            echo "Deploy attempt ${attempt} failed."
+            if [ "${attempt}" -lt 3 ]; then
+              echo "Retrying in 150s..."
+              sleep 150
+            fi
+          done
+          echo "::error::Deploy failed after 3 attempts — treating this as a real error, not a transient blip."
+          exit 1
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 ```
+
+Cloudflare の API はデプロイの途中で一時的に 5xx エラーを返すことがあります。デプロイコマンドを小さなリトライループでラップしておけば、一時的な不調でワークフロー全体を失敗させずに済みます。3回試行、間隔は150秒。3回とも失敗したら、それ以上リトライする価値のあるものではなく、本物のエラーとして扱います。
+
+:::tip[timeout-minutes にリトライの時間予算を織り込む]
+3回の試行の間に入る2回の150秒の待機は、合計で5分の純粋なバックオフ時間になります。これに加えて `wrangler deploy` 自体の実行時間もかかります。この例ではその余裕を持たせるため、ジョブの `timeout-minutes` を10から15に増やしています。この時間予算がないと、ループが3回目の試行にたどり着く前にジョブ自体のタイムアウトが先に発火してしまいます。
+:::
+
+:::warning[リトライするのは一時的な失敗だけ―認証やコンフィグのエラーはリトライしない]
+このループは Cloudflare API の一時的な 5xx エラーのために存在するもので、それ以外のためではありません。`wrangler` が認証やコンフィグのエラー――無効な API トークンや `10000` のような Cloudflare のエラーコード――で失敗した場合、リトライしても無駄です。同じ失敗が毎回繰り返されるだけだからです。それは、本来ならすぐに分かるはずの明確な失敗を、ジョブが最終的に赤く終わるまでの5分以上の無駄な CI 時間に変えてしまいます。リトライループの中で認証やコンフィグのエラーが出始めたら、ループにそれを隠させるのではなく、認証情報や設定の問題を直接修正してください。
+:::
 
 ## ビルドとデプロイを分離する理由
 
@@ -114,3 +228,187 @@ jobs:
 1. **成果物の確認**: 必要に応じてビルド出力をダウンロードして検査できる
 2. **デプロイの再試行**: デプロイが失敗した場合（ネットワーク障害など）、デプロイジョブのみ再実行できる
 3. **ビルドとデプロイの間でテスト**: ビルドとデプロイの間にテストジョブ（e2e、Lighthouse など）を挟める
+
+## デプロイ後のスモークテスト
+
+デプロイがエラーなく完了することと、サイトが実際に新しいビルドを配信していることは別の話です。Cloudflare はパークページ、古いルートを指したままの stale な `*.pages.dev` デプロイ、あるいは伝播がまだ終わっていないドメインからでも `200 OK` を返すことがあり、これらはどれも `deploy` ジョブからは見えません。`deploy` の直後に置くスモークテストジョブは、本番の URL に対してステータスコードだけでなく、このビルドの実際のコンテンツを確認することでそのギャップを埋めます。
+
+### DNS を先に見る：HTTP に触れる前に skip か fail かを決める
+
+スモークテストがまず答えるべき問いは「サイトは正しく応答したか」ではなく「そもそも尋ねる相手がまだ存在するか」です。新しいカスタムドメインは伝播に数分から数時間かかることがあり、その間に `fetch()` で叩くと例外が投げられます——が、それは本物の TLS 証明書の破損、本物のホスト名の誤り、本物の DNS 障害でも同じように起こります。`fetch()` のエラーの形（`TypeError: fetch failed`、Node のバージョンによって形が変わる `cause` チェーンの奥に埋もれた `ENOTFOUND` や `ECONNREFUSED`）を覗いてこれらを見分けようとするのは、契約になったことのない実装の詳細を当てにいく行為です。
+
+`node:dns/promises` はこの問いに直接答えてくれます：そのホスト名に A または AAAA レコードがそもそも存在するかどうか。
+
+```js
+import { resolve4, resolve6 } from "node:dns/promises";
+
+async function hasDnsRecord(hostname) {
+  const results = await Promise.allSettled([resolve4(hostname), resolve6(hostname)]);
+  return results.some((r) => r.status === "fulfilled" && r.value.length > 0);
+}
+```
+
+レコードがまだ無ければドメインが伝播していないだけ——これは失敗ではなく **skip** です。レコードは解決するのにその先が間違っている場合は別の問題であり、次に確認します。
+
+### 200 単体より、実ビルドのコンテンツマーカー
+
+`200 OK` それ単体では、*どのサイトが* 答えたかは何も証明しません。次の2つの状況も、正しいデプロイと同じように 200 を返します：
+
+- Cloudflare のパークページ製品にまだルーティングされたままのドメインが、プレースホルダーのコンテンツで `200` を返します。
+- 先週の Cloudflare Pages デプロイを指したままのカスタムドメインが、完全に正当な——そして完全に stale な——サイトで `200` を返します。
+
+ステータスコードだけを確認するチェックはどちらも通してしまいます。修正策は、実際のビルド出力にリテラルなマーカーを焼き込むこと——デプロイのコミット SHA をフッターのコメントや meta タグに埋め込む——そしてレスポンスボディをその厳密な文字列で確認することです。ビルドがうまくいったと決めてかかったハードコードの値ではなく：
+
+```js
+const marker = process.env.SMOKE_CONTENT_MARKER; // baked into the page at build time, e.g. the commit SHA
+const body = await res.text();
+if (!body.includes(marker)) {
+  throw new Error(`response is missing content marker "${marker}"`);
+}
+```
+
+:::warning[マーカーは実ビルドから取ること、推測ではない]
+スモークテストのスクリプトに期待する文字列をハードコードして、ビルドがそれに一致することを祈るようなことはしません。ビルドが実際に出力した HTML からリテラルなマーカーを読み取るか、ビルドステップが埋め込んだのと同じ値（例えば `github.sha`）を渡します。そうすることでチェックは「たまたま一度うまくいった文字列」ではなく、この特定のビルドの出力を検証することになります。
+:::
+
+### リダイレクトを追わない
+
+stale なカスタムドメインは、常に古いコンテンツを直接返すとは限りません——現在そのルートを持っているデプロイの `*.pages.dev` URL へ 301 することもあります。`fetch()` はデフォルトでリダイレクトを追うので、素朴なチェックは *遷移先* のページに着地し、そのマーカーを読んで通過してしまいます——ドメイン自体は誤ってルーティングされたままなのに。`redirect: "manual"` を渡し、何かがポインタを別の場所へ追う前に、テスト対象の URL から Node が実際に受け取ったレスポンスを検査します：
+
+```js
+const res = await fetch(target, { redirect: "manual" });
+if (res.status >= 300 && res.status < 400) {
+  throw new Error(`unexpected redirect (${res.status}) — check that ${target.hostname} isn't still pointed at a stale deployment`);
+}
+```
+
+### `SMOKE_REQUIRE_LIVE`：初日は寛容に、確立後は厳格に
+
+新しいサイトの最初のデプロイは、上記のチェックすべてに正当に失敗しうる——DNS がまだ伝播していない、まだ一致させるコンテンツが無い——が、それはデプロイが壊れていることを意味しません。確立済みのサイトが全く同じチェックに失敗する場合は、何かが退行したということです。1つのスモークテストが、ライフサイクルの異なる時点でこの両方の振る舞いを必要とします：
+
+- 未設定 / `false`：あらゆる失敗（DNS レコードなし、リクエスト自体の失敗、ステータス異常、リダイレクト、マーカー欠落）は警告を出して `0` で終了します——「まだ live ではない」として扱われ、壊れたデプロイとしては扱われません。
+- `true`：同じ失敗が `1` で終了し、ワークフローを失敗させます。
+
+ドメインが新しい間は未設定のままにしておき、サイトが live であることを確認できたらリポジトリの variables で `true` に切り替えてください——その時点から先は、スモークテストは本物の退行を決して見逃してはなりません。
+
+### スクリプト
+
+```js
+// scripts/smoke-test.mjs
+import { resolve4, resolve6 } from "node:dns/promises";
+
+const target = new URL(process.env.SMOKE_URL);
+const marker = process.env.SMOKE_CONTENT_MARKER;
+const requireLive = process.env.SMOKE_REQUIRE_LIVE === "true";
+
+function skipOrFail(reason) {
+  if (requireLive) {
+    console.error(`::error::${reason}`);
+    process.exit(1);
+  }
+  console.log(`::warning::${reason} -- treating as not-live-yet (SMOKE_REQUIRE_LIVE is unset)`);
+  process.exit(0);
+}
+
+async function hasDnsRecord(hostname) {
+  const results = await Promise.allSettled([resolve4(hostname), resolve6(hostname)]);
+  return results.some((r) => r.status === "fulfilled" && r.value.length > 0);
+}
+
+if (!(await hasDnsRecord(target.hostname))) {
+  skipOrFail(`${target.hostname} has no A/AAAA record yet`);
+}
+
+let res;
+try {
+  res = await fetch(target, { redirect: "manual" });
+} catch (err) {
+  skipOrFail(`request to ${target} failed: ${err.message}`);
+}
+
+if (res.status >= 300 && res.status < 400) {
+  skipOrFail(`${target} redirected (${res.status}) instead of serving directly`);
+} else if (res.status !== 200) {
+  skipOrFail(`${target} returned HTTP ${res.status}`);
+} else if (!(await res.text()).includes(marker)) {
+  skipOrFail(`${target} is missing content marker "${marker}"`);
+} else {
+  console.log(`smoke test passed: ${target} is serving ${marker}`);
+}
+```
+
+:::tip[DNS チェックは `fetch()` が投げうるすべてのケースをカバーしない]
+A/AAAA レコードが解決できることは、そのドメインにルーティングできることを証明するだけです——TLS がすでにプロビジョニングされているか、その先のルートが実際にサービスを提供しているかについては何も言っていません。証明書がまだ発行されていない、コネクションが拒否される、ルートが伝播の途中にあるといったケースでは `fetch()` は依然として例外を投げます（reject します）。ここで捕まえられない reject はスクリプトを非ゼロ終了でクラッシュさせ、`SMOKE_REQUIRE_LIVE` の値に関係なく `skipOrFail` を完全に迂回して、寛容なモードであってもハードに失敗させてしまいます。`fetch()` の呼び出しを `try`/`catch` で包み、そのエラーを `skipOrFail` に通すことで、DNS だけでなくすべての失敗モードを同じ寛容/厳格の切り替えの対象にできます。
+:::
+
+### ワークフローへの組み込み
+
+```yaml
+  smoke-test:
+    name: Post-deploy Smoke Test
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Run smoke test
+        run: node scripts/smoke-test.mjs
+        env:
+          SMOKE_URL: https://my-site.example.com
+          SMOKE_CONTENT_MARKER: ${{ github.sha }}
+          SMOKE_REQUIRE_LIVE: ${{ vars.SMOKE_REQUIRE_LIVE }}
+```
+
+`SMOKE_REQUIRE_LIVE` は `secrets` ではなく `vars` から読みます——これは認証情報ではなく、ドメインが live だと確認できた時点でチームが切り替える、ただのリポジトリ変数だからです。
+
+### API Worker 版：認証 → 作成 → 検証 → 削除
+
+静的サイトのスモークテストは `GET` 1本で済みます。API Worker のスモークテストは書き込み経路全体が動くことを証明する必要があり、それには実際に呼び出すしかありません：認証し、レコードを作成し、正しく返ってくることを検証し、削除します。これを毎回のデプロイで安全に実行できるようにする鍵が2つあります：
+
+- **実行ごとに一意な識別子** —— タイムスタンプにランダムなサフィックスを足したもの。これにより、並行する実行（立て続けの2回の push）が同じリソースで衝突することがなく、万一残ってしまったレコードもどの実行が作ったものか追跡できます。
+- **クリーンアップ用の `trap ... EXIT`** —— これにより、作成したレコードはスクリプトが成功しても、verify ステップで失敗しても、ジョブの `timeout-minutes` で kill されても削除されます。ハッピーパスだけではありません。クリーンアップ自体も声を上げて失敗しなければなりません——`DELETE` が黙って no-op になると、ジョブログに何も残らないままテストレコードが残り続けます。
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUN_ID="smoke-$(date +%s)-$RANDOM"
+ITEM_ID=""
+
+cleanup() {
+  local exit_code=$?
+  if [ -n "$ITEM_ID" ]; then
+    if ! curl -fsS -X DELETE "$API_URL/items/$ITEM_ID" \
+      -H "Authorization: Bearer $API_TOKEN" >/dev/null; then
+      echo "::error::cleanup failed to delete $ITEM_ID -- test record left behind"
+      [ "$exit_code" -eq 0 ] && exit_code=1
+    fi
+  fi
+  exit "$exit_code"
+}
+trap cleanup EXIT
+
+curl -fsS "$API_URL/auth/verify" -H "Authorization: Bearer $API_TOKEN" >/dev/null
+
+ITEM_ID=$(curl -fsS -X POST "$API_URL/items" \
+  -H "Authorization: Bearer $API_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"name\":\"$RUN_ID\"}" | jq -r '.id')
+
+curl -fsS "$API_URL/items/$ITEM_ID" -H "Authorization: Bearer $API_TOKEN" \
+  | jq -e --arg name "$RUN_ID" '.name == $name' >/dev/null
+
+echo "API smoke test passed for $RUN_ID"
+```
+
+:::warning[クリーンアップの失敗を成功に見せかけてはいけない]
+`[ -n "$ITEM_ID" ] && curl ... ; return 0` —— このトラップの素朴なバージョンは、`curl -X DELETE` が実際に何をしたかに関わらず、`cleanup` から常に `0` を返します。削除が失敗しても（トークン失効、ネットワークの瞬断、アイテムがすでに無い、など）その事実は跡形もなく消え、ジョブは green のまま、テストレコードはデータベースに永遠に残ります。`cleanup` は入口で `$?` を捕まえます（`exit_code=$?`）。そのため、スクリプトのより早い段階での失敗（verify ステップ、create ステップ）はこれまで通り保存され、ジョブは非ゼロで終了し続けます。新しいのは逆方向のケースです：スクリプト自体は成功したのに `DELETE` が失敗した場合、`exit_code` は `0` から `1` に引き上げられ、壊れたクリーンアップがそれ以外は成功しているように見える実行の裏に隠れられないようにします。どちらの場合も、最後の明示的な `exit "$exit_code"` こそがジョブの結果を実際に決めるものであり、trap 自身の最後のコマンドから bash が推測する何かではありません。
+:::
+
+:::warning[`trap ... EXIT` が生き残るのは通常の失敗経路だけ]
+`trap ... EXIT` は、通常の終了、`exit` の呼び出し、`set -e` によるスクリプトの中断で実行されます——上記のあらゆる失敗経路をカバーします。ただし、一部の CI ランナーがハードタイムアウトを強制する方法である `SIGKILL` でプロセスが kill された場合は実行され**ません**。`timeout-minutes` は、ジョブ側の外側の上限ではなく、スクリプト自身のロジックがジョブを終わらせる程度に余裕を持たせておいてください。
+:::
+
+上記の DNS/fetch 版の代わりに、API Worker の `smoke-test` ジョブではこのスクリプトを `run:` ステップとして差し替えます。周囲のジョブ（`needs: [deploy]`、`timeout-minutes`）はそのままでかまいません。

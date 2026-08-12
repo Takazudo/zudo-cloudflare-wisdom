@@ -9,10 +9,35 @@ sidebar_position: 1
 Before your first deploy, create the project:
 
 ```bash
-npx wrangler@4 pages project create zudo-cloudflare
+npx wrangler@4 pages project create zudo-cloudflare --production-branch=main
 ```
 
-Or let the first `pages deploy` create it automatically.
+Pass `--production-branch` explicitly — without it, `project create` needs a production branch and would normally prompt for one interactively. In CI there's no TTY to prompt against, so it doesn't hang: it fails immediately with `Must specify a production branch.`
+
+:::warning
+Don't rely on `pages deploy` to create the project for you in CI. Cloudflare's own docs describe an auto-create path for `pages deploy`, but it only fires through an interactive prompt for the project name and production branch — a GitHub Actions runner has no TTY, so that prompt never appears. Worse, once you pass `--project-name` (as the [deploy command](#deploy-command) below does, which you need in CI for an auditable log), wrangler requires the project to already exist and fails with `Project not found. The specified project name does not match any of your existing projects. [code: 8000007]` instead of creating one. Always run `pages project create` before the first CI deploy. This applies to current `wrangler@4` — the auto-create prompt is documented as interactive-only, with no non-interactive fallback.
+:::
+
+For CI pipelines, make the create step idempotent so re-runs don't fail once the project already exists:
+
+```bash
+set +e
+create_output=$(npx wrangler@4 pages project create zudo-cloudflare \
+  --production-branch=main 2>&1)
+create_exit=$?
+set -e
+
+if [ "$create_exit" -ne 0 ]; then
+  if echo "$create_output" | grep -qiE "already exists|8000077|duplicate"; then
+    echo "Project already exists, continuing."
+  else
+    echo "$create_output" >&2
+    exit "$create_exit"
+  fi
+fi
+```
+
+Only tolerate the "already exists" family of signatures (`already exists`, the `8000077` API error code, `duplicate`). Any other failure — an auth error, a rate limit, a typo'd account ID — should still fail the pipeline instead of being silently swallowed.
 
 ## Deploy Command
 
@@ -66,3 +91,15 @@ npx wrangler@4 pages deploy deploy --project-name=my-site --branch=main
 ```
 
 See [Base Path Pattern](./base-path-pattern.mdx) for details.
+
+## Pages CI Troubleshooting
+
+Common failure signatures when running `pages project create` / `pages deploy` in CI, and what actually causes them:
+
+| Signature | Cause | Fix |
+|---|---|---|
+| `[code: 10000]` / `Authentication error` | `CLOUDFLARE_API_TOKEN` is invalid, expired, or missing the Pages permission | Regenerate a token with the "Cloudflare Pages — Edit" account permission and update the CI secret |
+| `More than one account available but unable to select one in non-interactive mode` | `CLOUDFLARE_ACCOUNT_ID` is unset and the token has access to multiple accounts, so wrangler can't prompt for one | Set `CLOUDFLARE_ACCOUNT_ID` explicitly (see [Environment Variables](#deploy-command-environment-variables) above) |
+| Idempotent create step still fails even though the project exists | The captured output didn't match `already exists`, `8000077`, or `duplicate` | Print `create_output` — the pattern only tolerates that signature family on purpose; anything else (auth, rate limit, quota) is a real failure |
+| Install step fails before wrangler even runs (e.g. `ERR_PNPM_OUTDATED_LOCKFILE`) | `package.json` drifted from the committed lockfile and the CI install runs with a frozen lockfile | Run the install locally without `--frozen-lockfile` and commit the updated lockfile |
+| Deploy fails repeatedly with 5xx / gateway errors after retries | Cloudflare API instability, not a config problem | Check [Cloudflare's status page](https://www.cloudflarestatus.com/) before re-running the job |

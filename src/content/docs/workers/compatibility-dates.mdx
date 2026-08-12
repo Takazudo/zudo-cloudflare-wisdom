@@ -61,3 +61,13 @@ The concrete trigger is the `AsyncLocalStorage` per-request-context pattern used
 :::warning
 This is a build/deploy-time gate, not a runtime one. You will not discover it from a passing local test that never imports the Node built-in — you discover it when wrangler refuses to load the worker during deployment. If a worker depends on `node:*` modules, keep `nodejs_compat` in its `compatibility_flags` permanently.
 :::
+
+## A Pin's Guarantee Depends on Your Installed Wrangler
+
+`compatibility_date` pins runtime *behavior*, but the code that implements that behavior ships inside `workerd`, bundled with whatever `wrangler` version is installed locally. `wrangler dev` runs your pinned date against **that** bundled `workerd` -- it is not a live fetch of "what Cloudflare's edge looked like on this date." If the installed `wrangler` is old, local dev is simulating an old `workerd`'s idea of your compatibility date, which can silently drift from what the current production edge actually does for the same pin.
+
+The pin is not a one-time guarantee once set -- it only protects the code path you actually re-verify. Re-run `wrangler dev` (or a preview deploy) after any `wrangler` upgrade, not just after a `compatibility_date` change, and periodically re-check even when nothing in the config file moved.
+
+:::tip[Bump wrangler before you trust a long-standing pin]
+A `compatibility_date` that has not changed in months can still behave differently locally than it used to, if `wrangler` itself was upgraded (or fell behind) in that time. Re-verify against `wrangler dev` after any wrangler version bump, not only after editing `compatibility_date`.
+:::

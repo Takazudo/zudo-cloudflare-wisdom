@@ -17,3 +17,10 @@ Cloudflare Pages、Workers、ストレージサービスを使った本番プロ
 - [Cron + D1 キュー](./cron-d1-queue.mdx) -- バックオフとデッドレター処理を備えた cron トリガーの D1 ワークキュー
 - [Cookie セッション](./cookie-sessions.mdx) -- リフレッシュトークンローテーション付きの HttpOnly Cookie セッション
 - [Webhook 署名](./webhook-signing.mdx) -- Web Crypto を使った HMAC-SHA256 リクエスト署名
+- [D1 による Idempotency-Key 台帳](./idempotency-ledger.mdx) -- フィンガープリント計算、フェンスされた pending 予約の引き継ぎ、上限付き台帳スイープを備えた claim-before-mutate な idempotency キー
+- [SSRF とリダイレクト安全性](./ssrf-and-redirect-safety.mdx) -- 完全な文字列ブロックリストを持つアウトバウンド fetch の SSRF ガードと、クライアント指定リダイレクト先のパーセントデコード安全なサニタイズ
+- [プレビュー・ステージング環境向けパスワードゲート](./password-gate.mdx) -- 静的アセットを含むすべてのリクエストの手前に置く共有パスワードゲート。改ざん検知付きのマーカー Cookie、POST 限定のログイン、ブルートフォース対策の遅延を備える
+- [パーソナル API トークン](./personal-api-tokens.mdx) -- mint-once なシークレットをハッシュのみで保存するパーソナル API トークン。二重ガード付きソフト失効、セッション限定の管理ルート、レースに強い last_used_at 追跡を D1 上で実装する
+- [VAPID による Web Push](./web-push-vapid.mdx) -- web-push npm パッケージを使わず、VAPID と aes128gcm 暗号化で Worker から暗号化された Web Push 通知を送信する
+- [Workers 上のリモート MCP サーバー](./remote-mcp-workers.mdx) -- WebStandard な Streamable HTTP トランスポートによるステートレスなリモート MCP サーバー -- リクエストごとの isolate インスタンス化、POST 専用の 405 契約、JSON パース前に強制するボディキャップ、SDK のクライアント半分に対するバンドルサイズチェック
+- [固定アップストリームへのリバースプロキシ](./reverse-proxy.mdx) -- 両方のレグでのヘッダー衛生、クロスリクエストのホップ上限を持つ手動リダイレクト書き換え、cookie/CSP/HSTS に関する明示的なトラストモデルの選択、共有キャッシュの安全性、そして workerd の Content-Encoding トラップ

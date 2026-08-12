@@ -1,0 +1,302 @@
+---
+title: Workers PR Previews
+description: Per-PR preview deployments for standalone Workers via version aliases, not the Pages branch-deploy model
+sidebar_position: 7
+---
+
+[PR Preview](./pr-preview.mdx) covers the Pages branch-deploy model: every push gets a URL shaped around a `--branch` name, and Cloudflare owns the mapping from branch to URL. Standalone Workers have no equivalent flag -- `wrangler deploy` doesn't take a `--branch`. This page is the Workers-native recipe: upload a version without promoting it, then give that version a stable, per-PR alias.
+
+## Why `wrangler deploy --env preview` Doesn't Scale to Concurrent PRs
+
+`--env preview` deploys to one fixed, stably-named environment -- same Worker, same URL, every time. That's fine for a single long-lived staging environment, but PR previews need N concurrent, isolated deployments, one per open PR, and `--env preview` only ever gives you one.
+
+The second concurrent PR's `wrangler deploy --env preview` doesn't create a second preview -- it overwrites the first PR's code on the exact same environment. Whichever PR deployed most recently wins; every other open PR's "preview" now silently serves someone else's branch. Nothing errors. The failure is just whoever refreshes their preview tab first sees the wrong app.
+
+## Upload a Version, Don't Deploy One
+
+`wrangler versions upload` uploads a new Worker **version** without promoting it -- no traffic gets routed to it, whether via `workers_dev`, a custom domain, or gradual deployments. Splitting "get code onto Cloudflare" from "make it live" is exactly what a preview needs: every open PR can upload its own version side by side, with nothing fighting over which one is currently deployed.
+
+By itself, an uploaded version's only address is a hash-based preview URL tied to the version id -- not memorable, and it changes on every push. `--preview-alias` fixes that with a stable, human-chosen name:
+
+```bash
+npx wrangler versions upload \
+  --env preview \
+  --preview-alias "pr-${PR_NUMBER}" \
+  --message "Preview: PR #${PR_NUMBER}"
+```
+
+The alias resolves to `pr-<N>-<worker-name>.<subdomain>.workers.dev`. It's keyed by name, not by version: pushing new commits to the same PR re-runs this command and re-points `pr-<N>` at the new version. The PR keeps the exact same preview URL across every push -- post the comment link once, never update it again.
+
+`--env preview` is what makes this a preview instead of a second production: it resolves bindings from `[env.preview.*]`, not the top level. Give `[env.preview]` its own D1 database, KV namespace, and R2 bucket ids and the alias is isolated from production data too -- see [Named Environments & Service Bindings](../workers/wrangler-config.mdx#named-environments-service-bindings) for the non-inheritance rule that makes this possible, and the Danger callout below for what happens if you skip it.
+
+## Extract the Alias URL From NDJSON, Not Stdout
+
+The PR-comment step needs the alias URL as a value, not as something to eyeball in a CI log. Grepping wrangler's human-readable stdout for something that looks like a URL is fragile -- the exact wording, surrounding lines, and ANSI color codes all shift between wrangler releases without warning, and a CI step built on that text silently breaks on the next bump.
+
+Point `WRANGLER_OUTPUT_FILE_PATH` at a file instead. Every command that supports structured output appends one JSON object per line (ND-JSON) describing what it did. A `versions upload` line carries the fields that matter here directly:
+
+```jsonc
+{"type":"version-upload","version":1,"worker_name":"my-worker","version_id":"...","preview_url":"...","preview_alias_url":"https://pr-41-my-worker.example.workers.dev","wrangler_environment":"preview","timestamp":"..."}
+```
+
+`preview_alias_url` is the stable, aliased address; `preview_url` is the version's own hash-based one. Extract the field with `jq` instead of parsing prose:
+
+```yaml
+- name: Upload preview version
+  id: preview
+  run: |
+    OUTPUT_FILE="$(mktemp)"
+    WRANGLER_OUTPUT_FILE_PATH="$OUTPUT_FILE" npx wrangler versions upload \
+      --env preview \
+      --preview-alias "pr-${PR_NUMBER}" \
+      --message "Preview: PR #${PR_NUMBER}"
+
+    PREVIEW_URL=$(jq -er 'select(.type == "version-upload") | .preview_alias_url' "$OUTPUT_FILE")
+    if [ -z "$PREVIEW_URL" ] || [ "$PREVIEW_URL" = "null" ]; then
+      echo "::error::wrangler did not emit a preview_alias_url -- check WRANGLER_OUTPUT_FILE_PATH output"
+      exit 1
+    fi
+    echo "preview_url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
+  env:
+    CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    PR_NUMBER: ${{ github.event.pull_request.number }}
+```
+
+:::tip[Filter by `type`]
+`WRANGLER_OUTPUT_FILE_PATH` can accumulate more than one line per invocation (build metadata, warnings). Always `select()` the entry type you want instead of assuming line 1.
+:::
+
+:::warning[A Missing Alias Has to Fail the Step, Not Print `null`]
+Plain `jq -r` prints the literal string `null` (or nothing at all, if `select()` matches zero lines) and still exits `0` when `preview_alias_url` is absent -- from [the prerequisites above](#three-things-have-to-agree-before-an-alias-url-resolves), that happens whenever `previews_enabled` isn't actually set on the Worker's stored subdomain state. Left unchecked, that `null` gets written straight into `$GITHUB_OUTPUT` and posted as the PR's preview link. `-er` makes `jq` itself exit non-zero on a `null`/`false` result or on no match at all, and the explicit `if` after it catches both shapes regardless of how the surrounding shell's error propagation is configured -- so a broken upload fails this step loudly instead of shipping a dead link.
+:::
+
+## Three Things Have to Agree Before an Alias URL Resolves
+
+Miss any one of these and the failure looks like a Workers outage, not a config gap.
+
+**The real gate is the stored `previews_enabled` flag on the Worker's subdomain state, not the `workers_dev` / `preview_urls` values sitting in your config file.** Cloudflare keeps one API resource per Worker (`.../workers/scripts/<name>/subdomain`) with two flags: `enabled` gates production's workers.dev route, `previews_enabled` gates every alias URL. An alias resolves only when the *stored* value of `previews_enabled` is `true` -- what your committed config currently says is a separate question from what Cloudflare currently has on file for that Worker. Get the stored value wrong and the failure looks worse than a config error: `wrangler versions upload` still succeeds, still prints an alias URL, still writes a `preview_alias_url` into the ND-JSON output -- and every request to that URL comes back Cloudflare error 1042, because the upload step only *reads* the flag, it never checks whether anyone actually wants that URL live.
+
+**Only `wrangler deploy` writes that stored state from config -- `wrangler versions upload`, which is what this recipe's CI step actually runs, never does.** `deploy` computes `enabled` / `previews_enabled` from `workers_dev` / `preview_urls` on every run and pushes both to the subdomain resource; `versions upload --preview-alias` only reads the *current* `previews_enabled` before deciding whether to print an alias URL, and leaves it untouched either way. `workers_dev = false` with `preview_urls = true` is a supported, deliberate pairing for exactly this reason -- production off workers.dev, previews still resolving -- see [The Preview-URL Disappearance Trap](../workers/static-assets.mdx#the-preview-url-disappearance-trap) for the trap that actually catches people here: `preview_urls` silently defaults to *match* `workers_dev`, so leaving it unset alongside `workers_dev = false` also defaults previews to off. Get the config right, run `wrangler deploy` once to push it (or use the bootstrap call below, for a Worker that's never been deployed), and every later `versions upload --preview-alias` in CI keeps resolving off that same stored state -- unaffected by whatever `workers_dev` says in config afterward, because `versions upload` never reads that field again either. The error-1042 case above shows up when that push never happened (a fresh Worker, see the bootstrap section below), when `deploy` ran with `workers_dev = false` and no explicit `preview_urls = true`, or when something outside this pipeline -- a dashboard click, a raw API call -- flipped `previews_enabled` off and nothing has redeployed since.
+
+**A 404 before the first version exists is expected, not a routing failure.** An alias URL for a Worker/environment pair that has never had a version uploaded under that alias returns a plain 404 -- there's no script behind it yet. That resolves itself the moment the first `versions upload --preview-alias` for that PR completes; don't chase it as a bug.
+
+:::note[Tolerate a transient `10056` right after enabling previews]
+Same rule as [CI Token gotchas](../workers/deploy-from-zero.mdx#ci-token-edit-cloudflare-workers-is-not-enough) elsewhere on this site: exact Cloudflare error codes drift across API versions, and the message is the real signal, not the number. Right after flipping `previews_enabled` on, a request against the alias URL can come back `10056` for a short window while the setting propagates. Treat it as "not ready yet" and retry once -- the same leniency-scoped-to-the-first-probe rule as [a freshly attached custom domain](../workers/deploy-from-zero.mdx#a-freshly-attached-custom-domain-is-not-immediately-usable), not a blanket tolerance for every later request.
+:::
+
+## Bootstrapping Previews on a Worker That Has Never Been Deployed
+
+A brand-new Worker -- first-ever CI run, nothing pushed yet -- has no workers.dev subdomain relationship to hang a preview alias off of. The subdomain endpoint is scoped under `.../workers/scripts/<name>/subdomain`, so it needs that script to already exist -- calling it against a name Cloudflare has never seen errors out, script not found. Upload the Worker first (a plain `versions upload`, no alias needed for this one-time call), then register the subdomain state explicitly:
+
+```bash
+npx wrangler versions upload --env preview --message "Bootstrap: initial version"
+
+RESPONSE=$(curl -s -w '\n%{http_code}' -X POST \
+  "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${WORKER_NAME}/subdomain" \
+  -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data '{"enabled": true, "previews_enabled": true}')
+HTTP_STATUS=$(echo "$RESPONSE" | tail -n1)
+BODY=$(echo "$RESPONSE" | sed '$d')
+
+if [ "$HTTP_STATUS" -ge 400 ] || [ "$(echo "$BODY" | jq -r '.success')" != "true" ]; then
+  echo "::error::Failed to enable Worker subdomain/previews (HTTP ${HTTP_STATUS}): ${BODY}"
+  exit 1
+fi
+```
+
+Make the subdomain call idempotent and run it on every CI run rather than trying to detect "is this the first deploy": calling it again on an already-registered Worker is a no-op that returns the current state, not an error. Watch for -- and don't fail the job on -- `10056`, `100116`, or `100122` in the response body here: all three show up transiently while the subdomain relationship is still settling on a freshly-created Worker, and (as with the `10056` above) the exact code matters less than "retry once, then move on." Everything else that fails the `success` check is a real failure, not a transient one, and now exits loudly instead of disappearing into a bare `curl -s`.
+
+## Previews Are Not a Data Sandbox
+
+:::danger[A preview version shares production data only if `[env.preview]` redeclares it that way]
+`wrangler versions upload` isolates *code*, not *data* -- and bindings aren't inherited between named environments at all. Omit a binding from `[env.preview]` entirely and it's simply unavailable under `--env preview`: undefined at runtime, not quietly pointed at production (see [Named Environments & Service Bindings](../workers/wrangler-config.mdx#named-environments-service-bindings) for the non-inheritance rule this relies on). The actual danger is the opposite mistake: `[env.preview]` *does* redeclare a D1 database, KV namespace, or R2 bucket, but points it at production's own resource id -- the exact pattern the [Shared Production Database](#d1-migrations-and-previews-shared-production-database-unmerged-migrations-land-on-production) section below documents for D1. Do that for any binding and the alias resolves through the same live rows, the same live keys, the same real secrets production uses. An unreviewed PR branch with a bug in a write path doesn't corrupt a sandbox; it corrupts production, through a URL nobody thinks of as production.
+
+Rolling the alias back to an earlier version undoes the *code* it serves. It does not undo any writes that version already made -- there is no accompanying data rollback. Giving `[env.preview]`'s bindings their own resource ids, distinct from production's, is the only mitigation, and it isn't optional hardening -- it's the thing that makes "preview" mean what it says.
+:::
+
+Isolation is per-binding, not all-or-nothing. It's entirely possible to isolate D1 and KV while a payments or email-sending binding, redeclared with production's own id out of convenience, quietly stays pointed at the real provider. Audit every binding `[env.preview]` declares against the id it actually points to, not just the ones that come to mind first -- a binding `[env.preview]` never declares at all isn't a data-sharing risk, it's just unavailable under `--env preview`, which is a separate bug to catch on its own.
+
+## D1 Migrations and Previews
+
+A preview alias is only as useful as the schema it can see, and how you get migrations onto it depends entirely on which of the two binding setups above you chose.
+
+### Isolated Preview Database: Migrate Preview, Leave Production Alone
+
+If `[env.preview]` points its D1 binding at its own `database_id`, apply the PR's migrations there and production is never in the blast radius:
+
+```bash
+# Applies to env.preview's own database -- production is never touched.
+npx wrangler d1 migrations apply DB --env preview --remote
+```
+
+The `--env preview` flag is load-bearing, not decoration. Bindings are per-environment (see [Named Environments & Service Bindings](../workers/wrangler-config.mdx#named-environments-service-bindings)), so dropping it doesn't error -- it just silently resolves `DB` against the top-level binding instead:
+
+```bash
+# Missing --env: resolves DB against the TOP-LEVEL binding, i.e. production's
+# database, not the PR's isolated preview one. This applies the PR's
+# unreviewed migrations to production and reports success.
+npx wrangler d1 migrations apply DB --remote
+```
+
+:::warning[One Preview Database, Not One Per PR]
+`[env.preview]`'s `database_id` is a single static value in the committed config -- every open PR's alias resolves through that same preview database, not a private copy per PR. "Isolated" here means isolated from *production*, not isolated between concurrent PRs: two PRs open at once share this one D1, so PR #41's migration or a bad write can affect PR #42's preview the same day, even though their aliases and code versions never collide. Two ways around it, depending on how much concurrent-PR isolation is worth the extra cost: serialize migrations against the preview database (a `concurrency:` group scoped to the migration job, not just the alias upload, so only one PR's migration runs at a time), or provision a fresh preview D1 per PR (`wrangler d1 create` in the workflow, migrated and torn down alongside the PR) if independent preview data matters more than the added provisioning and cleanup work.
+:::
+
+### Shared Production Database: Unmerged Migrations Land on Production
+
+The other legitimate setup is `[env.preview]` re-declaring its D1 binding but pointing it at the **same** `database_id` as production, on purpose -- some teams don't want a second D1 to provision and keep in sync:
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "app-db"
+database_id = "prod-db-id"
+
+[env.preview]
+[[env.preview.d1_databases]]
+binding = "DB"
+database_name = "app-db"
+# Same database_id as the top-level DB above -- deliberate, not an omission.
+# This is what makes the database "shared" rather than isolated.
+database_id = "prod-db-id"
+```
+
+In this setup a PR's preview only shows the right schema if CI applies that PR's **unmerged** migrations straight to production before the PR merges -- there is no separate preview database for them to land on instead. That single fact is why the additive-only discipline below is mandatory here, not a nice-to-have: an unreviewed branch's migration runs against the real database, and if the PR is later abandoned instead of merged, whatever it already applied stays applied. There's no framework-level revert.
+
+### The Additive-Only Guard, and Its Escape Hatch
+
+"Additive-only" means a PR's migrations may only add -- new tables, new columns with a default, new indexes -- and never drop, rename, or narrow anything currently-deployed code depends on. Enforce it in CI rather than by convention, with an explicit way out for the rare case a maintainer has actually reviewed a breaking change:
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - "migrations/**"
+
+jobs:
+  guard-migrations:
+    name: Additive-Only Migration Guard
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'allow-breaking-migration') }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Reject destructive statements in new migrations
+        run: |
+          NEW_FILES=$(git diff --name-only --diff-filter=A "${{ github.event.pull_request.base.sha }}...HEAD" -- migrations/)
+          for f in $NEW_FILES; do
+            if grep -Eiq '\bDROP (TABLE|COLUMN)\b|\bALTER TABLE .* RENAME\b|\bDELETE FROM\b' "$f"; then
+              echo "::error file=$f::Destructive statement in an additive-only migration set. Label the PR 'allow-breaking-migration' to override."
+              exit 1
+            fi
+          done
+```
+
+:::warning[`labeled` and `unlabeled` have to be in the trigger explicitly]
+`pull_request` without a `types:` list defaults to `opened`, `synchronize`, `reopened` -- adding a label to an already-open PR isn't in that set, so GitHub Actions won't re-run the guard just because a maintainer applied `allow-breaking-migration`. The check stays stuck red until the next push. List `labeled` and `unlabeled` explicitly so applying (or removing) the escape-hatch label re-evaluates the guard on its own.
+:::
+
+### Back Up Before Every Shared-Database Apply
+
+The guard catches obviously destructive SQL, not every way a migration can go wrong against live data. Export before applying, every time, so a bad migration against the shared database has a recovery path -- and export somewhere that outlives the job, not just the runner's disk:
+
+```yaml
+- name: Back up shared database before migration
+  run: npx wrangler d1 export DB --remote --output "backup-pr-${PR_NUMBER}-$(date +%s).sql"
+  env:
+    CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    PR_NUMBER: ${{ github.event.pull_request.number }}
+
+- name: Upload backup artifact
+  uses: actions/upload-artifact@v7
+  with:
+    name: d1-backup-pr-${{ github.event.pull_request.number }}
+    path: "backup-pr-*.sql"
+    retention-days: 7
+
+- name: Apply migration
+  run: npx wrangler d1 migrations apply DB --remote
+  env:
+    CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+```
+
+A `wrangler d1 export` with no upload step writes to the ephemeral runner's disk -- the export exists for the length of the job, then the runner is destroyed along with it. There's nothing left to restore from by the time anyone notices the migration broke something. The upload step is what turns "a file that briefly existed" into an actual recovery path.
+
+:::warning[A Shared-Database Export Can Contain Real Production Data]
+This is the shared-database branch of the D1 setup -- the export is production's data, not a preview copy. GitHub Actions artifacts are visible to anyone with read access to the repository (which, on a public repo, is everyone), so treat `retention-days` and repository visibility as part of this decision, not an afterthought. If the database holds anything sensitive, upload to a secured, access-controlled destination instead of a workflow artifact -- a private cloud storage bucket your team already restricts, not a spot anyone with `git clone` access can browse.
+:::
+
+### `NOT NULL` Still Needs a `DEFAULT`
+
+An `ADD COLUMN` reads as purely additive, but it can still break the code that's *currently deployed* -- the old version, still live, that has never heard of the new column:
+
+```sql
+-- Breaks the currently-deployed Worker: its INSERTs don't set `status`, and
+-- SQLite rejects the row because there's no DEFAULT to fall back on.
+ALTER TABLE orders ADD COLUMN status TEXT NOT NULL;
+
+-- Additive and backward-compatible: the currently-deployed Worker's INSERTs
+-- succeed by falling back to the default.
+ALTER TABLE orders ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';
+```
+
+The grep guard above won't catch this -- `ADD COLUMN` isn't in its destructive-keyword list, and it shouldn't be, since most `ADD COLUMN` statements are exactly what "additive" means. This one is a review-time check, not a CI-automatable one.
+
+### Two Branches, the Same Migration Number
+
+`wrangler d1 migrations create` numbers sequentially from whatever already exists in `migrations/`. Two PR branches cut from the same base commit both get the next number:
+
+```bash
+# Branch A (PR #41), created off main at commit X
+npx wrangler d1 migrations create DB "add-status-column"
+# -> migrations/0007_add-status-column.sql
+
+# Branch B (PR #42), created off the same commit X
+npx wrangler d1 migrations create DB "add-priority-column"
+# -> migrations/0007_add-priority-column.sql
+```
+
+Neither PR sees a git conflict -- the filenames differ -- so both merge clean, and `main` ends up with two files both numbered `0007`. Whichever one wrangler's directory listing sorts second now applies after the other, decided by filename, not by merge order or by which migration the other one actually depends on. Rebase and regenerate the migration's number immediately before merging, or add a CI check that fails when a PR's migration number already exists on the base branch.
+
+## Preview Lifecycle: What Happens When a PR Closes
+
+Closing or merging a PR does not delete its alias. Nothing in this recipe issues a cleanup call, and wrangler has no `versions delete` or equivalent -- there's no command to reach for that forces an alias to disappear early. `pr-41-my-worker.<subdomain>.workers.dev` keeps resolving, keeps serving whatever version it last pointed to, and keeps reading through whatever `[env.preview]` bindings it has, for as long as it exists.
+
+What eventually reclaims it is a fixed cap, not PR state: Cloudflare retains at most the 1,000 most recently deployed aliases per Worker, evicting the least-recently-deployed one once a new alias would exceed that. On a busy repo that's a real backstop; on a quiet one, an alias from a PR closed months ago can still be live and still answering requests.
+
+Two implications worth designing around instead of discovering later. A lingering alias is exactly as exposed as the Danger above describes -- if `[env.preview]`'s bindings aren't isolated, a stale, forgotten PR preview is a live door onto production, not an inert leftover. And a PR reopened after its alias aged out doesn't error -- the next `versions upload --preview-alias pr-<N>` just creates the alias fresh, the same as the very first time.
+
+## Fork PRs: Skip the Whole Job, Not Just the Deploy Step
+
+[PR Preview](./pr-preview.mdx) covers the Pages side of this: GitHub withholds repository secrets from a `pull_request`-triggered workflow when the PR comes from a fork, so `CLOUDFLARE_API_TOKEN` resolves empty and the deploy step fails. That's a real failure -- a red X on every fork contributor's PR, for a reason that has nothing to do with their code.
+
+Skip the job outright instead of letting it fail into that state:
+
+```yaml
+jobs:
+  preview:
+    name: Preview Deploy
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      # ...versions upload, migration apply, PR comment
+```
+
+A job-level `if:` means the whole job -- checkout, build, the versions upload, the D1 migration apply, everything that touches `CLOUDFLARE_API_TOKEN` -- never starts for a fork PR. It shows up as skipped, not failed, and nothing in it ever runs against untrusted code with real credentials in scope.
+
+The `github.actor != 'dependabot[bot]'` clause covers a case the fork check misses entirely: a Dependabot PR passes `head.repo.full_name == github.repository` -- it's opened against this repository, not a fork -- but GitHub withholds repository secrets from Dependabot-triggered workflow runs regardless, the same as it does for forks. Without the actor check, every dependency-bump PR would pass the fork gate, run the job, and fail red on an empty `CLOUDFLARE_API_TOKEN`.
+
+:::warning[`pull_request_target` is not the fix for "forks don't get previews"]
+The tempting next step is switching the trigger to `pull_request_target`, which does run with the base repository's secrets even for a fork PR. That solves the missing-secrets symptom and opens a much worse hole if the job still checks out the fork's HEAD ref to build it: `pull_request_target` grants secrets to the workflow, and checking out attacker-controlled code inside that context means their install scripts, build steps, or test code run with those secrets in scope. This is the standard "pwn request" pattern behind a long list of real supply-chain compromises. If fork contributors genuinely need previews, that requires a deliberate two-stage design -- build untrusted code with no secrets on `pull_request`, then gate a second, secret-bearing job behind maintainer approval -- not a one-line trigger swap.
+:::
+
+Related pages: [Wrangler Config](../workers/wrangler-config.mdx) for the environment and binding rules this recipe depends on, [Workers Static Assets](../workers/static-assets.mdx) for the `preview_urls` mechanics, [D1](../storage/d1.mdx) for general migration usage, and [PR Preview](./pr-preview.mdx) for the Pages branch-deploy equivalent.

@@ -21,6 +21,32 @@ main = "src/index.ts"
 compatibility_date = "2024-12-01"
 ```
 
+## TOML のテーブルスコープ
+
+`wrangler.toml` は素の [TOML](https://toml.io/) であり、TOML のテーブルのルールがそのまま適用される。`[vars]`、`[assets]`、`[env.preview]` のようなテーブルヘッダーを書いた時点で、それに続く**裸の `key = value` 行はすべてそのテーブルに属する**。トップレベルには属さない。次の `[...]` ヘッダーが現れるまでこれは続く。ファイルの末尾にフィールドを追記する際、自分が今どのテーブルの中にいるかを確認しないとこれで足をすくわれる：
+
+```toml
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+
+# Intended as a top-level setting, but it lands inside [assets] because
+# no new table header appeared above it.
+workers_dev = false
+```
+
+wrangler はこの位置ずれを無害なノイズとして黙って受け入れたりしない。各テーブルの既知のフィールドを検証し、属さないものを報告する：
+
+```
+Unexpected fields found in assets field: "workers_dev"
+```
+
+これは**警告**であってハードエラーではない。ビルド自体は通るが、意図した場所に適用されずフィールドが捨てられるだけだ。`workers_dev` は一切効かなくなり、長いデプロイログの中では見落としやすいミスになる。
+
+:::tip[トップレベルのキーは最初のテーブルヘッダーより上にまとめる]
+`name`、`main`、`compatibility_date`、`compatibility_flags`、`workers_dev`、`preview_urls` はファイルの一番上、どの `[...]` テーブルよりも前にまとめて書く。トップレベルに置きたいものは、直前に編集していたテーブルだけでなく、すべてのテーブルヘッダーより上に置く必要がある。
+:::
+
 ## バインディング
 
 バインディングはコードを Cloudflare サービスに接続する。
@@ -67,11 +93,67 @@ npx wrangler secret put MY_SECRET
 `[vars]` セクションは機密性のない設定専用。シークレットは `wrangler secret put` または Cloudflare ダッシュボードで設定する。`wrangler.toml` は git にコミットされる。
 :::
 
+### 必須シークレットの宣言
+
+シークレット自体は `wrangler.toml` に書かないが、**Worker が期待するシークレット名**は `[secrets]` テーブルで宣言できる：
+
+```toml
+[secrets]
+required = ["STRIPE_KEY", "SESSION_SECRET"]
+```
+
+これは値を設定するものではない。wrangler が dev 時とデプロイ時に強制するチェックリストだ：
+
+- **`wrangler dev`**: 必須シークレットが欠けていても**警告**にとどまり、起動は止まらない -- `Missing required secrets: STRIPE_KEY. Add them to .dev.vars, .env, or set as environment variables.` Worker はそのまま起動し、そのシークレットは単に `env` に存在しないだけになる。
+- **新規 Worker の初回デプロイ**: 必須シークレットが欠けていると**ハードエラー**でデプロイが止まる -- `The following required secrets have not been set: STRIPE_KEY. Use wrangler secret put <NAME> to set secrets before deploying.`
+- **既存 Worker の再デプロイ**: wrangler はまず前バージョンの値を継承するよう API に依頼し、即座には失敗させない。そのシークレットが本当に一度も設定されていなければ API が継承を拒否し、wrangler は同じ「required secrets have not been set」エラーを再度出す -- 失敗自体は変わらず、API のラウンドトリップが一往復増えるだけだ。
+
+:::note[`--strict-vars` は無関係]
+`--strict-vars`（デフォルト `true`）は `wrangler types` 用のフラグで、`[vars]` に対して生成する TypeScript の型をリテラル/ユニオン型にするか、広い primitive 型にするかを制御する。`[secrets].required` とは何の関係もない。名前が似ているだけで、まったく別の機能を指している。
+:::
+
+:::danger[`[secrets]` も名前付き環境には継承されない]
+`[vars]` やバインディングと同じく、これも Worker レベルの設定であり名前付き環境からは自動的に見えない。`wrangler deploy --env preview` は `[env.preview.secrets]` しか見ない -- そのテーブルがなければ、上で説明した必須シークレットの検証はその環境に対して一切実行されず、シークレット未設定のまま preview のデプロイが黙って成功してしまう。
+
+```toml
+[secrets]
+required = ["STRIPE_KEY", "SESSION_SECRET"]
+
+[env.preview.secrets]
+required = ["STRIPE_KEY", "SESSION_SECRET"]
+```
+
+バインディングと `[vars]` に適用される同じ罠については、[環境の非継承ルール](#名前付き環境とサービスバインディング-最大の落とし穴-バインディングと-vars-は継承されない)を参照。
+:::
+
+### `wrangler deploy` は `[vars]` を丸ごと置き換える
+
+デフォルトでは、`wrangler deploy` のたびに**Worker 上に現在ある vars をすべて削除し、`wrangler.toml` が宣言するものだけに置き換える。**Cloudflare ダッシュボードから応急処置で var を追加していても、次の設定駆動のデプロイでそれは黙って消える -- マージは行われない。
+
+```bash
+npx wrangler deploy --keep-vars
+```
+
+`--keep-vars` を使うと削除してから再作成するステップをスキップし、ダッシュボードで設定した vars を `wrangler.toml` が宣言するものと並存させたまま残す。設定ファイルの外で vars が設定されている可能性がある場合は常にこれを使う。シークレットはどちらの場合でも影響を受けない -- `wrangler deploy` はこのフラグの有無にかかわらずシークレットを削除しないので、このトラップは `[vars]` に固有のものだ。
+
+:::tip[デプロイ前に確認する]
+現在何がライブになっているか分からない場合は、環境で初めて設定駆動のデプロイを行う前にダッシュボードの Variables & Secrets タブを確認し、`--keep-vars` が必要かどうかを判断する。
+:::
+
 ## Pages 固有のオプション
 
 ```toml
 pages_build_output_dir = "./dist"
 ```
+
+## `[cache]` テーブル
+
+```toml
+[cache]
+enabled = true
+```
+
+`[cache]` は許可されたフィールドが `enabled`（boolean）ひとつだけの、正当で有効な `wrangler.toml` テーブルだ。それ以外のキーを入れると、前述の「Unexpected fields」チェックに同じように引っかかる。このページの他のテーブルより新しくドキュメント化も薄いため、**一部エディタの汎用 TOML/JSON スキーマ linter は未知のキーとしてフラグを立てる**ことがある。wrangler 自体は何の問題もなく受け付けているにもかかわらずだ。`[cache]` の下にエディタが引く赤い波線は、古くなったスキーマのせいだと考えて構わない。エディタの下線ではなく、ファイル全体を検証する `wrangler deploy --dry-run` で確認すること。
 
 ## 複数バインディングの例
 
@@ -155,13 +237,33 @@ binding = "CACHE"
 id = "placeholder-production-kv-id"
 ```
 
-:::warning[環境ごとにすべて再宣言する]
-バインディングや vars に部分的な継承は存在しない。`[env.preview]` を作るなら、その D1、R2、KV、AI、services、そして `[env.preview.vars]` を自前で列挙しなければならない。バインディングの欠落はデプロイ時にエラーにならず、Worker 内の実行時 `undefined` として表面化する。
+:::warning[環境ごとにすべて再宣言する -- `[assets]` を除いて]
+バインディング、vars、シークレットに部分的な継承は存在しない。`[env.preview]` を作るなら、その D1、R2、KV、AI、services、`[env.preview.vars]`、そして `[env.preview.secrets]` を自前で列挙しなければならない。バインディングの欠落はデプロイ時にエラーにならず、Worker 内の実行時 `undefined` として表面化する。`[env.preview.secrets]` の欠落は違う壊れ方をする -- [必須シークレットの宣言](#バインディング-必須シークレットの宣言)で説明した検証がその環境では一切実行されず、シークレットが未設定のままデプロイが成功してしまう。唯一の例外が `[assets]`（Static Assets）で、以下で扱う。
+:::
+
+:::info[唯一の例外: `[assets]` は継承される]
+Static Assets は上記のルールを破る。トップレベルで `[assets]` を宣言し、`[env.preview]` が自前の `[env.preview.assets]` を宣言していなければ、`env.preview` は directory も binding も含めてトップレベルのブロックをそのまま自動的に使う。wrangler は `assets` を `workers_dev` と同じ扱い、つまり再宣言が必要なバインディングではなく通常の継承可能な設定として扱う。
+
+```toml
+name = "my-site"
+main = "./dist/_worker.js"
+compatibility_date = "2024-12-01"
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+
+# env.preview declares no [env.preview.assets] block at all,
+# so it inherits the top-level [assets] above unchanged.
+[env.preview]
+```
+
+継承は環境単位でオール・オア・ナッシングだ。`[env.preview.assets]` が部分的にでも存在した瞬間、それはマージされるのではなくトップレベルのブロックをまるごと置き換える。だから部分的な上書きであっても、依存しているフィールド（`directory`、`binding`、`not_found_handling`、`run_worker_first`）はすべて書く必要がある。
 :::
 
 <Note>
 
-`workers_dev` や `preview_urls` といったバインディングではない*設定*は、トップレベルから名前付き環境へ継承される。継承されないルールはバインディングと `[vars]` に特有のものだ。可読性のために環境ごとに明示的に設定することも依然として一般的。
+`workers_dev` や `preview_urls` といったバインディングではない*設定*は、トップレベルから名前付き環境へ継承される。継承されないルールはバインディング、`[vars]`、`[secrets]` に適用される -- 上で述べた `[assets]` という唯一の例外を除いて。可読性のために環境ごとに明示的に設定することも依然として一般的。
 
 </Note>
 

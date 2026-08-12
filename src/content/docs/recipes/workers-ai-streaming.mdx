@@ -215,6 +215,24 @@ const stream = new ReadableStream<Uint8Array>({
 Once `aborter` fires, the next `if (aborter.signal.aborted) break` exits the loop
 and the reader is released, so no further frames are pulled from Workers AI.
 
+:::warning[This pattern is for one-to-one streams, not fan-out]
+The `AbortController` + `signal`/`cancel()` pair above works because there is
+exactly one client and exactly one stream — one place doing the aborting, one
+`ReadableStream` to tear down. That holds for any one-to-one streaming
+handler, plain Worker or Durable Object alike; nothing here is specific to
+running outside a DO.
+
+What breaks the pattern is fan-out, or any stream that can sit idle: neither
+`signal` nor `cancel()` fires until the runtime actually attempts I/O against
+that specific connection and it fails, so a broadcast loop serving many
+connections at once can have a closed client sit invisible for minutes. The
+common shape for that is a Durable Object fanning SSE out to many
+connections — see [SSE fan-out and the heartbeat
+disconnect check](../workers/durable-objects.mdx#sse-fan-out-and-the-heartbeat-disconnect-check)
+for why per-request cancellation isn't enough there, and the heartbeat
+pattern that replaces it.
+:::
+
 ## Runtime kill switch
 
 Sometimes you need to turn the endpoint off right now — a cost spike, abuse, or a
