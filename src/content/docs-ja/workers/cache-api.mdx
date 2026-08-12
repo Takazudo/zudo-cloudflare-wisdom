@@ -133,7 +133,7 @@ curl -sI https://<worker>.<subdomain>.workers.dev/ | grep -i cf-cache-status
 
 ## `[cache]` にエディタの赤い波線が出る
 
-一部のエディタの汎用的な TOML/JSON スキーマリンターは、`[cache]` / `"cache"` を未知のキーとしてフラグを立てる。このテーブルが、エディタに同梱されたスキーマより新しいからだ。これは古びたリンターの問題であって、実際のエラーではない -- 同じテーブルについてすでに書かれている罠は [Wrangler 設定の `[cache]` テーブルの節](./wrangler-config.mdx#the-cache-table)を参照し、エディタの下線ではなく `npx wrangler deploy --dry-run` で確認すること。
+一部のエディタの汎用的な TOML/JSON スキーマリンターは、`[cache]` / `"cache"` を未知のキーとしてフラグを立てる。このテーブルが、エディタに同梱されたスキーマより新しいからだ。これは古びたリンターの問題であって、実際のエラーではない -- 同じテーブルについてすでに書かれている罠は [Wrangler 設定の `[cache]` テーブルの節](./wrangler-config.mdx#cache-テーブル)を参照し、エディタの下線ではなく `npx wrangler deploy --dry-run` で確認すること。
 
 ## Workers Cache と、ハッシュ化アセットのブラウザキャッシュの違い
 
@@ -141,4 +141,4 @@ curl -sI https://<worker>.<subdomain>.workers.dev/ | grep -i cf-cache-status
 
 実務上の違いはこうだ: ブラウザキャッシュがミスしても、コストは Cloudflare のエッジへのリクエスト 1 回分で済む（安くはあるが無料ではない）。エッジキャッシュの `HIT` は、エッジのレスポンスそのもの以外のコストがかからない。Worker のコードが一切動かないからだ。この 2 つは別の問題を解決している -- クライアントの往復を避けることと、Worker の呼び出しを避けること -- であり、あるレスポンスは両方に、どちらか一方だけに、あるいはどちらにも当てはまらない形で対応できる。
 
-関連ページ：[ローカル開発: バインディング対応表](./local-dev-bindings.mdx)は `wrangler dev` で何がエミュレートされ何がされないかについて、[Wrangler 設定](./wrangler-config.mdx#the-cache-table)は `[cache]` テーブルのエディタ誤検知について。
+関連ページ：[ローカル開発: バインディング対応表](./local-dev-bindings.mdx)は `wrangler dev` で何がエミュレートされ何がされないかについて、[Wrangler 設定](./wrangler-config.mdx#cache-テーブル)は `[cache]` テーブルのエディタ誤検知について。

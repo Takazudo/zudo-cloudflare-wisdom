@@ -36,3 +36,4 @@ Cloudflare Workers はエッジで実行されるサーバーレス関数。ス�
 - [ローカル開発: バインディング対応表](./local-dev-bindings.mdx) -- `wrangler dev` でどのバインディングがローカルエミュレートされるか、クレデンシャル不要な e2e 用の設定パターン
 - [ランタイムの落とし穴](./runtime-gotchas.mdx) -- self-fetch のホスト名、ストアされた fetch レスポンス、waitUntil / scheduled の予算、バインディングをラップするライブラリ、cloudflare:workers のアンビエント env、CORS と WebSocket
 - [Pages から Workers への移行](./pages-to-workers-migration.mdx) -- 最小限のダウンタイムで Pages から Workers Static Assets へライブサイトを移行し、うまくいかなかった場合にきれいにロールバックする
+- [Workers Cache（ctx.cache）](./cache-api.mdx) -- エッジレベルの cache.enabled / ctx.cache 機能 -- バージョンの下限、Cache-Control/Cache-Tag/Vary、ctx.cache.purge のスコープ、Cf-Cache-Status、Next.js の ISR をめぐる論点、そして検証がデプロイ済み Worker に対してしか成立しない理由
