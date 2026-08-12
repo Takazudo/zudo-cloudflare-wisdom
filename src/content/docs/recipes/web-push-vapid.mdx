@@ -148,7 +148,7 @@ async function signVapidJwt(
   const claims = {
     aud: audienceOrigin, // scheme + host of the push endpoint, no path -- see below
     exp: Math.floor(Date.now() / 1000) + VAPID_EXP_SECONDS,
-    sub: subject, // "mailto:push@example.com" -- optional per RFC 8292, but several push services reject requests without it
+    sub: subject, // "mailto:push@example.com" -- RFC 8292 says this SHOULD be included, and several push services reject requests without it
   };
   const signingInput = `${jsonToBase64Url(header)}.${jsonToBase64Url(claims)}`;
 
@@ -226,9 +226,9 @@ means:
 
 ```typescript
 async function hkdf(
-  ikm: ArrayBuffer,
-  salt: ArrayBuffer,
-  info: ArrayBuffer,
+  ikm: BufferSource,
+  salt: BufferSource,
+  info: BufferSource,
   lengthBits: number,
 ): Promise<ArrayBuffer> {
   const key = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
@@ -279,7 +279,7 @@ async function encryptPushPayload(
 
   const asKeyPair = await crypto.subtle.generateKey(
     { name: "ECDH", namedCurve: "P-256" },
-    true,
+    false, // not extractable -- the private half is never exported, only used for deriveBits below
     ["deriveBits"],
   );
   const asPublicRaw = new Uint8Array(await crypto.subtle.exportKey("raw", asKeyPair.publicKey));
@@ -322,9 +322,13 @@ async function encryptPushPayload(
 }
 ```
 
+`hkdf`'s parameters are typed `BufferSource` -- the union `crypto.subtle.importKey()` and `deriveBits()` actually accept -- rather than the narrower `ArrayBuffer`. Every call site above passes a `Uint8Array` (`authSecret`, `ikmInfo`, the `TextEncoder` output, the random salt from `crypto.getRandomValues`), and under `strict` TypeScript a `Uint8Array` is not assignable to a bare `ArrayBuffer` parameter -- typing `hkdf` as `ArrayBuffer` would fail to compile the moment any of these call sites ran through `tsc`, even though every one of them works correctly at runtime.
+
 :::note[Push payloads are small on purpose]
-RFC 8030 caps a push message's encrypted content at 4096 octets, and push
-services enforce close to that limit. A single `aes128gcm` record's overhead
+RFC 8030 §5.2 requires a push service to **support at least** 4096 octets of
+encrypted content -- a floor, not a cap -- but in practice most push services
+enforce something close to that floor as their real ceiling anyway, so
+designing for it is the safe default. A single `aes128gcm` record's overhead
 is fixed -- an 86-byte header for a P-256 key id, a 16-byte GCM tag, and the
 1-byte padding delimiter, roughly 103 bytes -- which leaves on the order of
 3900 plaintext bytes of headroom: comfortably enough for a JSON payload naming
@@ -440,6 +444,49 @@ uses for outbound fetches in general -- there is no legitimate hop to follow
 here, so there is nothing to rebuild the request for.
 :::
 
+### Validate the Endpoint Host at Subscribe Time
+
+`redirect: "manual"` above closes the redirect hop, but it does nothing about
+the *initial* request: `subscription.endpoint` is whatever the client's
+subscribe request said it is, and nothing forces that it actually came from a
+real `PushManager.subscribe()` call. Anyone who can reach your subscribe
+endpoint can submit any URL there, including an internal service or a cloud
+metadata endpoint, and the server will dutifully sign a VAPID JWT and `POST`
+an encrypted body to it -- the same outbound-fetch risk
+[SSRF and Redirect Safety](./ssrf-and-redirect-safety.mdx) covers in general,
+applied to a URL that arrives through a subscription instead of a redirect.
+
+The real push services are a short, stable list of hosts, so validate
+against an allowlist at subscribe time rather than trying to block the ones
+you don't want -- the same allowlist-over-blocklist framing
+[SSRF and Redirect Safety](./ssrf-and-redirect-safety.mdx) uses for outbound
+fetches generally:
+
+```typescript
+const PUSH_ENDPOINT_HOST_SUFFIXES = [
+  "googleapis.com", // Chrome/Edge -- FCM
+  "push.services.mozilla.com", // Firefox -- autopush
+  "web.push.apple.com", // Safari
+  "notify.windows.com", // legacy Edge/WNS
+];
+
+function isAllowedPushEndpoint(endpoint: string): boolean {
+  let host: string;
+  try {
+    host = new URL(endpoint).host;
+  } catch {
+    return false;
+  }
+  return PUSH_ENDPOINT_HOST_SUFFIXES.some(
+    (suffix) => host === suffix || host.endsWith(`.${suffix}`),
+  );
+}
+```
+
+Run this check when a subscription is first submitted, before it is ever
+stored -- rejecting a bad `endpoint` at subscribe time means `sendPushMessage`
+never has to see one.
+
 ### 404/410 vs Transient Failures
 
 The response status splits into three actionable buckets, and conflating any
@@ -450,8 +497,9 @@ two of them either leaks dead subscriptions forever or throws away live ones:
 - **`404` or `410`:** the subscription is permanently gone -- the user
   uninstalled the app, revoked notification permission, or cleared browser
   data. The push service is telling you, definitively, to stop trying. Prune
-  the subscription from storage on this response, not on some accumulated
-  failure count.
+  the subscription from storage -- [KV](../storage/kv.mdx) or
+  [D1](../storage/d1.mdx), depending on where subscriptions live -- on this
+  response, not on some accumulated failure count.
 - **`429` or `5xx`:** transient. Retry with backoff; do not prune. A
   subscription is not dead just because the push service was briefly
   overloaded or down.
@@ -473,21 +521,24 @@ export type PushResult =
   | { outcome: "expired"; status: number } // caller must prune the subscription
   | { outcome: "transient"; status: number }; // caller should retry with backoff
 
+type PushOptions = {
+  ttlSeconds?: number;
+  urgency?: "very-low" | "low" | "normal" | "high";
+  topic?: string;
+};
+
 const PUSH_SUCCESS = new Set([200, 201, 202]);
 
-export async function sendPushMessage(
+// The actual delivery, given an already-signed JWT -- shared by the
+// single-message path below and the fan-out batch in "Fan-Out" further down,
+// which signs one JWT per push-service origin instead of one per message.
+async function deliverPush(
   subscription: PushSubscription,
   payload: Uint8Array,
+  jwt: string,
   env: Env,
-  options: {
-    ttlSeconds?: number;
-    urgency?: "very-low" | "low" | "normal" | "high";
-    topic?: string;
-  } = {},
+  options: PushOptions,
 ): Promise<PushResult> {
-  const endpointUrl = new URL(subscription.endpoint);
-  const privateKeyJwk = JSON.parse(env.VAPID_PRIVATE_KEY_JWK) as VapidKeyJwk;
-  const jwt = await signVapidJwt(endpointUrl.origin, env.VAPID_SUBJECT, privateKeyJwk);
   const body = await encryptPushPayload(payload, subscription.keys.p256dh, subscription.keys.auth);
 
   const headers = new Headers({
@@ -518,6 +569,18 @@ export async function sendPushMessage(
   // 429 / 5xx, and anything else not covered above -- treat as transient.
   return { outcome: "transient", status: res.status };
 }
+
+export async function sendPushMessage(
+  subscription: PushSubscription,
+  payload: Uint8Array,
+  env: Env,
+  options: PushOptions = {},
+): Promise<PushResult> {
+  const endpointUrl = new URL(subscription.endpoint);
+  const privateKeyJwk = JSON.parse(env.VAPID_PRIVATE_KEY_JWK) as VapidKeyJwk;
+  const jwt = await signVapidJwt(endpointUrl.origin, env.VAPID_SUBJECT, privateKeyJwk);
+  return deliverPush(subscription, payload, jwt, env, options);
+}
 ```
 
 ```mermaid
@@ -536,6 +599,85 @@ graph TB
   Send -->|429/5xx| Retry[Transient -- retry with backoff, keep subscription]
 ```
 
+## Fan-Out: Subrequest Caps and Reusing the VAPID JWT
+
+The natural way to notify many subscribers is a loop that calls
+`sendPushMessage` once per subscription -- which means one outbound
+`fetch()` per subscription, against Workers' per-invocation subrequest cap:
+**50 on the Free plan, 10,000 by default on Paid** (the Paid limit is
+configurable up to 10 million; see
+[Limits](https://developers.cloudflare.com/workers/platform/limits/) for the
+current numbers). A notification to a mailing list large enough to exceed
+whichever cap applies blows through it from a single invocation, and the
+failure looks like a partial, seemingly random drop in delivery rather than
+an obvious error.
+
+`sendPushMessage` also signs a fresh VAPID JWT for every single message, and
+that is wasteful for exactly the same fan-out. `signVapidJwt`'s claims
+depend only on `audienceOrigin` -- the push endpoint's origin -- and
+`VAPID_EXP_SECONDS` above is a full hour. A fan-out to a few thousand
+subscribers realistically touches only a handful of distinct origins (FCM,
+Mozilla's autopush, Apple's web push service, and whatever else the
+subscriber base uses), so signing per message repeats the same ECDSA
+signature dozens or hundreds of times for an origin whose JWT is already
+valid for the next hour. Sign once per origin and reuse it across every
+subscription that shares it:
+
+```typescript
+export async function sendPushBatch(
+  subscriptions: PushSubscription[],
+  payload: Uint8Array,
+  env: Env,
+  options: PushOptions = {},
+): Promise<PushResult[]> {
+  const privateKeyJwk = JSON.parse(env.VAPID_PRIVATE_KEY_JWK) as VapidKeyJwk;
+
+  // One JWT per push-service origin, reused across every subscription that
+  // shares it -- not one per message.
+  const jwtByOrigin = new Map<string, Promise<string>>();
+  const jwtFor = (origin: string): Promise<string> => {
+    let cached = jwtByOrigin.get(origin);
+    if (!cached) {
+      cached = signVapidJwt(origin, env.VAPID_SUBJECT, privateKeyJwk);
+      jwtByOrigin.set(origin, cached);
+    }
+    return cached;
+  };
+
+  return Promise.all(
+    subscriptions.map(async (subscription) => {
+      const origin = new URL(subscription.endpoint).origin;
+      const jwt = await jwtFor(origin);
+      return deliverPush(subscription, payload, jwt, env, options);
+    }),
+  );
+}
+```
+
+### Chunking Beyond the Subrequest Cap
+
+`sendPushBatch` above still issues one `fetch()` per subscription from a
+single Worker invocation, so it is only safe up to the subrequest cap
+itself. A subscriber list larger than that has to be split across multiple
+invocations, not sent from one:
+
+- `ctx.waitUntil(sendPushBatch(chunk, payload, env))` is worth reaching for
+  regardless of list size: it lets the triggering request return
+  immediately instead of the caller waiting on every push delivery, since
+  nothing about triggering a notification fan-out needs the client to block
+  on it. It does not, on its own, raise the subrequest cap -- that cap
+  applies for the life of one invocation whether the fetches happen
+  synchronously in the handler or deferred into a `waitUntil`.
+- The only way to send more messages in total than the cap allows for a
+  single invocation is to split the list across multiple invocations.
+  [Cloudflare Queues](https://developers.cloudflare.com/queues/) is the
+  standard shape for that: enqueue one message per chunk of subscribers
+  sized to fit inside the cap, and let each queue consumer -- itself a
+  fresh Worker invocation with its own subrequest budget -- call
+  `sendPushBatch` on that chunk. Queues' built-in retry is also a natural
+  fit here: a `transient` outcome for one subscriber in a chunk shouldn't
+  fail the whole chunk's delivery.
+
 ## Wrangler Config: Secret vs Vars
 
 `VAPID_PUBLIC_KEY` is not sensitive -- it is handed to every subscribing
@@ -551,9 +693,8 @@ main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
 [vars]
-VAPID_PUBLIC_KEY = "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8"
+VAPID_PUBLIC_KEY = "BExample_Replace_With_Your_Own_Generated_VAPID_Public_Key"
 VAPID_SUBJECT = "mailto:push@example.com"
-VAPID_PRIVATE_KEY_JWK = ""
 ```
 
 ```bash
@@ -561,13 +702,45 @@ npx wrangler secret put VAPID_PRIVATE_KEY_JWK
 # paste the JSON-stringified { kty, crv, d, x, y } from generateVapidKeyPair()
 ```
 
-:::danger[Secrets vs Vars]
-The blank `VAPID_PRIVATE_KEY_JWK` in `[vars]` is only a placeholder for local
-typing -- the real value is set with `wrangler secret put VAPID_PRIVATE_KEY_JWK`
-and never committed. Leaking it is equivalent to leaking every VAPID-signed
-push identity for this Worker at once, the same blast radius as the shared
-signing keys covered in [HTTP-only Cookie Sessions](./cookie-sessions.mdx) and
+For local development, put the same JSON string in `.dev.vars` (gitignored,
+never committed) instead of running `wrangler secret put` against a local
+environment:
+
+```
+# .dev.vars
+VAPID_PRIVATE_KEY_JWK={"kty":"EC","crv":"P-256","d":"...","x":"...","y":"..."}
+```
+
+:::danger[Never declare a secret's name in `[vars]` too]
+`VAPID_PRIVATE_KEY_JWK` is typed by the `Env` interface declared earlier on
+this page -- `[vars]` is not a typing mechanism, and it never needs a blank
+placeholder entry for a name that's set as a secret. A Worker has one
+binding per name, so declaring the same name in both `[vars]` and as a
+secret is a collision, not a harmless redundancy: reports against
+`wrangler deploy` describe it silently overwriting a dashboard- or
+CLI-set secret value with whatever `[vars]` says at deploy time
+([workers-sdk#276](https://github.com/cloudflare/wrangler2/issues/276),
+[workers-sdk discussion #8219](https://github.com/cloudflare/workers-sdk/discussions/8219)).
+At best the precedence between the two is undocumented; at worst the next
+deploy silently replaces a working VAPID private key with an empty string,
+and every push starts failing with an opaque push-service rejection.
+Leaking the real secret value, wherever it ends up set, is equivalent to
+leaking every VAPID-signed push identity for this Worker at once -- the same
+blast radius as the shared signing keys covered in
+[HTTP-only Cookie Sessions](./cookie-sessions.mdx) and
 [Signing Webhooks with HMAC-SHA256](./webhook-signing.mdx).
+:::
+
+:::warning[The example `VAPID_PUBLIC_KEY` above is a placeholder, not a usable key]
+Generate your own with `generateVapidKeyPair()` from "Generating and Storing
+the VAPID Key Pair" above. Do not reuse the public key from the RFC 8291
+known-answer test vector earlier on this page -- it's the **ephemeral**
+ECDH public key from that vector, whose matching private key is printed two
+rows above it and published worldwide in the RFC. Copying it into a real
+config mixes up the two distinct P-256 key pairs this page is careful to
+keep separate (the long-lived VAPID **ECDSA** identity vs. the per-message
+ephemeral **ECDH** key) and ships a public key with a globally known private
+half.
 :::
 
 ## Related

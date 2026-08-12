@@ -145,7 +145,7 @@ async function signVapidJwt(
   const claims = {
     aud: audienceOrigin, // scheme + host of the push endpoint, no path -- see below
     exp: Math.floor(Date.now() / 1000) + VAPID_EXP_SECONDS,
-    sub: subject, // "mailto:push@example.com" -- optional per RFC 8292, but several push services reject requests without it
+    sub: subject, // "mailto:push@example.com" -- RFC 8292 says this SHOULD be included, and several push services reject requests without it
   };
   const signingInput = `${jsonToBase64Url(header)}.${jsonToBase64Url(claims)}`;
 
@@ -223,9 +223,9 @@ RFC 8291 は RFC 8188 の汎用的な `aes128gcm` コンテンツエンコーデ
 
 ```typescript
 async function hkdf(
-  ikm: ArrayBuffer,
-  salt: ArrayBuffer,
-  info: ArrayBuffer,
+  ikm: BufferSource,
+  salt: BufferSource,
+  info: BufferSource,
   lengthBits: number,
 ): Promise<ArrayBuffer> {
   const key = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
@@ -276,7 +276,7 @@ async function encryptPushPayload(
 
   const asKeyPair = await crypto.subtle.generateKey(
     { name: "ECDH", namedCurve: "P-256" },
-    true,
+    false, // not extractable -- the private half is never exported, only used for deriveBits below
     ["deriveBits"],
   );
   const asPublicRaw = new Uint8Array(await crypto.subtle.exportKey("raw", asKeyPair.publicKey));
@@ -319,9 +319,14 @@ async function encryptPushPayload(
 }
 ```
 
+`hkdf` の各引数は、`crypto.subtle.importKey()` と `deriveBits()` が実際に受け付ける型である `BufferSource` として型付けされており、より狭い `ArrayBuffer` ではない。上のすべての呼び出し箇所は `Uint8Array`（`authSecret`、`ikmInfo`、`TextEncoder` の出力、`crypto.getRandomValues` によるランダムなソルト）を渡しており、`strict` な TypeScript の下では `Uint8Array` は素の `ArrayBuffer` パラメータには代入できない -- `hkdf` を `ArrayBuffer` として型付けすると、これらの呼び出し箇所のどれか一つが `tsc` を通った瞬間にコンパイルが失敗する。実行時にはどれも正しく動作するにもかかわらずだ。
+
 :::note[プッシュのペイロードが小さいのは意図的]
-RFC 8030 はプッシュメッセージの暗号化済みコンテンツを 4096 オクテットに制限して
-おり、プッシュサービスもほぼその上限を強制する。単一の `aes128gcm` レコードの
+RFC 8030 §5.2 が要求しているのは、プッシュサービスが暗号化済みコンテンツを
+**少なくとも** 4096 オクテットまで**受け付ける**ことであり -- これは上限では
+なく下限だ -- とはいえ実務上はほとんどのプッシュサービスがその下限に近いところ
+を実質的な上限として運用しているので、それを前提に設計しておくのが無難な既定
+値になる。単一の `aes128gcm` レコードの
 オーバーヘッドは固定だ -- P-256 の key id を使う場合ヘッダーが 86 バイト、GCM タグ
 が 16 バイト、パディング区切りが 1 バイトで、合計およそ 103 バイト -- これにより
 平文には概ね 3900 バイト程度の余裕が残る: 通知のタイトル・本文・遷移先 URL を持つ
@@ -434,6 +439,50 @@ FCM、Mozilla の autopush、Apple の web push サービスのいずれも、�
 正当なホップは存在しないので、リクエストを組み直す必要もない。
 :::
 
+### サブスクライブ時にエンドポイントのホストを検証する
+
+上の `redirect: "manual"` はリダイレクトのホップを塞いでくれるが、*最初の*リクエ
+ストについては何もしてくれない: `subscription.endpoint` はクライアントのサブス
+クライブリクエストが言っている値そのものであり、それが本物の
+`PushManager.subscribe()` 呼び出しから来たことを強制するものは何もない。サブス
+クライブ用エンドポイントに到達できる者なら誰でも、内部サービスやクラウドのメタ
+データエンドポイントを含む任意の URL をそこへ送信でき、サーバーは律儀に VAPID
+JWT に署名し、暗号化済みのボディをそこへ `POST` してしまう -- これは
+[SSRF とリダイレクトの安全性](./ssrf-and-redirect-safety.mdx)が一般的に扱ってい
+るのと同じアウトバウンド fetch のリスクを、リダイレクトではなくサブスクリプショ
+ンを経由して届く URL に当てはめたものだ。
+
+実在するプッシュサービスは短く安定したホストのリストなので、除外したいものを
+ブロックしようとするのではなく、サブスクライブ時に許可リストと突き合わせて検証
+すること -- これは [SSRF とリダイレクトの安全性](./ssrf-and-redirect-safety.mdx)
+がアウトバウンド fetch 全般に対して使っているのと同じ、ブロックリストではなく
+許可リストというフレーミングだ:
+
+```typescript
+const PUSH_ENDPOINT_HOST_SUFFIXES = [
+  "googleapis.com", // Chrome/Edge -- FCM
+  "push.services.mozilla.com", // Firefox -- autopush
+  "web.push.apple.com", // Safari
+  "notify.windows.com", // legacy Edge/WNS
+];
+
+function isAllowedPushEndpoint(endpoint: string): boolean {
+  let host: string;
+  try {
+    host = new URL(endpoint).host;
+  } catch {
+    return false;
+  }
+  return PUSH_ENDPOINT_HOST_SUFFIXES.some(
+    (suffix) => host === suffix || host.endsWith(`.${suffix}`),
+  );
+}
+```
+
+このチェックはサブスクリプションが最初に送信された時点、保存する前に実行する
+こと -- サブスクライブ時に不正な `endpoint` を弾いておけば、`sendPushMessage` が
+それを目にすることは二度とない。
+
 ### 404/410 と一時的な失敗の違い
 
 レスポンスステータスは 3 つの実行可能なバケットに分かれ、そのうちの 2 つを混同
@@ -445,8 +494,9 @@ FCM、Mozilla の autopush、Apple の web push サービスのいずれも、�
 - **`404` または `410`:** サブスクリプションは永続的に失われている -- ユーザーが
   アプリをアンインストールした、通知許可を取り消した、ブラウザデータを消去した、
   などだ。プッシュサービスは、再試行をやめるようはっきりと伝えてきている。
-  蓄積された失敗回数ではなく、このレスポンスを受けた時点でサブスクリプションを
-  ストレージから削除すること。
+  サブスクリプションをストレージ -- サブスクリプションがどこに置かれているかに
+  よって [KV](../storage/kv.mdx) か [D1](../storage/d1.mdx) -- から削除するの
+  は、蓄積された失敗回数ではなく、このレスポンスを受けた時点にすること。
 - **`429` または `5xx`:** 一時的なもの。バックオフしながら再試行し、削除しない。
   プッシュサービスが一時的に過負荷だったりダウンしていたりしたからといって、
   サブスクリプションが死んだわけではない。
@@ -468,21 +518,24 @@ export type PushResult =
   | { outcome: "expired"; status: number } // caller must prune the subscription
   | { outcome: "transient"; status: number }; // caller should retry with backoff
 
+type PushOptions = {
+  ttlSeconds?: number;
+  urgency?: "very-low" | "low" | "normal" | "high";
+  topic?: string;
+};
+
 const PUSH_SUCCESS = new Set([200, 201, 202]);
 
-export async function sendPushMessage(
+// The actual delivery, given an already-signed JWT -- shared by the
+// single-message path below and the fan-out batch in "Fan-Out" further down,
+// which signs one JWT per push-service origin instead of one per message.
+async function deliverPush(
   subscription: PushSubscription,
   payload: Uint8Array,
+  jwt: string,
   env: Env,
-  options: {
-    ttlSeconds?: number;
-    urgency?: "very-low" | "low" | "normal" | "high";
-    topic?: string;
-  } = {},
+  options: PushOptions,
 ): Promise<PushResult> {
-  const endpointUrl = new URL(subscription.endpoint);
-  const privateKeyJwk = JSON.parse(env.VAPID_PRIVATE_KEY_JWK) as VapidKeyJwk;
-  const jwt = await signVapidJwt(endpointUrl.origin, env.VAPID_SUBJECT, privateKeyJwk);
   const body = await encryptPushPayload(payload, subscription.keys.p256dh, subscription.keys.auth);
 
   const headers = new Headers({
@@ -513,6 +566,18 @@ export async function sendPushMessage(
   // 429 / 5xx, and anything else not covered above -- treat as transient.
   return { outcome: "transient", status: res.status };
 }
+
+export async function sendPushMessage(
+  subscription: PushSubscription,
+  payload: Uint8Array,
+  env: Env,
+  options: PushOptions = {},
+): Promise<PushResult> {
+  const endpointUrl = new URL(subscription.endpoint);
+  const privateKeyJwk = JSON.parse(env.VAPID_PRIVATE_KEY_JWK) as VapidKeyJwk;
+  const jwt = await signVapidJwt(endpointUrl.origin, env.VAPID_SUBJECT, privateKeyJwk);
+  return deliverPush(subscription, payload, jwt, env, options);
+}
 ```
 
 ```mermaid
@@ -531,6 +596,83 @@ graph TB
   Send -->|429/5xx| Retry[Transient -- retry with backoff, keep subscription]
 ```
 
+## ファンアウト: サブリクエストの上限と VAPID JWT の使い回し
+
+多数のサブスクライバーへ通知する自然なやり方は、サブスクリプションごとに
+`sendPushMessage` を 1 回呼ぶループだ -- つまりサブスクリプションごとに 1 回の
+アウトバウンド `fetch()` になり、それは Workers のインボケーションあたりのサブ
+リクエスト上限（**Free プランで 50、Paid プランでデフォルト 10,000**、Paid の
+上限は最大 1000 万まで設定変更可能。最新の数値は
+[Limits](https://developers.cloudflare.com/workers/platform/limits/) を参照）
+に対してのことだ。どちらの上限であれそれを超える規模のメーリングリストへの通
+知は、単一のインボケーションからこれを軽く突破してしまい、その失敗は分かりや
+すいエラーではなく、部分的で一見ランダムな配信の抜け落ちとして現れる。
+
+`sendPushMessage` はメッセージ 1 件ごとに新しい VAPID JWT を署名してもいて、
+これもまったく同じファンアウトにとって無駄が多い。`signVapidJwt` のクレームが
+依存しているのは `audienceOrigin`（プッシュエンドポイントのオリジン）だけであ
+り、上の `VAPID_EXP_SECONDS` は丸ごと 1 時間だ。数千人規模のファンアウトが実
+際に触れるオリジンは、現実的にはひと握り（FCM、Mozilla の autopush、Apple の
+web push サービス、あとはサブスクライバー層次第でいくつか）にすぎないので、
+メッセージごとに署名すると、まだ 1 時間有効な同じオリジンに対して同じ ECDSA
+署名を何十回、何百回と繰り返すことになる。オリジンごとに 1 回だけ署名し、それ
+を共有するすべてのサブスクリプションで使い回すこと:
+
+```typescript
+export async function sendPushBatch(
+  subscriptions: PushSubscription[],
+  payload: Uint8Array,
+  env: Env,
+  options: PushOptions = {},
+): Promise<PushResult[]> {
+  const privateKeyJwk = JSON.parse(env.VAPID_PRIVATE_KEY_JWK) as VapidKeyJwk;
+
+  // One JWT per push-service origin, reused across every subscription that
+  // shares it -- not one per message.
+  const jwtByOrigin = new Map<string, Promise<string>>();
+  const jwtFor = (origin: string): Promise<string> => {
+    let cached = jwtByOrigin.get(origin);
+    if (!cached) {
+      cached = signVapidJwt(origin, env.VAPID_SUBJECT, privateKeyJwk);
+      jwtByOrigin.set(origin, cached);
+    }
+    return cached;
+  };
+
+  return Promise.all(
+    subscriptions.map(async (subscription) => {
+      const origin = new URL(subscription.endpoint).origin;
+      const jwt = await jwtFor(origin);
+      return deliverPush(subscription, payload, jwt, env, options);
+    }),
+  );
+}
+```
+
+### サブリクエスト上限を超えて分割する
+
+上の `sendPushBatch` は依然として単一の Worker インボケーションからサブスクリ
+プションごとに 1 回の `fetch()` を発行するので、安全なのはサブリクエスト上限
+そのものまでだ。それより大きなサブスクライバーリストは、1 回のインボケーショ
+ンから送るのではなく、複数のインボケーションへ分割する必要がある:
+
+- `ctx.waitUntil(sendPushBatch(chunk, payload, env))` はリストの大きさにかか
+  わらず使う価値がある: 通知のファンアウトを起動すること自体はクライアントを
+  ブロックする必要が何もないので、これによって呼び出し元がすべてのプッシュ配
+  信を待つ代わりに、トリガーとなったリクエストをすぐに返せる。これ単体ではサ
+  ブリクエスト上限は上がらない -- その上限は、fetch がハンドラー内で同期的に
+  実行されようと `waitUntil` に遅延されようと、1 つのインボケーションが生きて
+  いる間ずっと適用される。
+- 1 回のインボケーションに許された上限を超えて、合計でより多くのメッセージを
+  送る唯一の方法は、リストを複数のインボケーションへ分割することだ。
+  [Cloudflare Queues](https://developers.cloudflare.com/queues/) はまさにこの
+  ための標準的な形だ: 上限に収まるサイズのサブスクライバーのチャンクごとに 1
+  つのメッセージをキューへ入れ、それぞれのキューコンシューマー -- それ自体が
+  独自のサブリクエスト予算を持つ新しい Worker インボケーションだ -- にそのチ
+  ャンクに対して `sendPushBatch` を呼ばせる。Queues 組み込みのリトライも、こ
+  こに自然に収まる: あるチャンクの中の 1 サブスクライバーが `transient` にな
+  ったからといって、そのチャンク全体の配信を失敗させるべきではない。
+
 ## Wrangler 設定: secret と vars の使い分け
 
 `VAPID_PUBLIC_KEY` は機密ではない -- サブスクライブするすべてのブラウザに
@@ -546,9 +688,8 @@ main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
 [vars]
-VAPID_PUBLIC_KEY = "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8"
+VAPID_PUBLIC_KEY = "BExample_Replace_With_Your_Own_Generated_VAPID_Public_Key"
 VAPID_SUBJECT = "mailto:push@example.com"
-VAPID_PRIVATE_KEY_JWK = ""
 ```
 
 ```bash
@@ -556,13 +697,42 @@ npx wrangler secret put VAPID_PRIVATE_KEY_JWK
 # paste the JSON-stringified { kty, crv, d, x, y } from generateVapidKeyPair()
 ```
 
-:::danger[Secret と Vars]
-`[vars]` の中の空の `VAPID_PRIVATE_KEY_JWK` は、ローカルでの型付けのためだけの
-プレースホルダーだ -- 実際の値は `wrangler secret put VAPID_PRIVATE_KEY_JWK` で
-設定し、決してコミットしない。これが漏れることは、この Worker に紐づくすべての
-VAPID 署名済みプッシュの身元を一度に漏らすことに等しく、[HTTP-only Cookie セッション](./cookie-sessions.mdx)
-や [HMAC-SHA256 によるウェブフック署名](./webhook-signing.mdx)で扱った共有署名鍵と
-同じ被害半径を持つ。
+ローカル開発では、`wrangler secret put` をローカル環境に対して実行する代わりに、
+同じ JSON 文字列を `.dev.vars`（gitignore 済みで、決してコミットしない）に置く:
+
+```
+# .dev.vars
+VAPID_PRIVATE_KEY_JWK={"kty":"EC","crv":"P-256","d":"...","x":"...","y":"..."}
+```
+
+:::danger[secret と同じ名前を `[vars]` にも宣言しないこと]
+`VAPID_PRIVATE_KEY_JWK` の型は、このページの前半で宣言した `Env` インターフェー
+スがすでに与えている -- `[vars]` は型付けの仕組みではなく、secret として設定さ
+れている名前のために空のプレースホルダーエントリを持つ必要は一切ない。1 つの
+Worker には名前ごとに 1 つのバインディングしかないので、`[vars]` と secret の
+両方に同じ名前を宣言するのは無害な重複ではなく衝突だ -- `wrangler deploy` に対
+する複数の報告が、デプロイ時にダッシュボードや CLI で設定した secret の値を
+`[vars]` の値で静かに上書きしてしまう挙動を記述している
+（[workers-sdk#276](https://github.com/cloudflare/wrangler2/issues/276)、
+[workers-sdk discussion #8219](https://github.com/cloudflare/workers-sdk/discussions/8219)）。
+良くて両者の優先順位が未文書化、悪くすると次のデプロイで、動いていた VAPID の
+秘密鍵が空文字列に静かに置き換わり、すべてのプッシュが不可解なプッシュサービ
+スの拒否で失敗し始める。実際の secret の値がどこに設定されていようと、それが
+漏れることは、この Worker に紐づくすべての VAPID 署名済みプッシュの身元を一度
+に漏らすことに等しく、[HTTP-only Cookie セッション](./cookie-sessions.mdx)や
+[HMAC-SHA256 によるウェブフック署名](./webhook-signing.mdx)で扱った共有署名鍵
+と同じ被害半径を持つ。
+:::
+
+:::warning[上の `VAPID_PUBLIC_KEY` の例はプレースホルダーであり、そのまま使える鍵ではない]
+上の「VAPID 鍵ペアの生成と保存」にある `generateVapidKeyPair()` で自分自身の鍵
+を生成すること。このページの前半にある RFC 8291 の既知解テストベクターの公開
+鍵を使い回してはいけない -- あれはそのベクターの **一時的な** ECDH 公開鍵であ
+り、対応する秘密鍵は 2 行上に印刷されていて、RFC として世界中に公開されている。
+それを実際の設定にコピーすると、このページが前半で丁寧に分けている 2 つの異な
+る P-256 鍵ペア（長寿命の VAPID **ECDSA** アイデンティティと、メッセージごとの
+一時的な **ECDH** 鍵）を混同することになり、しかも秘密鍵が世界に知られている公
+開鍵を配ってしまうことになる。
 :::
 
 ## 関連項目

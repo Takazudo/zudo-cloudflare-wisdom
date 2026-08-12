@@ -4,11 +4,11 @@ description: エッジレベルの cache.enabled / ctx.cache 機能 -- バージ
 sidebar_position: 11
 ---
 
-Workers Cache は Worker 自身のコードの手前に、エッジレベルの HTTP キャッシュを直接置く仕組みだ。設定で `cache.enabled` を有効にし、通常の `Cache-Control` ヘッダーを返せば、一致するリクエストは Worker を一切動かさずに Cloudflare のエッジから配信される。これは [Cache API](./local-dev-bindings.mdx)（`caches.default`）とは別の仕組みで、`wrangler dev` でローカルにエミュレートされるのは Cache API の方だけであり、Workers Cache はされない。また、[ハッシュ化アセットのブラウザキャッシュ](./static-assets-caching.mdx)にあるクライアント向けヘッダーとも別の関心事で、そちらは本ページ末尾のセクションで扱う。このページでは、Workers Cache の有効化、それを駆動するヘッダー、`ctx.cache.purge()`、`Cf-Cache-Status`、そしてなぜ検証がデプロイ済みの Worker に対してしか成立しないのかを扱う。
+Workers Cache は Worker 自身のコードの手前に、エッジレベルの HTTP キャッシュを直接置く仕組みだ。設定で `cache.enabled` を有効にし、通常の `Cache-Control` ヘッダーを返せば、一致するリクエストは Worker を一切動かさずに Cloudflare のエッジから配信される。これは [Cache API](./local-dev-bindings.mdx#cache-api-はローカルでエミュレートされるが、workers-cache-はされない)（`caches.default`）とは別の仕組みで、`wrangler dev` でローカルにエミュレートされるのは Cache API の方だけであり、Workers Cache はされない。また、[ハッシュ化アセットのブラウザキャッシュ](./static-assets-caching.mdx)にあるクライアント向けヘッダーとも別の関心事で、そちらは本ページ末尾のセクションで扱う。このページでは、Workers Cache の有効化、それを駆動するヘッダー、`ctx.cache.purge()`、`Cf-Cache-Status`、そしてなぜ検証がデプロイ済みの Worker に対してしか成立しないのかを扱う。
 
 ## Workers Cache を有効にする: バージョンの下限は 4.69.0
 
-Workers Cache には [Wrangler 4.69.0 以上](https://developers.cloudflare.com/workers/cache/configuration/)が必要だ -- `[cache]` ブロックが「何も起きない」ときは、設定ミスだと決めつける前に `npx wrangler --version` で確認すること。古い CLI が原因のことがある。エントリポイントごとのキャッシュ -- 1 つの Worker が複数の `WorkerEntrypoint` クラスをエクスポートし、それぞれが自分のキャッシュを持つ構成 -- には、さらに高い下限、Wrangler 4.107.0 が必要になる。
+Workers Cache には [Wrangler 4.69.0 以上](https://developers.cloudflare.com/workers/cache/configuration/)が必要だ -- `[cache]` ブロックが「何も起きない」ときは、設定ミスだと決めつける前に `npx wrangler --version` で確認すること。古い CLI が原因のことがある。エントリポイントごとのキャッシュ -- 1 つの Worker が複数の `WorkerEntrypoint` クラスをエクスポートし、それぞれが自分のキャッシュを持つ構成 -- には、さらに高い下限、Wrangler 4.107.0 が必要になる。このページで確認できる下限は Wrangler のバージョンまでだ。`cache.enabled` の有効化に最小 `compatibility_date` も関わってくるなら、他の日付付き機能と同じ要領で確認すること -- [互換性日付](./compatibility-dates.mdx)を参照。
 
 ```jsonc
 // wrangler.jsonc -- the only field this table accepts is `enabled`.
@@ -59,14 +59,25 @@ Cloudflare は、列挙されたヘッダーの値の組み合わせごとに別
 
 Worker は、[自分自身のキャッシュを](https://developers.cloudflare.com/workers/cache/purge/)自分のコードの中から無効化できる。別途 Cloudflare の API トークンも `Zone.Cache Purge` 権限のプロビジョニングも要らない -- `ctx.cache.purge()` は、それを呼び出したリクエストと同じ実行コンテキストの中で動き、その Worker であること自体が認証になる。
 
+:::warning[それは Worker 自身の認証であって、このルートを叩く相手の認証ではない]
+「別途プロビジョニングするトークンが要らない」ことこそ、下のようなルートに独自のゲートが必要な理由でもある -- 見知らぬ相手がキャッシュをパージするのを普段は止めているもの（トークンを持っていないこと）が、設計上取り除かれているので、代わりのチェックを置かない限り何も止めてくれない。下のベアラー比較は最小限の版であり、このルートに単一の共有シークレット以上のものが必要なら、[パーソナル API トークン](../recipes/personal-api-tokens.mdx)がハッシュ化・失効・有効期限を備えた本物のトークンシステムを扱っている。
+:::
+
 ```ts
+export interface Env {
+  CACHE_PURGE_TOKEN: string; // shared secret -- see Personal API Tokens for a real token system
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (new URL(request.url).pathname === "/admin/purge") {
+      if (request.headers.get("authorization") !== `Bearer ${env.CACHE_PURGE_TOKEN}`) {
+        return new Response("Unauthorized", { status: 401 });
+      }
       await ctx.cache.purge({ tags: ["blog-posts"] });
       return new Response("purged");
     }
-    // ...
+    return new Response("Not found", { status: 404 });
   },
 };
 ```
@@ -128,6 +139,8 @@ curl -sI https://<worker>.<subdomain>.workers.dev/admin/purge
 curl -sI https://<worker>.<subdomain>.workers.dev/ | grep -i cf-cache-status
 # -> cf-cache-status: MISS
 ```
+
+`purge()` 自体もレート制限がかかっており、Cloudflare の PoP 全体では結果整合的にしか反映されない。だからステップ 4 は、上の並びが示唆するほど決定的ではない -- 連続する `curl` リクエストは別々の拠点に着地することがあり、パージがまだ伝播していない拠点に当たれば `HIT` を返してもおかしくない。配線が間違っていると結論づける前に、少し待ってからリトライすること。
 
 ユニットテストがパスしても、それが証明するのはハンドラが正しいヘッダーを返すことだけで、Cloudflare が実際にエッジでキャッシュして配信したかどうかは何も証明しない。それを確かめられるのは、この一連の手順だけだ。
 

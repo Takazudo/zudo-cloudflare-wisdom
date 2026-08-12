@@ -20,12 +20,13 @@ type AiRouteResult<T> = {
   data: T;
   fallback: null | {
     guard: "budget" | "call" | "output";
-    reason: string;
+    reason: FallbackReason; // stable token -- see "Reason Taxonomy" below
+    detail: string; // free-text or numeric context, never used as a metric label
   };
 };
 ```
 
-`data` は、モデルから来たかガードのフォールバック値から来たかにかかわらず、常に同じスキーマに一致する。`fallback` はハッピーパスでは `null` で、ガードが発動して自前の値に差し替えたときだけ、どのガードが発動したか、なぜかとともに埋まる。
+`data` は、モデルから来たかガードのフォールバック値から来たかにかかわらず、常に同じスキーマに一致する。`fallback` はハッピーパスでは `null` で、ガードが発動して自前の値に差し替えたときだけ、どのガードが発動したか、メトリクスのラベルとして安全に使える固定の `reason` トークン、そしてそのトークンがあえて除いている自由記述や数値の詳細を運ぶ `detail` 文字列とともに埋まる。
 
 ## 3 つのガード、1 つの封筒
 
@@ -48,10 +49,20 @@ interface AiSummary {
   confidence: number;
 }
 
+type FallbackReason =
+  | "rate_limited"
+  | "budget_exceeded"
+  | "circuit_open"
+  | "timeout"
+  | "provider_error"
+  | "schema_invalid"
+  | "empty_response"
+  | "moderation_blocked";
+
 type AiRouteResult<T> = {
   ok: true;
   data: T;
-  fallback: null | { guard: "budget" | "call" | "output"; reason: string };
+  fallback: null | { guard: "budget" | "call" | "output"; reason: FallbackReason; detail: string };
 };
 
 const MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
@@ -75,49 +86,80 @@ const DEFAULT_SUMMARY: AiSummary = { label: "unavailable", confidence: 0 };
 function fallbackResult<T>(
   data: T,
   guard: "budget" | "call" | "output",
-  reason: string,
+  reason: FallbackReason,
+  detail: string,
 ): AiRouteResult<T> {
-  return { ok: true, data, fallback: { guard, reason } };
+  return { ok: true, data, fallback: { guard, reason, detail } };
+}
+
+// A fixed TTL longer than one UTC day, so a write made just before midnight
+// isn't evicted before the day it belongs to is over.
+const BUDGET_KEY_TTL_SECONDS = 2 * 24 * 60 * 60;
+
+function dailyBudgetKey(userId: string, now = new Date()): string {
+  // Scoping the key to the UTC day, not just the user, is what makes
+  // "daily" actually reset -- see the warning below for why a rolling TTL
+  // on a user-only key does not.
+  return `ai-budget:${userId}:${now.toISOString().slice(0, 10)}`; // YYYY-MM-DD, UTC
 }
 
 // Guard 1: budget -- reject before the model call happens at all.
-async function checkBudgetGuard(env: Env, userId: string): Promise<string | null> {
-  const key = `ai-budget:${userId}`;
+async function checkBudgetGuard(
+  env: Env,
+  userId: string,
+): Promise<{ reason: FallbackReason; detail: string } | null> {
+  const key = dailyBudgetKey(userId);
   const count = Number((await env.RATE_LIMIT.get(key)) ?? "0");
   if (count >= DAILY_CALL_LIMIT) {
-    return "per-user daily call limit reached";
+    return {
+      reason: "budget_exceeded",
+      detail: `daily call limit of ${DAILY_CALL_LIMIT} reached`,
+    };
   }
-  await env.RATE_LIMIT.put(key, String(count + 1), { expirationTtl: 86_400 });
+  // Charged before the call happens, not after it succeeds -- a timeout or
+  // provider error below still burns this increment. That's the tradeoff a
+  // pre-call guard makes: charging after success instead would undercount
+  // exactly the calls expensive enough to be worth guarding against, and
+  // let a string of failures retry past the budget uncounted.
+  await env.RATE_LIMIT.put(key, String(count + 1), { expirationTtl: BUDGET_KEY_TTL_SECONDS });
   return null;
 }
 
 class TimeoutError extends Error {}
 
-function timeoutRejection(ms: number): Promise<never> {
-  return new Promise((_, reject) => {
-    setTimeout(() => reject(new TimeoutError()), ms);
+function timeoutRejection(ms: number): { promise: Promise<never>; cancel: () => void } {
+  let handle: ReturnType<typeof setTimeout>;
+  const promise = new Promise<never>((_, reject) => {
+    handle = setTimeout(() => reject(new TimeoutError()), ms);
   });
+  return { promise, cancel: () => clearTimeout(handle) };
 }
 
 // Guard 2: call -- race against a deadline, catch provider errors here too.
 async function callWithGuard(
   env: Env,
   prompt: string,
-): Promise<{ ok: true; value: unknown } | { ok: false; reason: string }> {
+): Promise<{ ok: true; value: unknown } | { ok: false; reason: FallbackReason; detail: string }> {
+  const timeout = timeoutRejection(TIMEOUT_MS);
   try {
     const result = await Promise.race([
       env.AI.run(MODEL_ID, {
         messages: [{ role: "user", content: prompt }],
         response_format: SUMMARY_SCHEMA,
       }),
-      timeoutRejection(TIMEOUT_MS),
+      timeout.promise,
     ]);
     return { ok: true, value: result };
   } catch (err) {
     if (err instanceof TimeoutError) {
-      return { ok: false, reason: `model call exceeded ${TIMEOUT_MS}ms` };
+      return { ok: false, reason: "timeout", detail: `model call exceeded ${TIMEOUT_MS}ms` };
     }
-    return { ok: false, reason: "provider returned an error" };
+    return { ok: false, reason: "provider_error", detail: "provider returned an error" };
+  } finally {
+    // Clears the timer whichever side of the race settles first -- left
+    // armed, it would otherwise fire after the response has already gone
+    // out, rejecting a promise nothing is still attached to.
+    timeout.cancel();
   }
 }
 
@@ -141,32 +183,50 @@ async function handleSummaryRoute(
   userId: string,
   prompt: string,
 ): Promise<AiRouteResult<AiSummary>> {
-  const budgetReason = await checkBudgetGuard(env, userId);
-  if (budgetReason) {
-    return fallbackResult(DEFAULT_SUMMARY, "budget", budgetReason);
+  const budgetFailure = await checkBudgetGuard(env, userId);
+  if (budgetFailure) {
+    return fallbackResult(DEFAULT_SUMMARY, "budget", budgetFailure.reason, budgetFailure.detail);
   }
 
   const called = await callWithGuard(env, prompt);
   if (!called.ok) {
-    return fallbackResult(DEFAULT_SUMMARY, "call", called.reason);
+    return fallbackResult(DEFAULT_SUMMARY, "call", called.reason, called.detail);
   }
 
-  const validated = checkOutputGuard(called.value);
+  // Workers AI wraps every text-generation call in { response, usage,
+  // tool_calls } -- JSON Mode nests the schema-validated result under
+  // `response`, not at the top level. See "Unwrapping the Workers AI
+  // Envelope" below.
+  const raw = (called.value as { response?: unknown }).response;
+  const validated = checkOutputGuard(raw);
   if (!validated) {
-    return fallbackResult(DEFAULT_SUMMARY, "output", "response failed schema validation");
+    return fallbackResult(
+      DEFAULT_SUMMARY,
+      "output",
+      "schema_invalid",
+      "response failed schema validation",
+    );
   }
 
   return { ok: true, data: validated, fallback: null };
 }
 ```
 
+### Workers AI のエンベロープを開く
+
+`env.AI.run()` はスキーマオブジェクトを直接返すことは決してない。Workers AI はすべてのテキスト生成呼び出しを `{ response, usage, tool_calls }` でラップし、JSON Mode はスキーマ検証済みの結果をその `response` キーの下に、**パース済みの JavaScript オブジェクト**として（JSON 文字列としてではなく）ネストする -- これは、このページが使うモデル `@cf/meta/llama-3.3-70b-instruct-fp8-fast` について [Workers AI の JSON Mode ドキュメント](https://developers.cloudflare.com/workers-ai/features/json-mode/)で確認済みだ。`checkOutputGuard` はスキーマ自身のフィールド（`label`、`confidence`）がトップレベルにあることを期待しているので、`called.value` そのものではなく `called.value.response` に対して実行しなければならない。ラッパーの方を検証してしまうと、成功したすべての呼び出しで失敗するようになり、このパターンの核心が「フォールバックは失敗ではない」であるがゆえに、ルートは静かに、そして永続的にフォールバックを返し続けることになる -- このバグにとって最悪の現れ方だ。
+
 :::warning[`Promise.race` が止めるのはルートの待機であって、プロバイダー呼び出しではない]
-モデル呼び出しをタイマーと競わせると、Worker は待つのをやめてフォールバックを返すようになるが、モデルプロバイダーへの飛行中のリクエストをキャンセルするわけではない。裏側の呼び出しは、Worker がすでにレスポンスを返した後でも完了することがあり、その分の課金も発生しうる。「待つのをやめる」ではなく本当のキャンセルが必要なワークロードでは、race ベースのタイムアウトだけに頼る前に、使っている呼び出しパスが abort signal をサポートしているか確認する。
+モデル呼び出しをタイマーと競わせると、Worker は待つのをやめてフォールバックを返すようになるが、モデルプロバイダーへの飛行中のリクエストをキャンセルするわけではない。裏側の呼び出しは、Worker がすでにレスポンスを返した後でも完了することがあり、その分の課金も発生しうる。上の `callWithGuard` は、race のどちらの側が先に決着してもその瞬間に `finally` でタイマー自体をクリアしており、レスポンスが返った後に宙に浮いた `setTimeout` が発火するのを防いでいる -- ただしこれは本当のキャンセルとは別の修正であり、プロバイダー側のコネクションに踏み込んで飛行中のリクエストを止めるものではない。「待つのをやめる」ではなく本当のキャンセルが必要なワークロードでは、race ベースのタイムアウトだけに頼る前に、使っている呼び出しパスが abort signal をサポートしているか確認する。
+:::
+
+:::warning[KV はここではベストエフォートのカウンターであり、支出の上限ではない]
+上の `checkBudgetGuard` は説明のためのものであり、並行性の下では安全ではない。Workers KV の read-modify-write はアトミックではない -- 同じユーザーからの並行リクエストが同じ `count` を読み、それぞれが `count + 1` を書き込み、まさに budget guard が捕まえたいバーストトラフィックの下で増分が静かに失われる。KV の読み取りはエッジで最大 60 秒キャッシュされるので、別の PoP に着地したリクエストは古い count を読み、並行性が一切なくても `DAILY_CALL_LIMIT` を超えてしまう。このガードがコスト管理にとって本当に重要なら、[Cloudflare の Rate Limiting バインディング](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)、Durable Object のカウンター、あるいは D1 の条件付き `UPDATE` に手を伸ばすこと -- [パーソナル API トークン](../recipes/personal-api-tokens.mdx#last_used_at-をレースなしで追跡する)が自身の並行書き込みされるカウンターに使っているのと同じ、レースに対して安全な形だ。KV 版のまま使ってよいのは、負荷がかかったときにたまに超過することが本当に許容できる場合だけだ。
 :::
 
 ## Reason のタクソノミー
 
-`fallback.reason` の値は、毎回トレースを開かなくてもログやメトリクスでページングできる程度に、具体的に保つ：
+`fallback.reason` は閉じた固定トークンの集合だ -- 値の種類が決して増えないので、メトリクスのラベルとして安全に使える。自由記述や数値の詳細（タイムアウトの秒数、プロバイダーの生のエラーメッセージ）は代わりに `fallback.detail` フィールドに入れる。こちらはログには適しているが、メトリクスのキーには決して使ってはいけない：
 
 | Guard | Reason | 典型的な発動条件 |
 |---|---|---|
@@ -185,7 +245,7 @@ async function handleSummaryRoute(
 
 ガードが発動することは、ルートが落ちていることとは違う。計測とアラートの立て方でその違いを保つ：
 
-- フォールバックは guard + reason でラベル付けしたカウンターとして、未捕捉の例外や 5xx レスポンスのカウンターとは分けて記録する。`fallback` が埋まった `200` は、呼び出し側から見れば成功したリクエストだ。
+- フォールバックは `guard` + `reason` でラベル付けしたカウンターとして記録する（`detail` は自由記述でメトリクスのカーディナリティを無限に押し上げるので絶対に使わない）。未捕捉の例外や 5xx レスポンスのカウンターとは分けて記録する。`fallback` が埋まった `200` は、呼び出し側から見れば成功したリクエストだ。
 - フォールバックの単発の発生ではなく、ウィンドウ内の**発生率**にアラートを立てる（例えば、5 分間で `provider_error` のフォールバックが呼び出しの 20% を超えたら）。ゼロでないフォールバック率は、timeout や quota の際どさから出る通常のバックグラウンドノイズだ。
 - すべてのフォールバックで guard と reason をログに残し、傾向を診断できるようにする。`output.schema_invalid` に偏ったスパイクは、たいていプロバイダー障害ではなく、自分たちがデプロイしたプロンプトやスキーマの regression を指している。
 - フォールバックのペイロードは本当に役立つものにする： キャッシュ済みの直近の正解、シンプルな決定的計算、または正直な「後でもう一度試して」というメッセージ。同じ形だが空のスタブは、失敗をクライアント側へ静かに移すだけだ。

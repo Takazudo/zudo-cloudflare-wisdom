@@ -73,9 +73,11 @@ const transport = new WebStandardStreamableHTTPServerTransport({
 
 これは、ステートレスな設計がこのプラットフォームに合う理由でもある。Workers は、このスクリプトを扱っているどの温かい isolate にでも、エッジ上のどこであろうとリクエストをルーティングでき、「セッションを持っているあのインスタンス」への親和性を必要としない。セッションベースの設計はその保証を保つために、クライアントを 1 つの Durable Object インスタンスに紐付ける必要がある。ここでのステートレスな設計には保つべき保証がないので、どの isolate でもどのリクエストにも応答できる。
 
+とはいえこれはタダというわけではない -- 安いのであって、ゼロではない。「タダだ」ではなく、実際の上限に対してどれくらい安いのかを測る価値がある。Free プランの CPU 時間予算は[リクエストあたり 10ms](https://developers.cloudflare.com/workers/platform/limits/)であり、`buildServer()` に加えていくつかの同期的な `registerTool()` 呼び出しは、温かい isolate 上ではそのごく一部にすぎない。実際に仕事をする `tools/call` は話が別だ -- アウトバウンドの `fetch()`、KV の読み取り、あるいはより重い登録ツールは、上のほぼタダな構築コストの上に、それ自身の CPU 時間を積み増し、アウトバウンド呼び出しがあればそれは Worker のインボケーションあたりのサブリクエスト上限にもカウントされる。「構築が安い」というのはこのセクションで組み立てているオブジェクトグラフについての主張であり、`tools/call` がそこへ届いたあとに特定の登録ツールが何をするかについての主張ではない。
+
 ## リクエストゲート: POST 専用、405 + Allow ヘッダー
 
-Streamable HTTP トランスポート自身の `handleRequest` は、`GET` を SSE ストリームへ、`DELETE` をセッション終了へルーティングする -- どちらもセッションが存在して初めて意味を持つ。このレシピのトランスポートにはセッションがない（`sessionIdGenerator: undefined`）ので、どちらの動詞もここでは何もすることがない。それでもトランスポートに処理させてしまうと、`GET` や `DELETE` は、クリーンで予測可能なレスポンスの代わりに、トランスポート自身のセッション ID 欠落エラーへ落ちてしまう。代わりに、トランスポートがリクエストを目にする **前** にメソッドをゲートし、`POST` 以外のすべてに同じ方法で答える。
+Streamable HTTP トランスポート自身の `handleRequest` は、`GET` を SSE ストリームへ、`DELETE` をセッション終了へルーティングする -- どちらもセッションが存在して初めて意味を持つ。このレシピのトランスポートにはセッションがない（`sessionIdGenerator: undefined`）ので、どちらの動詞もここでは何もすることがない。それでもトランスポートに処理させてしまうと、`GET` や `DELETE` は、クリーンで予測可能なレスポンスの代わりに、トランスポート自身のセッション ID 欠落エラーへ落ちてしまう。代わりに、トランスポートがリクエストを目にする **前** にメソッドをゲートする: まず `OPTIONS` に専用の分岐を用意すること -- ブラウザの CORS プリフライトは `OPTIONS` リクエストとして届くので、それを下の汎用 405 に紛れ込ませると、ブラウザが実リクエストを送る前にすべてのプリフライトが失敗してしまい、後述の「CORS と認証」セクションが有効にすると説明しているブラウザからのアクセスを静かに壊してしまう -- そのうえで `POST` 以外のすべてに同じ方法で答える。
 
 ```typescript
 function jsonRpcError(
@@ -90,13 +92,18 @@ function jsonRpcError(
   });
 }
 
-// Inside the fetch handler, before any body is read:
+// Inside the fetch handler, before any body is read. OPTIONS is a CORS
+// preflight, not a method to reject -- see "CORS and Auth" for what this
+// branch needs to add if browser access to this endpoint is enabled.
+if (request.method === "OPTIONS") {
+  return new Response(null, { status: 204, headers: { Allow: "POST, OPTIONS" } });
+}
 if (request.method !== "POST") {
-  return jsonRpcError(405, -32000, "Method not allowed", { Allow: "POST" });
+  return jsonRpcError(405, -32000, "Method not allowed", { Allow: "POST, OPTIONS" });
 }
 ```
 
-レスポンスボディは、それでも有効な JSON-RPC のエラーエンベロープ（`code: -32000` は SDK 自身がメソッド不許可のケースで使うのと同じ汎用サーバーエラーコードだ）のままなので、ボディを常に JSON-RPC としてパースしようとするクライアントは、どちらにしても筋の通ったものを受け取る -- それに加えて、SDK が関与するより前に走るチェックから、安定した `405` と `Allow: POST` も得られる。
+レスポンスボディは、それでも有効な JSON-RPC のエラーエンベロープ（`code: -32000` は SDK 自身がメソッド不許可のケースで使うのと同じ汎用サーバーエラーコードだ）のままなので、ボディを常に JSON-RPC としてパースしようとするクライアントは、どちらにしても筋の通ったものを受け取る -- それに加えて、SDK が関与するより前に走るチェックから、安定した `405` と `Allow: POST, OPTIONS` も得られる。
 
 ## ボディキャップ: JSON パースより前に強制する
 
@@ -146,13 +153,25 @@ async function readBodyWithCap(request: Request, maxBytes: number): Promise<stri
 
 `Content-Length` のチェックは、ボディに一切触れることなく、正直に大きいと申告されたリクエストを拒否できる、安価な最初の一手だ。しかしこれだけをチェックにすることはできない -- `Content-Length` はチャンク転送のリクエストでは存在しないし、クライアントが小さい宣言長と、それより大きい実際のストリームを送ってくる（あるいはその逆をする）のを止めるものは何もない。ストリーミングのループこそが本当の境界だ -- 到着するバイトを数え、累計がキャップを超えた瞬間にリーダーをキャンセルする。だから最悪のケースでも `maxBytes` プラス 1 チャンク分をバッファするだけで済み、無制限のボディになることはない。
 
+ここで組み立てが完成したときの順序について、ひとつ注意点がある: この先の完成版ハンドラーでは、このキャップは次に扱う `Content-Type` チェックの**あとに**実行される。前ではない -- そもそも JSON になるはずのないボディをストリームでカウントする理由はないからだ。このページのセクションは、完成版ハンドラーが実際に実行する順序ではなく、概念ごとに並んでいる。実際の順序については、下の [Content-Type と JSON-RPC のエラー形状](#content-type-と-json-rpc-のエラー形状) を参照。
+
 ## Content-Type と JSON-RPC のエラー形状
 
 ボディキャップが走るより前に `Content-Type` を検証する -- そもそも JSON になり得ないリクエストのバイトを 1 つでも読む理由はない。
 
 ```typescript
+function isJsonContentType(contentType: string): boolean {
+  // Parse the media type -- the part before any `;` parameter -- instead
+  // of a substring match. The SDK's own transport does the same (its
+  // internal `isJsonContentType` explicitly rejects substring matching),
+  // and a plain `.includes("application/json")` also passes something like
+  // `text/plain; charset=application/json`, which is not JSON.
+  const mediaType = contentType.split(";", 1)[0].trim().toLowerCase();
+  return mediaType === "application/json";
+}
+
 const contentType = request.headers.get("content-type") ?? "";
-if (!contentType.includes("application/json")) {
+if (!isJsonContentType(contentType)) {
   return jsonRpcError(415, -32000, "Content-Type must be application/json");
 }
 ```
@@ -173,10 +192,12 @@ try {
 ゲートを、実際に各チェックが走る順番でまとめると次のようになる。
 
 ```typescript
-interface Env {
-  // no bindings required for this minimal example -- add KV, D1, or secrets
-  // as your registered tools need them
-}
+// No bindings required for this minimal example. `Record<string, never>`
+// (not an empty `interface Env {}`) types "no properties" without tripping
+// the no-empty-object-type lint rule most configs enable -- switch to a
+// real `interface Env { ... }` once your registered tools need KV, D1, or
+// secrets.
+type Env = Record<string, never>;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -185,12 +206,15 @@ export default {
       return new Response("Not found", { status: 404 });
     }
 
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: { Allow: "POST, OPTIONS" } });
+    }
     if (request.method !== "POST") {
-      return jsonRpcError(405, -32000, "Method not allowed", { Allow: "POST" });
+      return jsonRpcError(405, -32000, "Method not allowed", { Allow: "POST, OPTIONS" });
     }
 
     const contentType = request.headers.get("content-type") ?? "";
-    if (!contentType.includes("application/json")) {
+    if (!isJsonContentType(contentType)) {
       return jsonRpcError(415, -32000, "Content-Type must be application/json");
     }
 
@@ -223,6 +247,8 @@ export default {
   },
 };
 ```
+
+上のどこにも `server` も `transport` も明示的にクローズする箇所がないが、これは見落としではなく意図的なものだ。どちらも永続的なハンドルを何も持たない関数ローカルのオブジェクトであり -- 開いたソケットもタイマーも Durable Object のコネクションもない -- `fetch()` が返ったあとに `close()` が解放すべきものは、通常のガベージコレクション以外に何もない。SDK 自身の Node ベースの例が両方をクローズしているのは、長寿命の Node プロセスが、次のリクエストが同じサーバーオブジェクトを再利用する前にコネクションごとの状態を明示的に後始末しなければならないからだ。Worker の `fetch()` ハンドラーは単に return し、他の外部リソースを持たない関数ローカルの値とまったく同じように、リクエストスコープのオブジェクトを手放すだけでよい。
 
 ## SDK を正確なバージョンにピン留めする
 
@@ -321,18 +347,20 @@ curl -s -i -X GET https://your-worker.example.workers.dev/mcp
 
 ```
 HTTP/1.1 405 Method Not Allowed
-Allow: POST
+Allow: POST, OPTIONS
 content-type: application/json
 
 {"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"Method not allowed"}}
 ```
 
-このレスポンスは、SDK のトランスポートが動くより前の、このレシピ自身のゲートから来ている -- `GET` だけでなく `PUT` や `DELETE` でも同じように発火することを確認して、それを裏付けること。
+このレスポンスは、SDK のトランスポートが動くより前の、このレシピ自身のゲートから来ている -- `GET` だけでなく `PUT` や `DELETE` でも同じように発火すること、そして `OPTIONS` はこの `405` 分岐に落ちるのではなく、同じ `Allow` ヘッダーを持つ独自の `204` を返すことを確認して、それを裏付けること。
 
 ```mermaid
 graph TB
-  Req[POST /mcp] --> Method{"Method is POST?"}
-  Method -->|No| M405["405 + Allow: POST"]
+  Req[POST /mcp] --> Opt{"Method is OPTIONS?"}
+  Opt -->|Yes| O204["204 + Allow: POST, OPTIONS"]
+  Opt -->|No| Method{"Method is POST?"}
+  Method -->|No| M405["405 + Allow: POST, OPTIONS"]
   Method -->|Yes| CT{"Content-Type is application/json?"}
   CT -->|No| CT415["415 Unsupported Media Type"]
   CT -->|Yes| Cap["readBodyWithCap(): Content-Length check, then stream-count"]
@@ -346,4 +374,4 @@ graph TB
 
 ## 関連
 
-[Personal API Tokens](./personal-api-tokens.mdx) は、上で触れたベアラートークン認証の形を扱っている。セッションベースの MCP サーバー -- OAuth 認証されたクライアント、サーバー起点の通知、単一リクエストを超えて生き続ける状態 -- が必要なら、このステートレスなパターンの代わりに、Cloudflare の Agents SDK による Durable Object 裏付けの `McpAgent` に手を伸ばすこと。この 2 つは同じことをする 2 通りの方法ではなく、異なるセッション要件のための異なる道具だ。
+[Personal API Tokens](./personal-api-tokens.mdx) は、上で触れたベアラートークン認証の形を扱っている。セッションベースの MCP サーバー -- OAuth 認証されたクライアント、サーバー起点の通知、単一リクエストを超えて生き続ける状態 -- が必要なら、このステートレスなパターンの代わりに、Cloudflare の Agents SDK による Durable Object 裏付けの `McpAgent` に手を伸ばすこと。そのパターンが依拠している状態永続化のモデルについては [Durable Objects](../workers/durable-objects.mdx) を参照。この 2 つは同じことをする 2 通りの方法ではなく、異なるセッション要件のための異なる道具だ。
