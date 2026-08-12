@@ -18,3 +18,6 @@ Cloudflare Pages、Workers、ストレージサービスを使った本番プロ
 - [Cookie セッション](./cookie-sessions.mdx) -- リフレッシュトークンローテーション付きの HttpOnly Cookie セッション
 - [Webhook 署名](./webhook-signing.mdx) -- Web Crypto を使った HMAC-SHA256 リクエスト署名
 - [D1 による Idempotency-Key 台帳](./idempotency-ledger.mdx) -- フィンガープリント計算、フェンスされた pending 予約の引き継ぎ、上限付き台帳スイープを備えた claim-before-mutate な idempotency キー
+- [SSRF とリダイレクト安全性](./ssrf-and-redirect-safety.mdx) -- 完全な文字列ブロックリストを持つアウトバウンド fetch の SSRF ガードと、クライアント指定リダイレクト先のパーセントデコード安全なサニタイズ
+- [プレビュー・ステージング環境向けパスワードゲート](./password-gate.mdx) -- 静的アセットを含むすべてのリクエストの手前に置く共有パスワードゲート。改ざん検知付きのマーカー Cookie、POST 限定のログイン、ブルートフォース対策の遅延を備える
+- [パーソナル API トークン](./personal-api-tokens.mdx) -- mint-once なシークレットをハッシュのみで保存するパーソナル API トークン。二重ガード付きソフト失効、セッション限定の管理ルート、レースに強い last_used_at 追跡を D1 上で実装する

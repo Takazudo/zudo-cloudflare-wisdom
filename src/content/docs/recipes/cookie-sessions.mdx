@@ -212,6 +212,112 @@ const accessCookie = serializeCookie('access_token', newAccessToken, {
 });
 ```
 
+## CSRF: the cookie is ambient
+
+Every request from a browser to a matching origin carries the `Cookie` header automatically -- the browser doesn't check which page triggered the request, only which origin it's addressed to. That convenience is also the entire premise of Cross-Site Request Forgery: a page on `evil.example` can make the victim's browser fire `POST https://app.example.com/api/refresh`, and the `access_token` / `refresh_token` cookies ride along, fully authenticated, without the attacker ever seeing their value.
+
+**Scope the gate to browser-cookie routes.** This check only belongs in front of routes authenticated by the ambient cookie set on this page. A route authenticated by a bearer token in an `Authorization` header doesn't need it -- attaching that header is something the calling code has to do on purpose (read the token from storage, set the header), and a page on another origin has no way to make the browser do that for it. CSRF exploits *ambient* credential attachment; a header credential was never ambient to begin with.
+
+The gate itself is a handful of rules, each closing a specific hole:
+
+- **Skip safe methods.** Only gate `POST`/`PUT`/`PATCH`/`DELETE`. A cross-site page can still trigger a `GET` against your origin -- an `<img src>`, a `<link>`, an `EventSource` -- and the cookie rides along with none of them needing your permission. That's tolerated because `GET` is defined to be side-effect free: the attacker can make the browser *fetch* something under the victim's identity, but not *change* anything, and can't read the response either (no CORS grant). The whole scheme collapses if a `GET` handler ever mutates state.
+- **Origin allowlist, compared as a tuple.** Parse the `Origin` header with `new URL()` and compare `(scheme, host, port)` against an explicit allowlist -- never string-prefix or substring matching. `https://app.example.com.evil.example` starts with `https://app.example.com` as a string; it is not the same origin.
+- **No `Origin` header -> refuse.** Modern browsers send `Origin` on every state-changing fetch/XHR/form submission, same-origin or not. A state-changing request with no `Origin` header at all is either a very old browser or a non-browser client forging headers -- refuse it rather than falling back to `Referer` or assuming same-origin.
+- **`Origin: null` -> reject explicitly.** Sandboxed iframes (`sandbox` without `allow-same-origin`), some redirect chains, and `file://` pages all send the literal string `"null"` as the Origin. It will never legitimately match your allowlist, but a naive comparison (a permissive regex, an `includes()` check) can be tricked by it -- reject it by name before it reaches the comparison.
+- **Sec-Fetch-Site is a second signal, not a replacement.** `Sec-Fetch-Site: same-origin` is a useful defense-in-depth check, but "site" is the registrable domain only -- it ignores port. Two apps on `app.example.com:8787` and `app.example.com:8788` are different origins (and must be treated as such by the Origin allowlist above), yet both report as `same-site`. If this cookie is shared across subdomains with `Domain=.example.com` (see above), `Sec-Fetch-Site` alone would trust *any* app on *any* port under that domain. The Origin tuple comparison is the one that has to include port; `Sec-Fetch-Site` only adds a cheap extra check on top of it.
+- **Verify the session before running the gate.** Check the cookie itself first. No valid session -> `401 Unauthorized` immediately, before the CSRF check ever runs -- there's no ambient credential yet to protect. Valid session but the CSRF check fails -> `403 Forbidden`. The status code tells the client which problem it has: "log in" versus "you're logged in, but this specific request is being refused."
+
+```typescript
+// utils/csrf.ts
+const ALLOWED_ORIGINS = new Set(['https://app.example.com']);
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+interface OriginTuple {
+  scheme: string;
+  host: string;
+  port: string;
+}
+
+function parseOrigin(value: string): OriginTuple | null {
+  try {
+    const url = new URL(value);
+    return {
+      scheme: url.protocol,
+      host: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? '443' : '80'),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isSameOrigin(a: OriginTuple, b: OriginTuple): boolean {
+  return a.scheme === b.scheme && a.host === b.host && a.port === b.port;
+}
+
+export function requiresCsrfCheck(request: Request): boolean {
+  return !SAFE_METHODS.has(request.method);
+}
+
+export function isTrustedOrigin(request: Request): boolean {
+  const origin = request.headers.get('Origin');
+
+  // Missing Origin on a state-changing request: refuse rather than fall
+  // back to Referer or assume same-origin.
+  if (!origin) {
+    return false;
+  }
+
+  // Sandboxed iframes, some redirect chains, and file:// pages send the
+  // literal string "null" -- it must never match the allowlist below.
+  if (origin === 'null') {
+    return false;
+  }
+
+  const parsed = parseOrigin(origin);
+  if (!parsed) {
+    return false;
+  }
+
+  for (const allowed of ALLOWED_ORIGINS) {
+    const parsedAllowed = parseOrigin(allowed);
+    if (parsedAllowed && isSameOrigin(parsed, parsedAllowed)) {
+      return true;
+    }
+  }
+  return false;
+}
+```
+
+Wire it into a mutating handler after the session check and before the state change -- here, the refresh endpoint from above:
+
+```typescript
+// handlers/refresh.ts (excerpt)
+const payload = await verifyToken(refreshToken, env.JWT_SECRET, 'refresh');
+// Reaching this line means the refresh token itself is valid -- an invalid
+// or missing one throws and is caught by the existing 401 branch above.
+// There is no ambient credential yet to protect until the session checks out.
+
+if (requiresCsrfCheck(request) && !isTrustedOrigin(request)) {
+  return new Response(
+    JSON.stringify({
+      error: 'Forbidden',
+      message: 'Origin not allowed',
+    }),
+    {
+      status: 403,
+      headers: { 'Content-Type': 'application/json' },
+    },
+  );
+}
+
+// ...mint and return the new access cookie as before
+```
+
+:::note[Why `SameSite=Lax`, not `Strict`]
+The access and refresh cookies above use `sameSite: 'Lax'`, not `Strict`. `Lax` withholds the cookie on cross-site `POST`s and subresource requests (images, iframes, `fetch`) but still sends it on a top-level cross-site *navigation* using `GET` -- exactly what happens when an OAuth provider redirects the browser back to `/auth/callback`. `Strict` would drop the cookie on that first landing and break the login flow. The trade-off is that the "skip safe methods" rule above isn't optional: `Lax` only stays safe as long as no `GET` route performs a state change.
+:::
+
 ## Wrangler config: secret vs vars
 
 `COOKIE_DOMAIN` is public configuration and is fine in `[vars]`. `JWT_SECRET` is the signing key for every token -- it must **never** sit in `wrangler.toml`. Leave it blank in `[vars]` as a placeholder and inject the real value as a secret.

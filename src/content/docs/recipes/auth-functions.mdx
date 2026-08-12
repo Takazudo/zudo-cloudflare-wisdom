@@ -55,6 +55,13 @@ A JWT has three base64url parts: `header.payload.signature`. Verification means:
 
 Define the cache at module scope so it **survives across requests in the same isolate**. It refetches only when the 1-hour TTL expires or when a token references a `kid` not in the cache (key rotation).
 
+Four things keep this safe under load and with more than one issuer:
+
+- **Keyed per issuer.** The cache, the in-flight fetch, and the forced-refetch cooldown are all keyed by the issuer domain (equivalently, the JWKS URL), so one isolate can safely serve several IdPs without their state colliding.
+- **In-flight dedup.** If several requests hit a cold or expiring cache at the same time, they share one outstanding fetch instead of each firing a separate request at the IdP.
+- **Forced-refetch cooldown.** A `kid` miss forces a refetch to pick up key rotation -- but without a limit, a stream of tokens carrying bogus `kid`s would force a refetch on every single request. The cooldown is gated on the last fetch **attempt**, not the last success, so a run of failed refetches doesn't reset the clock and let an attacker keep forcing new ones. A failed in-flight fetch is cleared immediately rather than cached, so a transient IdP outage doesn't get stuck failing forever.
+- **The cleanup chain's own rejection is consumed.** `.finally()` returns a second promise, separate from `inFlight`, and that second promise rejects too whenever the fetch fails -- nothing here awaits or catches it. Left alone, that is an unhandled rejection inside the Worker even when the caller of `fetchJwks` catches the original failure correctly, turning a handled IdP outage into an unrelated crash. A no-op `.catch()` on the `.finally()` chain consumes it without changing what the caller receives; `inFlight` itself, returned unwrapped below, still carries the real rejection.
+
 ```typescript
 // functions/auth/jwks.ts
 interface JwksKey {
@@ -70,34 +77,83 @@ interface JwksResponse {
   keys: JwksKey[];
 }
 
-// Module-level cache: survives across requests in the same isolate.
-let jwksCache: { keys: JwksKey[]; fetchedAt: number } | null = null;
+interface JwksCacheEntry {
+  keys: JwksKey[];
+  fetchedAt: number;
+}
+
+// Keyed per issuer (JWKS URL) so one isolate can safely cache multiple IdPs.
+// All three maps survive across requests in the same isolate, not across isolates.
+const jwksCache = new Map<string, JwksCacheEntry>();
+const inFlightFetches = new Map<string, Promise<JwksKey[]>>();
+const lastForceRefreshAttempt = new Map<string, number>();
+
 const JWKS_CACHE_TTL = 3600_000; // 1 hour
+const FORCE_REFRESH_COOLDOWN = 10_000; // 10s: caps refetch rate on a kid miss
 
 export async function fetchJwks(
   domain: string,
   forceRefresh = false,
 ): Promise<JwksKey[]> {
   const now = Date.now();
-  if (!forceRefresh && jwksCache && now - jwksCache.fetchedAt < JWKS_CACHE_TTL) {
-    return jwksCache.keys;
+  const cached = jwksCache.get(domain);
+
+  if (!forceRefresh && cached && now - cached.fetchedAt < JWKS_CACHE_TTL) {
+    return cached.keys;
   }
 
-  const url = `https://${domain}/.well-known/jwks.json`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Failed to fetch JWKS: ${res.status}`);
+  // Dedup concurrent callers for the same issuer: join the fetch already
+  // in flight instead of firing another request at the IdP. Checked before
+  // the cooldown below so two forced refetches arriving together still
+  // share one request instead of the second being cooldown-blocked.
+  const existing = inFlightFetches.get(domain);
+  if (existing) {
+    return existing;
   }
 
-  const data = (await res.json()) as JwksResponse;
-  jwksCache = { keys: data.keys, fetchedAt: now };
-  return data.keys;
+  if (forceRefresh) {
+    // Gate on the last fetch ATTEMPT, not the last success: a burst of
+    // tokens with bogus `kid`s must not force a refetch on every request,
+    // even while every prior attempt has been failing.
+    const lastAttempt = lastForceRefreshAttempt.get(domain) ?? 0;
+    if (now - lastAttempt < FORCE_REFRESH_COOLDOWN) {
+      return cached?.keys ?? [];
+    }
+    lastForceRefreshAttempt.set(domain, now);
+  }
+
+  const inFlight = (async () => {
+    const url = `https://${domain}/.well-known/jwks.json`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      throw new Error(`Failed to fetch JWKS: ${res.status}`);
+    }
+    const data = (await res.json()) as JwksResponse;
+    jwksCache.set(domain, { keys: data.keys, fetchedAt: Date.now() });
+    return data.keys;
+  })();
+  inFlightFetches.set(domain, inFlight);
+  // Clear on success AND failure -- a failed fetch must not be cached
+  // forever, or every future call would replay the same rejection.
+  // .finally() returns its own promise, which also rejects when `inFlight`
+  // does; the no-op .catch() consumes that second rejection so it never
+  // surfaces as unhandled. `inFlight` below is still the original, unwrapped
+  // promise, so the caller's own catch/try still sees the real failure.
+  inFlight.finally(() => inFlightFetches.delete(domain)).catch(() => {});
+
+  return inFlight;
 }
 ```
 
+<Tip>
+
+The 1-hour TTL describes the cache **within one isolate**, not the fetch rate the IdP actually sees. Isolates are recycled on redeploys, scale-to-zero, and Cloudflare's own placement decisions -- every new isolate starts cold, and a busy route may have many isolates running in parallel, each keeping its own cache. Log (or increment a metric) every time `fetchJwks` actually issues a network request, so you can observe the real fetch rate against the IdP instead of assuming "once per hour" from the TTL alone.
+
+</Tip>
+
 ### RS256 verification with Web Crypto
 
-Decode base64url by hand (JWTs use the URL-safe alphabet, no padding), import the JWK as an `RSASSA-PKCS1-v1_5` key, and verify. If the `kid` is not found in the cache, refetch the JWKS once to handle key rotation.
+Decode base64url by hand (JWTs use the URL-safe alphabet, no padding), import the JWK as an `RSASSA-PKCS1-v1_5` key, and verify. If the `kid` is not found in the cache, refetch the JWKS once to handle key rotation, subject to the refetch cooldown described above.
 
 ```typescript
 // functions/auth/verify.ts
@@ -185,7 +241,14 @@ export async function verifyAuth0Token(
   }
 
   const now = Math.floor(Date.now() / 1000);
-  if (payload.exp && payload.exp < now) {
+  const CLOCK_SKEW_SECONDS = 30; // tolerate small clock drift with the IdP
+
+  // `exp` must be present and a finite number: a missing or NaN exp would
+  // silently skip this check, making the token effectively immortal.
+  if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) {
+    throw new Error("Token missing a valid exp claim");
+  }
+  if (payload.exp < now - CLOCK_SKEW_SECONDS) {
     throw new Error("Token expired");
   }
 
@@ -193,9 +256,11 @@ export async function verifyAuth0Token(
 }
 ```
 
+This sample does not check `nbf` or `iat`: Auth0 access tokens don't set `nbf`, and `iat` is informational only. If your IdP does set `nbf`, add a matching check that rejects tokens used before `nbf` (with the same clock-skew allowance).
+
 ### Auth Middleware Function
 
-The middleware now verifies the token **locally** -- no per-request fetch to the IdP. The only network call is the JWKS fetch, which happens at most once per hour per isolate.
+The middleware now verifies the token **locally** -- no per-request fetch to the IdP. The only network call is the JWKS fetch, which happens at most once per hour per isolate, plus occasional forced refetches on a `kid` miss (rate-limited by the cooldown above).
 
 ```typescript
 // functions/auth/_middleware.ts
