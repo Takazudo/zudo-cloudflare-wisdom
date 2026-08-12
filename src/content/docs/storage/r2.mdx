@@ -164,6 +164,52 @@ R2 does **not** invalidate a presigned URL after the first PUT. The only enforce
 
 Presigned signing needs R2 **S3 API tokens** — `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`, created under **R2 → Manage R2 API Tokens** in the dashboard. These are a **different credential** from the native `[[r2_buckets]]` binding. A Worker can use both: the binding for server-side reads/writes, S3 tokens for minting presigned URLs.
 
+## Pairing R2 with D1
+
+The same "no distributed transaction" constraint that shapes deletion (below) also shapes creation — just pointed in the opposite direction.
+
+### Blob first, row last
+
+Write the **blob first, the D1 row last**:
+
+```typescript
+// 1. Write the blob first. If this fails, nothing else has happened yet.
+const key = `uploads/${crypto.randomUUID()}`;
+await env.FILES.put(key, fileData, {
+  httpMetadata: { contentType },
+});
+
+// 2. Row last. If this fails, the blob is orphaned but harmless —
+//    nothing in D1 claims it exists.
+await env.DB.prepare(
+  "INSERT INTO photos (id, r2_key, content_type) VALUES (?, ?, ?)",
+).bind(crypto.randomUUID(), key, contentType).run();
+```
+
+This protects the same invariant as the delete ordering below, applied to creation instead: **a D1 row must never claim a blob that doesn't exist.** Writing the blob first means a failure between the two steps leaves an orphaned object — recoverable, see reclamation below — instead of a dangling pointer that 404s in front of a user.
+
+### Immutable UUID keys
+
+Derive keys from `crypto.randomUUID()`, or a content hash (see [Key safety](#key-safety)) — never from a user-supplied name, a display title, or anything that might change later.
+
+- **No rename problem.** A key derived from a mutable field forces a choice on rename: leave the key stale and misleading, or move the object. R2 has no atomic rename, so "moving" is copy-then-delete-old — reopening the exact two-step failure window this whole section exists to avoid.
+- **No collision problem.** A UUID key never needs an existence check before writing; two uploads can't accidentally land on the same key the way two files both named `photo.jpg` could.
+
+### Copy-before-batch
+
+Immutable keys have a corollary for batch operations: when a job replaces or regenerates a set of objects (a resize pass, a re-encode, a migration), write every new blob under a new key **first**, in full, and only run the D1 batch update once every object it's about to reference actually exists. A batch UPDATE that goes out while an upload loop is still running risks the same dangling-pointer failure as a single record, just multiplied — a crash mid-batch leaves some rows pointing at blobs that were never written.
+
+### Reclaiming orphaned blobs
+
+Blob-first writes make orphaned objects an expected byproduct, not an exceptional one — every failure between step 1 and step 2 above leaves one behind. A periodic reclamation job is required, not optional, and it needs three properties:
+
+:::warning[Grace period first, or you delete a blob mid-write]
+Never delete an object younger than the longest plausible gap between "blob finished uploading" and "D1 row committed" in your write path — retries, queueing, and cold starts all stretch that gap. An object that looks orphaned two seconds after upload might just be a normal request that hasn't reached step 2 yet. Pick a grace period comfortably longer than your worst-case write latency (hours, not seconds), and skip anything newer than that.
+:::
+
+- **Bounded, paginated scan.** `list()` caps out at 1000 keys per call, same as KV — scanning a large bucket means paging through with `cursor` in bounded batches, not enumerating the whole bucket in one pass.
+- **Reference-aware deletion.** If keys are content-addressed (see below), more than one D1 row can point at the same object. Delete on "zero rows still reference this key" — a `COUNT(*)` check against D1 — never on "the row that created this is gone."
+
 ## Coordinating R2 + D1 without transactions
 
 When a record spans both R2 (the blob) and D1 (the metadata row), there is **no distributed transaction** across the two. A delete or update can fail halfway, and you have to choose which inconsistency you can tolerate.
@@ -193,6 +239,20 @@ try {
 
 return Response.json({ success: true, r2 }, { status: 200 });
 ```
+
+## Key safety
+
+R2 keys built from client-influenced input need the same validation discipline as any other untrusted string reaching storage.
+
+### Charset and length
+
+Constrain any client-influenced portion of a key to a safe allowlist (`[a-zA-Z0-9_-]`, no `..`, no leading `/`, no control characters) before it becomes part of an R2 key. Validate length against the **UTF-8 byte count**, not the character count — R2 keys can be up to 1024 bytes, and multi-byte characters (CJK, emoji) can blow that budget well before 1024 *characters*. Prefer generating the key server-side (see [Immutable UUID keys](#immutable-uuid-keys)) and storing any client-supplied name as `customMetadata` instead of trusting it in the key path at all.
+
+### Content-addressing and its encryption caveat
+
+Keying objects by a hash of their content (`sha256:${hash}`) gives dedup for free: identical content always lands on the same key, so uploading the same file twice costs one object with two referencing D1 rows, not two objects.
+
+The caveat is encryption. If content is encrypted before it reaches R2, hash the **plaintext**, not the ciphertext — a random IV/nonce makes ciphertext differ even for identical plaintext, so hashing ciphertext defeats the dedup entirely. Hashing the plaintext restores it, but the hash itself then reveals when two uploads share identical content, even to someone who can't decrypt either one. Decide whether that leak is acceptable for the data before choosing content-addressing under encryption — if it isn't, accept the storage cost of no dedup instead.
 
 ## Gotchas
 
