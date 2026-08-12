@@ -109,8 +109,13 @@ GitHub Actions はこれをそもそもパースしてくれません。`secrets
           else
             echo "ok=false" >> "$GITHUB_OUTPUT"
             echo "::error::Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID"
+            exit 1
           fi
 ```
+
+:::warning[シークレットが欠けているときは、このジョブは赤く失敗するべきです]
+`exit 1` がここで重要な意味を持つのは、[テンプレートリポジトリの CI](./template-repo-ci.mdx) の preflight ジョブとは違う理由です。テンプレートリポジトリの狙いはまさに、まだ設定されていないフレッシュなクローンが green のままであることです -- そこでのシークレット欠如は最初の実行での想定内の状態です。こちらは逆です：これは本番用のワークフローであり、シークレットはすでに設定されているはずで、トークンが欠けているのは何かが退行した（トークンが失効した、シークレットが削除された）ことを意味します。`exit 1` がなければ、このステップは `ok=false` を書き込みつつ `0` で終了してしまいます -- `check-secrets` は green のまま表示され、`migrate-d1` と `deploy` はそれぞれの `if:` ゲートでスキップされ、ワークフロー全体が何もデプロイしないまま green で終わります。`exit 1` によってジョブ自体を失敗させることで、実行を赤くし、誰かに気づかせるべき状態にします。
+:::
 
 後続のジョブはこの output でゲートできます。`secrets` とは異なり、`needs.<job>.outputs.*` はジョブの `if:` で利用できるためです：
 
@@ -134,7 +139,7 @@ Worker が D1 のスキーマ変更に依存している場合、それを前提
 ```yaml
   migrate-d1:
     name: Apply D1 Migrations
-    needs: [check-secrets]
+    needs: [build-site, check-secrets]
     if: needs.check-secrets.outputs.ok == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -149,6 +154,8 @@ Worker が D1 のスキーマ変更に依存している場合、それを前提
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 ```
+
+`needs: [build-site, check-secrets]` はトークンのゲートだけの話ではありません。`check-secrets` だけでゲートすると、シークレットが確認できた時点で、まだ実行中の、あるいはこの後失敗するかもしれない `build-site` と並行してマイグレーションが走り出してしまいます。`needs:` に `build-site` を加えることで、デプロイまでたどり着かないかもしれないコードより先にスキーマが進んでしまうのを防ぎます。
 
 :::warning[デプロイの後ではなく前にマイグレーションする]
 デプロイジョブの `needs:` に `migrate-d1` を含めてください。そうすることで、新しいスキーマを前提とするコードが動き出す前に、マイグレーションがエラーになった時点でワークフローを早期に失敗させられます。デプロイの後にマイグレーションを実行すると、すでに動いているコードがまだ存在しないカラムやテーブルを問い合わせてしまう時間帯が生まれます。
@@ -279,7 +286,7 @@ if (res.status >= 300 && res.status < 400) {
 
 新しいサイトの最初のデプロイは、上記のチェックすべてに正当に失敗しうる——DNS がまだ伝播していない、まだ一致させるコンテンツが無い——が、それはデプロイが壊れていることを意味しません。確立済みのサイトが全く同じチェックに失敗する場合は、何かが退行したということです。1つのスモークテストが、ライフサイクルの異なる時点でこの両方の振る舞いを必要とします：
 
-- 未設定 / `false`：あらゆる失敗（DNS レコードなし、ステータス異常、リダイレクト、マーカー欠落）は警告を出して `0` で終了します——「まだ live ではない」として扱われ、壊れたデプロイとしては扱われません。
+- 未設定 / `false`：あらゆる失敗（DNS レコードなし、リクエスト自体の失敗、ステータス異常、リダイレクト、マーカー欠落）は警告を出して `0` で終了します——「まだ live ではない」として扱われ、壊れたデプロイとしては扱われません。
 - `true`：同じ失敗が `1` で終了し、ワークフローを失敗させます。
 
 ドメインが新しい間は未設定のままにしておき、サイトが live であることを確認できたらリポジトリの variables で `true` に切り替えてください——その時点から先は、スモークテストは本物の退行を決して見逃してはなりません。
@@ -312,7 +319,12 @@ if (!(await hasDnsRecord(target.hostname))) {
   skipOrFail(`${target.hostname} has no A/AAAA record yet`);
 }
 
-const res = await fetch(target, { redirect: "manual" });
+let res;
+try {
+  res = await fetch(target, { redirect: "manual" });
+} catch (err) {
+  skipOrFail(`request to ${target} failed: ${err.message}`);
+}
 
 if (res.status >= 300 && res.status < 400) {
   skipOrFail(`${target} redirected (${res.status}) instead of serving directly`);
@@ -324,6 +336,10 @@ if (res.status >= 300 && res.status < 400) {
   console.log(`smoke test passed: ${target} is serving ${marker}`);
 }
 ```
+
+:::tip[DNS チェックは `fetch()` が投げうるすべてのケースをカバーしない]
+A/AAAA レコードが解決できることは、そのドメインにルーティングできることを証明するだけです——TLS がすでにプロビジョニングされているか、その先のルートが実際にサービスを提供しているかについては何も言っていません。証明書がまだ発行されていない、コネクションが拒否される、ルートが伝播の途中にあるといったケースでは `fetch()` は依然として例外を投げます（reject します）。ここで捕まえられない reject はスクリプトを非ゼロ終了でクラッシュさせ、`SMOKE_REQUIRE_LIVE` の値に関係なく `skipOrFail` を完全に迂回して、寛容なモードであってもハードに失敗させてしまいます。`fetch()` の呼び出しを `try`/`catch` で包み、そのエラーを `skipOrFail` に通すことで、DNS だけでなくすべての失敗モードを同じ寛容/厳格の切り替えの対象にできます。
+:::
 
 ### ワークフローへの組み込み
 
@@ -353,7 +369,7 @@ if (res.status >= 300 && res.status < 400) {
 静的サイトのスモークテストは `GET` 1本で済みます。API Worker のスモークテストは書き込み経路全体が動くことを証明する必要があり、それには実際に呼び出すしかありません：認証し、レコードを作成し、正しく返ってくることを検証し、削除します。これを毎回のデプロイで安全に実行できるようにする鍵が2つあります：
 
 - **実行ごとに一意な識別子** —— タイムスタンプにランダムなサフィックスを足したもの。これにより、並行する実行（立て続けの2回の push）が同じリソースで衝突することがなく、万一残ってしまったレコードもどの実行が作ったものか追跡できます。
-- **クリーンアップ用の `trap ... EXIT`** —— これにより、作成したレコードはスクリプトが成功しても、verify ステップで失敗しても、ジョブの `timeout-minutes` で kill されても削除されます。ハッピーパスだけではありません。
+- **クリーンアップ用の `trap ... EXIT`** —— これにより、作成したレコードはスクリプトが成功しても、verify ステップで失敗しても、ジョブの `timeout-minutes` で kill されても削除されます。ハッピーパスだけではありません。クリーンアップ自体も声を上げて失敗しなければなりません——`DELETE` が黙って no-op になると、ジョブログに何も残らないままテストレコードが残り続けます。
 
 ```bash
 #!/usr/bin/env bash
@@ -363,9 +379,15 @@ RUN_ID="smoke-$(date +%s)-$RANDOM"
 ITEM_ID=""
 
 cleanup() {
-  [ -n "$ITEM_ID" ] && curl -fsS -X DELETE "$API_URL/items/$ITEM_ID" \
-    -H "Authorization: Bearer $API_TOKEN" >/dev/null
-  return 0
+  local exit_code=$?
+  if [ -n "$ITEM_ID" ]; then
+    if ! curl -fsS -X DELETE "$API_URL/items/$ITEM_ID" \
+      -H "Authorization: Bearer $API_TOKEN" >/dev/null; then
+      echo "::error::cleanup failed to delete $ITEM_ID -- test record left behind"
+      [ "$exit_code" -eq 0 ] && exit_code=1
+    fi
+  fi
+  exit "$exit_code"
 }
 trap cleanup EXIT
 
@@ -380,6 +402,10 @@ curl -fsS "$API_URL/items/$ITEM_ID" -H "Authorization: Bearer $API_TOKEN" \
 
 echo "API smoke test passed for $RUN_ID"
 ```
+
+:::warning[クリーンアップの失敗を成功に見せかけてはいけない]
+`[ -n "$ITEM_ID" ] && curl ... ; return 0` —— このトラップの素朴なバージョンは、`curl -X DELETE` が実際に何をしたかに関わらず、`cleanup` から常に `0` を返します。削除が失敗しても（トークン失効、ネットワークの瞬断、アイテムがすでに無い、など）その事実は跡形もなく消え、ジョブは green のまま、テストレコードはデータベースに永遠に残ります。`cleanup` は入口で `$?` を捕まえます（`exit_code=$?`）。そのため、スクリプトのより早い段階での失敗（verify ステップ、create ステップ）はこれまで通り保存され、ジョブは非ゼロで終了し続けます。新しいのは逆方向のケースです：スクリプト自体は成功したのに `DELETE` が失敗した場合、`exit_code` は `0` から `1` に引き上げられ、壊れたクリーンアップがそれ以外は成功しているように見える実行の裏に隠れられないようにします。どちらの場合も、最後の明示的な `exit "$exit_code"` こそがジョブの結果を実際に決めるものであり、trap 自身の最後のコマンドから bash が推測する何かではありません。
+:::
 
 :::warning[`trap ... EXIT` が生き残るのは通常の失敗経路だけ]
 `trap ... EXIT` は、通常の終了、`exit` の呼び出し、`set -e` によるスクリプトの中断で実行されます——上記のあらゆる失敗経路をカバーします。ただし、一部の CI ランナーがハードタイムアウトを強制する方法である `SIGKILL` でプロセスが kill された場合は実行され**ません**。`timeout-minutes` は、ジョブ側の外側の上限ではなく、スクリプト自身のロジックがジョブを終わらせる程度に余裕を持たせておいてください。

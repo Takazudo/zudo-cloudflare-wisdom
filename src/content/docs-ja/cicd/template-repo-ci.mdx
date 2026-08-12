@@ -100,6 +100,20 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
       - name: Download site artifact
         uses: actions/download-artifact@v7
         with:
@@ -196,7 +210,7 @@ PR ごとにデプロイする PR プレビューワークフローでは、同�
   preview:
     name: Preview Deploy
     needs: [build-site]
-    if: github.event.pull_request.head.repo.fork == false
+    if: github.event.pull_request.head.repo.fork == false && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -204,5 +218,9 @@ PR ごとにデプロイする PR プレビューワークフローでは、同�
 ```
 
 これはプリフライトゲートと同じ形 -- skipped に解決されるジョブレベルの `if:` -- を、自分のワークフローが計算する条件の代わりに GitHub がすでにイベントペイロードに公開している条件に適用したものだ。デプロイジョブについてはプリフライトパターンと組み合わせるとよい：フォーク PR はここで別の理由（そもそもシークレットが存在するはずがない）でスキップし、同一リポジトリからの push はリポジトリが実際にまだ設定されていないときにそちらでスキップする。
+
+:::warning[Dependabot の PR はフォークチェックを通過するのに、シークレットは無い]
+`head.repo.fork == false` は Dependabot の PR に対しても真になる -- フォークではなく同じリポジトリに対して開かれる PR だからだ。それでも GitHub は、Dependabot がトリガーしたワークフロー実行をシークレットの扱いに関してはフォーク PR と同じように扱う: `CLOUDFLARE_API_TOKEN` はやはり空文字列に解決され、`github.actor != 'dependabot[bot]'` の節がなければ、preview ジョブは普通に走ってしまい、依存関係を上げる PR のたびに赤く失敗する。根本にあるこの制限と、そうした PR にどうしてもシークレットが必要な場合に同名の Dependabot シークレットを別途登録する代替策については、[GitHub の Dependabot ドキュメント](https://docs.github.com/en/code-security/dependabot/working-with-dependabot/automating-dependabot-with-github-actions#accessing-secrets)を参照。
+:::
 
 関連ページ：このパターンが反応するプレースホルダー設定のライフサイクルについては[ゼロからのデプロイ](../workers/deploy-from-zero.mdx)、このプリフライトジョブが拡張するベースラインのワークフローについては[本番デプロイ](./production-deploy.mdx)を参照。
