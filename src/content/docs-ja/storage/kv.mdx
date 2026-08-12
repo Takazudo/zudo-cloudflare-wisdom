@@ -147,9 +147,72 @@ async function checkRateLimit(
 KV は結果整合性のため、高い同時実行数では数件の余分なリクエストが通過する可能性がある。ボットや API のレート制限としては問題ないが、正確なカウントが必要な場合は [Durable Objects](../workers/durable-objects.mdx) を使用する。
 :::
 
+## パターン: 新着順フィード
+
+「最近のアクティビティ」や「最新の投稿」のようなフィードを KV 上に構築するには、2つの問題を解決する必要がある：順序を正しくすることと、それを描画するために無制限のファンアウトコストを支払わないことだ。
+
+### ソート可能なキー
+
+各フィードアイテムのキーに ISO-8601 タイムスタンプを含め、辞書順のキー順序が時系列順序と一致するようにする：
+
+```typescript
+const key = `feed:${new Date().toISOString()}:${crypto.randomUUID()}`;
+await env.FEED.put(key, JSON.stringify(item));
+```
+
+`toISOString()` は固定長でゼロ埋めされている（`2026-08-12T03:15:22.123Z`）ため、文字列比較と時刻比較が一致する -- ゼロ埋めのない `Date.now()` やランダムな UUID では時系列順にソートされないのとは対照的だ。
+
+これで時系列順にはなるが、*逆*時系列順にはならない。`list()` はプレフィックス範囲の先頭から前方にしか進めない -- 「末尾から開始する」カーソルは存在しない。そのまま昇順の ISO-8601 にしておくと、最新のアイテムは肥大化し続けるプレフィックスの末尾にあり、そこに到達するには履歴全体をページングする必要がある。代わりにタイムスタンプを反転させ、最新の書き込みが最小のキー、つまり素の `list()` の最初の結果になるようにする：
+
+```typescript
+// Newest-first: invert the timestamp so ascending list() order is descending time order.
+const REVERSE_EPOCH_MS = 9999999999999; // safely past any real Date.now()
+function feedKey(id: string, when = new Date()): string {
+  const reversed = String(REVERSE_EPOCH_MS - when.getTime()).padStart(13, "0");
+  return `feed:${reversed}:${id}`;
+}
+```
+
+### ファンアウトのコスト
+
+`list()` はキー名とメタデータのみを返し、値は返さない。N 件のフィードアイテムを描画するには N 回の追加の `get()` 呼び出しが必要になる -- 本当のコストは list 自体ではなく、このファンアウトにある。
+
+フィード量の急増や、フィルタで除外されるアイテムの連続が、無制限の `get()` バーストに変わらないよう、境界を3段階に分けて設ける：
+
+```typescript
+interface FeedItem {
+  hidden: boolean;
+  // ...other fields
+}
+
+async function getFeed(env: Env, displayLimit = 6): Promise<FeedItem[]> {
+  // 1. List a candidate pool, oversized to absorb items filtered out in step 3.
+  const { keys } = await env.FEED.list({ prefix: "feed:", limit: 40 });
+
+  // 2. Bound the fan-out: fetch at most 20 bodies, regardless of how many
+  //    candidates step 1 returned.
+  const candidates = keys.slice(0, 20);
+  const items = await Promise.all(
+    candidates.map((k) => env.FEED.get<FeedItem>(k.name, "json")),
+  );
+
+  // 3. Bound what actually reaches the UI.
+  return items
+    .filter((item): item is FeedItem => item !== null && !item.hidden)
+    .slice(0, displayLimit);
+}
+```
+
+- **40** -- `list()` の呼び出し。手順3で除外されるアイテム（非表示、不正、削除済み）の分だけ余裕を持たせたサイズ
+- **20** -- `get()` のファンアウトに対するハードな上限で、手順1が何件のキーを返したかに関わらず適用される。これはワーストケースのサブリクエスト数と CPU 時間を決める数値なので、意図的に選ぶ
+- **6** -- 実際にフィードに表示される件数。ファンアウトの上限とは切り離してあるので、UI 変更（6件ではなく10件表示する等）がフェッチコストの予算に影響することはない
+
+各レイヤーは、その下のレイヤーで発生する損失 -- フィルタで除外される list 結果、取得後に非表示と判明するアイテム -- を吸収し、その損失が KV 操作の回数を静かに膨張させないようにする。
+
 ## 注意点
 
 - **結果整合性**: 書き込み直後の読み取りは古いデータを返す可能性がある
+- **CAS（Compare-And-Swap）がなく、否定的なルックアップがキャッシュされる**: `put()` は常に無条件で上書きする -- アトミックな check-and-set が存在しないため、2つの書き込み側がそれぞれキーを「存在しない」と観測し、衝突の合図なしに両方とも書き込んでしまうことがある。さらに `get()` のミスはエッジでキャッシュされうるため、別の書き込み側がその key に対して `put()` を完了した後もしばらく「見つからない」を返し続けることがある。重複排除、ロック、クレーム処理のロジックを KV の上に構築してはならない -- それは [D1 のアトミックな重複排除とクレーム](./d1.mdx#アトミックな重複排除と行の確保) が担うべきで、そこにはこれに必要なプリミティブ（`ON CONFLICT`、`changes()`）がある。
 - **512バイトのキー制限**: キーは512バイトを超えられない
 - **25 MiB の値制限**: 値は25 MiB を超えられない
 - **リストのページネーション**: `list()` は1回の呼び出しで最大1000キーを返す
