@@ -212,6 +212,112 @@ const accessCookie = serializeCookie('access_token', newAccessToken, {
 });
 ```
 
+## CSRF: Cookie はアンビエントな認証情報
+
+ブラウザは、一致するオリジン宛てのリクエストであれば `Cookie` ヘッダーを自動的に付与します。そのリクエストをどのページが発生させたかは関知せず、宛先のオリジンだけを見ます。この利便性こそが、Cross-Site Request Forgery（CSRF）の前提そのものです。`evil.example` 上のページが被害者のブラウザに `POST https://app.example.com/api/refresh` を発火させれば、`access_token` / `refresh_token` の各 Cookie は攻撃者がその値を一切見ることなく、認証済みのまま乗ってしまいます。
+
+**ゲートはブラウザ Cookie 経由のルートに限定します。** このチェックは、このページで扱っているアンビエント Cookie で認証されるルートの前にのみ置くべきものです。`Authorization` ヘッダー中のベアラートークンで認証するルートには不要です。そのヘッダーを付けるのは呼び出し側コードが意図的に行う作業（ストレージからトークンを読み出し、ヘッダーにセットする）であり、別オリジンのページがブラウザにそれを代行させる手段はありません。CSRF が突くのは「アンビエントな」認証情報の自動付与であり、ヘッダー経由の認証情報はそもそもアンビエントではありません。
+
+ゲートの中身は、それぞれ特定の穴をふさぐいくつかのルールから成ります。
+
+- **安全なメソッドはスキップします。** ゲートするのは `POST`/`PUT`/`PATCH`/`DELETE` だけです。クロスサイトのページは `<img src>`・`<link>`・`EventSource` などで自オリジンへの `GET` を発火させることができ、許可なしに Cookie が乗ります。それが許容されるのは、`GET` が副作用を持たないと定義されているからです。攻撃者はブラウザに被害者の身元で何かを「取得」させられますが、「変更」はできませんし、レスポンスを読むこともできません（CORS の許可がないため）。`GET` ハンドラが何かを変更してしまえば、この前提は崩壊します。
+- **Origin allowlist はタプルとして比較します。** `Origin` ヘッダーは `new URL()` でパースし、`(scheme, host, port)` を明示的な allowlist と比較します。文字列の前方一致や部分一致では絶対に比較しません。`https://app.example.com.evil.example` は文字列としては `https://app.example.com` から始まりますが、同一オリジンではありません。
+- **`Origin` ヘッダーがない場合は拒否します。** 最近のブラウザは、同一オリジンかどうかを問わず、状態変更を伴う fetch/XHR/フォーム送信のすべてで `Origin` を送ります。状態変更リクエストに `Origin` ヘッダーが一切ない場合、それは非常に古いブラウザか、ヘッダーを偽装したブラウザ以外のクライアントです。`Referer` にフォールバックしたり同一オリジンとみなしたりせず、拒否します。
+- **`Origin: null` は明示的に拒否します。** サンドボックス化された iframe（`allow-same-origin` なしの `sandbox`）や一部のリダイレクトチェーン、`file://` のページは、いずれも文字列そのものの `"null"` を Origin として送ってきます。これが allowlist に正当にマッチすることはありませんが、緩い正規表現や `includes()` による比較では、これに騙されることがあります。比較ロジックに到達する前に、名指しで拒否します。
+- **Sec-Fetch-Site は補助シグナルであり代替ではありません。** `Sec-Fetch-Site: same-origin` は多層防御として有用ですが、「site」は登録可能ドメイン（eTLD+1）のみを見ており、ポートは無視します。`app.example.com:8787` と `app.example.com:8788` は別オリジンであり（上記の Origin allowlist ではそう扱う必要があります）、どちらも `same-site` と報告されます。この Cookie を `Domain=.example.com` でサブドメイン間共有している場合（上記参照）、`Sec-Fetch-Site` だけを信頼すると、そのドメイン配下の *どのポートのどのアプリ* も信頼してしまうことになります。ポートまで含めて比較しなければならないのは Origin のタプル比較のほうであり、`Sec-Fetch-Site` はその上に乗せる安価な追加チェックにすぎません。
+- **ゲートより先にセッションを検証します。** まず Cookie 自体を検証します。有効なセッションがなければ、CSRF チェックを走らせる前に即座に `401 Unauthorized` を返します -- まだ保護すべきアンビエントな認証情報が存在しないからです。セッションは有効だが CSRF チェックに失敗した場合は `403 Forbidden` です。このステータスコードの違いが、クライアントにとっての問題の種類を伝えます。「ログインし直せ」なのか、「ログインはできているが、この特定のリクエストは拒否されている」なのか、という違いです。
+
+```typescript
+// utils/csrf.ts
+const ALLOWED_ORIGINS = new Set(['https://app.example.com']);
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+interface OriginTuple {
+  scheme: string;
+  host: string;
+  port: string;
+}
+
+function parseOrigin(value: string): OriginTuple | null {
+  try {
+    const url = new URL(value);
+    return {
+      scheme: url.protocol,
+      host: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? '443' : '80'),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isSameOrigin(a: OriginTuple, b: OriginTuple): boolean {
+  return a.scheme === b.scheme && a.host === b.host && a.port === b.port;
+}
+
+export function requiresCsrfCheck(request: Request): boolean {
+  return !SAFE_METHODS.has(request.method);
+}
+
+export function isTrustedOrigin(request: Request): boolean {
+  const origin = request.headers.get('Origin');
+
+  // Missing Origin on a state-changing request: refuse rather than fall
+  // back to Referer or assume same-origin.
+  if (!origin) {
+    return false;
+  }
+
+  // Sandboxed iframes, some redirect chains, and file:// pages send the
+  // literal string "null" -- it must never match the allowlist below.
+  if (origin === 'null') {
+    return false;
+  }
+
+  const parsed = parseOrigin(origin);
+  if (!parsed) {
+    return false;
+  }
+
+  for (const allowed of ALLOWED_ORIGINS) {
+    const parsedAllowed = parseOrigin(allowed);
+    if (parsedAllowed && isSameOrigin(parsed, parsedAllowed)) {
+      return true;
+    }
+  }
+  return false;
+}
+```
+
+状態変更ハンドラの中では、セッションチェックの後・状態変更の前にこれを組み込みます。ここでは上記のリフレッシュエンドポイントを例にします。
+
+```typescript
+// handlers/refresh.ts (excerpt)
+const payload = await verifyToken(refreshToken, env.JWT_SECRET, 'refresh');
+// Reaching this line means the refresh token itself is valid -- an invalid
+// or missing one throws and is caught by the existing 401 branch above.
+// There is no ambient credential yet to protect until the session checks out.
+
+if (requiresCsrfCheck(request) && !isTrustedOrigin(request)) {
+  return new Response(
+    JSON.stringify({
+      error: 'Forbidden',
+      message: 'Origin not allowed',
+    }),
+    {
+      status: 403,
+      headers: { 'Content-Type': 'application/json' },
+    },
+  );
+}
+
+// ...mint and return the new access cookie as before
+```
+
+:::note[なぜ `SameSite=Lax` であって `Strict` ではないのか]
+上記のアクセス Cookie・リフレッシュ Cookie は `sameSite: 'Lax'` を使っており、`Strict` ではありません。`Lax` はクロスサイトの `POST` やサブリソースリクエスト（画像・iframe・`fetch`）では Cookie を送りませんが、`GET` によるトップレベルのクロスサイト *ナビゲーション* では送ります -- これはまさに OAuth プロバイダーがブラウザを `/auth/callback` にリダイレクトして戻すときに起きることです。`Strict` だとその最初の着地で Cookie が落ちてしまい、ログインフローが壊れます。この代償として、上の「安全なメソッドはスキップします」のルールはオプションではありません。`Lax` が安全であり続けるのは、`GET` のルートが一切状態を変更しない場合に限られます。
+:::
+
 ## Wrangler 設定: シークレットと vars
 
 `COOKIE_DOMAIN` は公開設定なので `[vars]` で問題ありません。`JWT_SECRET` は全トークンの署名鍵であり、**絶対に** `wrangler.toml` に置いてはいけません。`[vars]` ではプレースホルダーとして空のままにし、実際の値はシークレットとして注入します。
