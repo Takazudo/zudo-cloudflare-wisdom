@@ -211,7 +211,11 @@ export async function listTokens(env: Env, principal: string): Promise<TokenSumm
 
 `/account/tokens` 配下のルート -- 発行・一覧・失効 -- は、呼び出し元をセッションで認証しなければならず、API トークン自身での認証を決して受け付けてはならない。これは上記の二重ガードとは別のルールであり、別の穴を塞ぐ: 期限内で失効もされていないトークンであっても、トークン管理のための資格情報として受け入れられてはならない。
 
+セッション Cookie は認証であって CSRF 対策ではない。それはアンビエントだ -- ブラウザはクロスサイトのリクエストにも同一サイトのリクエストとまったく同じように Cookie を付けて送る -- ので、以下の `authenticate` が確認しているのは呼び出し元が*有効なセッションを持っていること*であり、呼び出し元が*このリクエストを本当に意図したこと*ではない。ここにある状態を変更するルートはすべて、[HTTP-only Cookie セッションの CSRF セクション](./cookie-sessions.mdx#csrf-cookie-はアンビエントな認証情報)にある Origin タプルのゲートを、セッションが有効だと確認できたあとにだけ重ねて適用する: セッションがまだない場合は、保護すべきアンビエントな資格情報がまだ何もない時点で即座に `401`。セッションは有効だが `Origin` が違う場合は `403`。
+
 ```typescript
+import { isTrustedOrigin, requiresCsrfCheck } from "./csrf"; // see HTTP-only Cookie Sessions, CSRF section
+
 type AuthResult =
   | { kind: "session"; principal: string }
   | { kind: "token"; principal: string; tokenId: string };
@@ -245,6 +249,13 @@ export async function handleCreateToken(
     return new Response("Unauthorized", { status: 401 });
   }
 
+  // Session confirmed -- now confirm the request itself is trusted before
+  // it mutates anything. A crafted cross-site form POST rides the same
+  // ambient cookie `authenticate` just accepted; this is what stops it.
+  if (requiresCsrfCheck(request) && !isTrustedOrigin(request)) {
+    return new Response("Forbidden", { status: 403 });
+  }
+
   const { name } = (await request.json()) as { name: string };
   const minted = await mintToken(env, auth.principal, name);
 
@@ -259,26 +270,35 @@ export async function handleCreateToken(
 もし漏洩したトークンが自分自身の管理ルートで認証できてしまうなら、それは単一の失効可能な資格情報ではなく、自己増殖する資格情報になってしまう。盗んだトークンを 1 つ持つ攻撃者は、他のすべてのトークンのメタデータを一覧して狙いを定めたり、漏洩したトークンをオーナーが失効させても生き残る新しいトークンを発行したり、侵害の後始末に必要な API そのものからオーナーを締め出すためにオーナー自身のトークンを失効させたりできてしまう。セッションを要求すること -- 漏洩したトークンしか持たない攻撃者には持ち得ないもの -- こそが、侵害されたトークン 1 つを、封じ込められた単一のインシデントのままにとどめる。
 :::
 
-`handleListTokens` と `handleRevokeToken` もまったく同じ形をたどる: `authenticate` を呼び、`kind === "session"` でないものはすべて拒否し、そのあとで初めて `listTokens` / `revokeToken` に触れる。
+:::note[このルートが CORS のプリフライトなしで到達可能な理由]
+`request.json()` はリクエストの `Content-Type` ヘッダーに関わらずボディをパースする -- ここではたまたま JSON だが、ヘッダーが実際にそう言っているかを確認する処理はどこにもない。`enctype="text/plain"` を指定したクロスサイトの `<form>` POST は CORS のプリフライトを一切引き起こさず、それでいてボディはこのハンドラが期待する JSON としてパースされるように細工できる。ここでの CSRF には、フォーム 1 つあれば十分だ -- `fetch()` も、カスタムヘッダーも、リクエストが送られる前にブラウザが警告するようなものは何もいらない。実際にそれを止めているのは上の Origin チェックであり、Content-Type を見るだけでは止まらない。
+:::
+
+`handleListTokens` と `handleRevokeToken` もまったく同じ形をたどる: `authenticate` を呼び、`kind === "session"` でないものはすべて拒否する。`handleRevokeToken` -- ここでもう一つの状態を変更するルート -- も `revokeToken` に触れる前に同じ `requiresCsrfCheck` / `isTrustedOrigin` のゲートを適用する。`handleListTokens` は `GET` なのでこれをスキップする。`requiresCsrfCheck` はすでに安全なメソッドを除外しているからだ。
 
 ## `last_used_at` をレースなしで追跡する
 
 上記の `verifyToken` は、行が見つかったあとに `ctx.waitUntil(touchLastUsed(...))` を呼び出す -- この更新はレスポンスがすでに送信され始めたあとに行われるので、リクエストのクリティカルパス上では何のコストもかからない。
 
 ```typescript
+const LAST_USED_MIN_INTERVAL_MS = 60_000; // coalesce writes to at most once a minute per token
+
 async function touchLastUsed(db: D1Database, id: string, now: number): Promise<void> {
   await db
     .prepare(
       `UPDATE api_tokens
        SET last_used_at = ?
-       WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)`,
+       WHERE id = ?
+         AND (last_used_at IS NULL OR (last_used_at < ? AND ? - last_used_at > ?))`,
     )
-    .bind(now, id, now)
+    .bind(now, id, now, now, LAST_USED_MIN_INTERVAL_MS)
     .run();
 }
 ```
 
-`WHERE last_used_at IS NULL OR last_used_at < ?` という句は省略可能なものではない。自動化された高頻度の API 呼び出しに使われるトークンは、同時に多数のリクエストが飛び交い、それぞれが自分自身の `now` タイムスタンプを持つ独立した `waitUntil` の書き込みを発火させる -- そして `waitUntil` のコールバックは、それをスケジュールしたリクエストが届いた順序どおりに完了するとは保証されていない。単調性のガードがなければ、より早く始まったリクエスト（つまりより早い `now` を持つリクエスト）の書き込みが、より遅く始まったリクエストの*あとに*着地してしまい、より新しい `last_used_at` を古いもので黙って上書きしかねない。ガードがあれば、書き込みはタイムスタンプを前にしか進めない -- すでにより新しい行を対象にした順序違いの完了は、単に 0 行にマッチして何もしない。これは [D1 による Idempotency-Key 台帳](./idempotency-ledger.mdx#pending-予約の引き継ぎをフェンシングする)の completion 書き込みとまったく同じ、フェンスされた書き込みの形だ。
+`last_used_at IS NULL OR last_used_at < ?` の半分は省略可能なものではない。自動化された高頻度の API 呼び出しに使われるトークンは、同時に多数のリクエストが飛び交い、それぞれが自分自身の `now` タイムスタンプを持つ独立した `waitUntil` の書き込みを発火させる -- そして `waitUntil` のコールバックは、それをスケジュールしたリクエストが届いた順序どおりに完了するとは保証されていない。単調性のガードがなければ、より早く始まったリクエスト（つまりより早い `now` を持つリクエスト）の書き込みが、より遅く始まったリクエストの*あとに*着地してしまい、より新しい `last_used_at` を古いもので黙って上書きしかねない。ガードがあれば、書き込みはタイムスタンプを前にしか進めない -- すでにより新しい行を対象にした順序違いの完了は、単に 0 行にマッチして何もしない。これは [D1 による Idempotency-Key 台帳](./idempotency-ledger.mdx#pending-予約の引き継ぎをフェンシングする)の completion 書き込みとまったく同じ、フェンスされた書き込みの形だ。
+
+単調性のガードだけでは、行が*どれだけの頻度で*書き込まれるかは制限されない。制限されるのは書き込みが着地できる順序だけだ。同じ高頻度トークンはほぼすべてのリクエストで異なる `now` を持つので、さらなるチェックがなければ `touchLastUsed` はそのトークンに触れるほぼすべてのリクエストで D1 への書き込みを実行してしまう -- `ctx.waitUntil` は書き込みをレスポンスのクリティカルパスから外すだけで、D1 自身が直列化しなければならない書き込み量そのものは何も減らさない。そして実際にボトルネックになるのはその書き込み量のほうだ。述語の `? - last_used_at > ?` の部分がその下限を加える: `last_used_at` が直近 `LAST_USED_MIN_INTERVAL_MS` 以内に設定されていれば、その時間枠が経過するまで以降の書き込みはスキップされ、1 秒間に何度も使われるトークンでも 1 分間に 1 回の書き込みへと合流させられる。これは単調性チェックを置き換えるのではなく、同じ `WHERE` 句に組み込まれている -- 単調性は古い書き込みを安全にスキップできるようにするものであり、間隔は「スキップする」ことを例外ではなく通常のケースにするものだ。
 
 ## ルートテーブル
 
@@ -301,7 +321,7 @@ graph TB
   Lookup -->|Row found| Guard{"revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now)"}
   Guard -->|Either predicate fails| Reject
   Guard -->|Both pass| Allow[Request authenticated as principal]
-  Allow --> Touch["ctx.waitUntil: monotonic last_used_at UPDATE"]
+  Allow --> Touch["ctx.waitUntil: monotonic, interval-throttled last_used_at UPDATE"]
   Touch --> Respond[Handle the request]
 ```
 
@@ -336,6 +356,6 @@ export default {
 
 ## 関連項目
 
-- [HTTP-only Cookie セッション](./cookie-sessions.mdx) -- ここで管理ルートが要求するセッション Cookie 認証。
+- [HTTP-only Cookie セッション](./cookie-sessions.mdx) -- ここで管理ルートが要求するセッション Cookie 認証、そしてそれに重ねて使う [Origin タプルの CSRF ゲート](./cookie-sessions.mdx#csrf-cookie-はアンビエントな認証情報)の出どころ。
 - [D1 による Idempotency-Key 台帳](./idempotency-ledger.mdx) -- 同じ D1 の基礎（条件付き `UPDATE ... RETURNING`、フェンスされた書き込み）を別の問題に適用したもの。
 - [HMAC-SHA256 によるウェブフック署名](./webhook-signing.mdx) -- このサイトが Web Crypto でハッシュ計算を行うもう一つの場所であり、あちらは一定時間比較が必要でこちらは不要である理由。

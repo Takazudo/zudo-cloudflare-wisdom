@@ -141,13 +141,13 @@ export async function sendWebhook(
 // Both `received` and `expected` are meant to be the same fixed-length hex
 // digest, so the length check below is safe: that length is public
 // (HMAC-SHA256's fixed digest size), not something derived from `secret`.
+// It also guarantees the two encoded buffers are the same length, which
+// crypto.subtle.timingSafeEqual() requires: it throws, rather than
+// returning false, on a length mismatch.
 function timingSafeEqualHex(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
-  let result = 0;
-  for (let i = 0; i < a.length; i++) {
-    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return result === 0;
+  const encoder = new TextEncoder();
+  return crypto.subtle.timingSafeEqual(encoder.encode(a), encoder.encode(b));
 }
 
 /**
@@ -170,7 +170,7 @@ export async function verifyWebhook(request: Request, secret: string): Promise<b
 ```
 
 :::tip[ハッシュ優先の一定時間比較]
-`timingSafeEqualHex` はバイトの不一致では早期リターンしません -- 結果を決めるのはループによる一定時間の XOR だけです。対照的に素朴な `===` は 2 つの文字列が異なった瞬間にリターンしてしまうため、レスポンスのタイミングを十分な精度で計測できる攻撃者はそれを利用して正しい署名を 1 バイトずつ復元できてしまいます。これは、このサイトの他のシークレット比較レシピ全体で使われているのと同じ、ハッシュ優先・一定時間比較の形です -- 同じ手法を、すでに固定長のダイジェストではなく可変長のシークレット（パスワード）に適用した例については [パスワードゲート](./password-gate.mdx#パスワードの検証-まずハッシュ化し、それから一定時間で比較する) を参照してください。
+`timingSafeEqualHex` はバイトの不一致では早期リターンしません -- 結果を決めるのは `crypto.subtle.timingSafeEqual()` による一定時間の比較だけです。対照的に素朴な `===` は 2 つの文字列が異なった瞬間にリターンしてしまうため、レスポンスのタイミングを十分な精度で計測できる攻撃者はそれを利用して正しい署名を 1 バイトずつ復元できてしまいます。`crypto.subtle.timingSafeEqual()` は自前のループではなく、まさにこの比較のために Workers ランタイムが自ら提供するプリミティブです -- ECMAScript はどの JS の一片についても一定時間実行を保証しないため、JIT に最適化されたループは安全な代替にはなりません。これは、このサイトの他のシークレット比較レシピ全体で使われているのと同じ、ハッシュ優先・一定時間比較の形です -- 同じ手法を、すでに固定長のダイジェストではなく可変長のシークレット（パスワード）に適用した例については [パスワードゲート](./password-gate.mdx#パスワードの検証-まずハッシュ化し、それから一定時間で比較する) を参照してください。
 :::
 
 ## 関連: Workers での Web Crypto

@@ -55,11 +55,12 @@ JWT は base64url でエンコードされた 3 つの部分 `header.payload.sig
 
 キャッシュをモジュールスコープで定義し、**同じアイソレート内のリクエスト間で生存する** ようにします。再取得が走るのは、1 時間の TTL が切れたとき、またはキャッシュに無い `kid` をトークンが参照したとき（鍵のローテーション）だけです。
 
-負荷に耐え、複数の発行者に対応するために、次の 3 点を組み込んでいます。
+負荷に耐え、複数の発行者に対応するために、次の 4 点を組み込んでいます。
 
 - **発行者ごとにキー分割。** キャッシュ・進行中のフェッチ・強制再取得のクールダウンはすべて発行者のドメイン（つまり JWKS URL）をキーにしているので、1 つのアイソレートが複数の IdP を状態衝突なく扱えます。
 - **進行中フェッチの重複排除。** 複数のリクエストが同時にキャッシュ切れ・期限切れに当たった場合、それぞれが別々に IdP へリクエストを飛ばすのではなく、進行中の 1 つのフェッチを共有します。
 - **強制再取得のクールダウン。** `kid` が見つからないと鍵ローテーションに対応するため再取得を強制しますが、制限がなければ、でたらめな `kid` を持つトークンの連打がリクエストのたびに再取得を強制してしまいます。このクールダウンは直近の成功ではなく直近の**試行**を基準にゲートしているので、再取得が失敗し続けても時計はリセットされず、攻撃者が再取得を強制し続けることはできません。進行中フェッチが失敗した場合は即座にクリアされ、キャッシュされたままにはならないので、IdP の一時的な障害が永久に失敗し続ける状態にはなりません。
+- **クリーンアップ用チェーン自身の rejection を消費する。** `.finally()` は `inFlight` とは別の、もう 1 つの Promise を返し、フェッチが失敗するたびにその Promise も reject します -- ここではそれを await も catch もしていません。放置すると、`fetchJwks` の呼び出し元が元の失敗を正しく catch していたとしても、Worker の中で未処理の rejection になってしまい、正しく処理されたはずの IdP 障害が無関係なクラッシュに化けます。`.finally()` チェーンに no-op の `.catch()` を付けることで、呼び出し元が受け取るものを変えずにこれを消費できます。以下で unwrap されたまま返される `inFlight` 自体は、引き続き本物の rejection を運びます。
 
 ```typescript
 // functions/auth/jwks.ts
@@ -134,7 +135,11 @@ export async function fetchJwks(
   inFlightFetches.set(domain, inFlight);
   // Clear on success AND failure -- a failed fetch must not be cached
   // forever, or every future call would replay the same rejection.
-  inFlight.finally(() => inFlightFetches.delete(domain));
+  // .finally() returns its own promise, which also rejects when `inFlight`
+  // does; the no-op .catch() consumes that second rejection so it never
+  // surfaces as unhandled. `inFlight` below is still the original, unwrapped
+  // promise, so the caller's own catch/try still sees the real failure.
+  inFlight.finally(() => inFlightFetches.delete(domain)).catch(() => {});
 
   return inFlight;
 }
