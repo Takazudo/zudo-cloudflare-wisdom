@@ -189,7 +189,7 @@ await env.DB.prepare(
 :::
 
 - **境界付きでページネーションされたスキャン。** `list()` は KV と同様、1回の呼び出しにつき最大1000キーが上限だ——大きなバケットをスキャンするには `cursor` を使って境界付きのバッチでページングする必要があり、バケット全体を一度に列挙しようとしてはならない。
-- **参照を意識した削除。** キーがコンテンツアドレス化されている場合（後述）、複数の D1 行が同じオブジェクトを指しうる。「これを作成した行が消えた」ではなく「このキーを参照する行が0件になった」——D1 に対する `COUNT(*)` チェック——を基準に削除すること。
+- **参照を意識した削除は、使い回されないキーに限定する。** すべてのキーが 1 オブジェクトにつき 1 度だけ発行される UUID なら（[不変な UUID キー](#r2-と-d1-のペアリング-不変な-uuid-キー) 参照）、「これを作成した行が消えた」ではなく「このキーを参照する行が0件になった」——D1 に対する `COUNT(*)` チェック——を基準に削除してよい。これが安全なのは、参照が0件になった UUID キーがあとから新しい参照を得ることは決してないからだ——その正確な UUID を指すものが新たに作られることは二度とない。**コンテンツアドレス化されたキーではこれは安全ではない。** 新しいアップロードがいつでも古いキーを参照しうるからだ——生きた `COUNT(*)` がなぜ並行アップロードとレースするのか、そして代わりに何を協調させるべきかは、後述の [コンテンツアドレス化されたキーを安全に回収する](#キーの安全性-コンテンツアドレス化されたキーを安全に回収する) を参照。
 
 ## トランザクションなしでの R2 + D1 の整合
 
@@ -234,6 +234,72 @@ return Response.json({ success: true, r2 }, { status: 200 });
 オブジェクトをコンテンツのハッシュ（`sha256:${hash}`）でキー付けすると、重複排除がただで手に入る：同じコンテンツは常に同じキーになるため、同じファイルを2回アップロードしてもオブジェクトは1つで済み、それを参照する D1 行が2つあるだけになる。
 
 注意点は暗号化だ。コンテンツが R2 に届く前に暗号化される場合は、暗号文ではなく **平文** をハッシュすること——ランダムな IV / nonce により、同じ平文でも暗号文は異なるものになるため、暗号文をハッシュすると重複排除は完全に無効になる。平文をハッシュすればそれは復元されるが、その一方でハッシュ自体が、どちらも復号できない者に対してさえ、2つのアップロードが同一のコンテンツを共有していることを明かしてしまう。暗号化下でコンテンツアドレッシングを選ぶ前に、そのリークがそのデータにとって許容できるかどうかを判断すること——許容できないなら、重複排除なしのストレージコストを受け入れる。
+
+### コンテンツアドレス化されたキーを安全に回収する
+
+コンテンツアドレス化されたキーは、いつ何時でも新しい D1 行から参照されうる——回収者の `COUNT(*)` チェックが参照0件を見つけた、その直後の瞬間も含めて。回収者がそのスナップショットを信頼してそのあとオブジェクトを削除すると、その間に参照を挿入した並行の create は何も指さないものを参照することになる。[孤立したブロブの回収](#r2-と-d1-のペアリング-孤立したブロブの回収) の参照を意識した削除が成り立つのは、決して使い回されないキーに限られる。使い回されるキーでは、参照数と削除の判断を、あとで別々に読んで行動するのではなく、D1 自身を通じて協調させる必要がある。
+
+コンテンツアドレス化された各キーの参照数とトゥームストーンのタイムスタンプを、専用の行として追跡する:
+
+```sql
+CREATE TABLE blob_refs (
+  r2_key         TEXT PRIMARY KEY,
+  ref_count      INTEGER NOT NULL DEFAULT 0,
+  tombstoned_at  INTEGER  -- set when ref_count drops to 0; cleared by the next reference
+);
+```
+
+コンテンツアドレス化されたキーを参照するすべての書き込みは、同じステートメントの中で参照数をインクリメントし、既存のトゥームストーンをクリアする。そうすればトゥームストーンが設定されたあとに届いた参照が、キーのトゥームストーンをアトミックに解除する:
+
+```typescript
+await env.DB.prepare(
+  `INSERT INTO blob_refs (r2_key, ref_count, tombstoned_at)
+   VALUES (?, 1, NULL)
+   ON CONFLICT (r2_key) DO UPDATE SET
+     ref_count = blob_refs.ref_count + 1,
+     tombstoned_at = NULL`,
+).bind(r2Key).run();
+```
+
+参照している D1 行の削除は参照数をデクリメントし、0 に達したときだけトゥームストーンを設定する:
+
+```typescript
+await env.DB.prepare(
+  `UPDATE blob_refs
+   SET ref_count = ref_count - 1,
+       tombstoned_at = CASE WHEN ref_count - 1 <= 0 THEN ? ELSE tombstoned_at END
+   WHERE r2_key = ?`,
+).bind(Date.now(), r2Key).run();
+```
+
+回収者は、猶予期間を過ぎたトゥームストーンを、R2 に触れる前にアトミックに claim する——このサイト全体で使われているのと同じ claim-before-mutate の形だ:
+
+```typescript
+const claim = await env.DB.prepare(
+  `UPDATE blob_refs
+   SET tombstoned_at = NULL
+   WHERE r2_key = ? AND ref_count <= 0 AND tombstoned_at < ?
+   RETURNING r2_key`,
+)
+  .bind(r2Key, Date.now() - GRACE_PERIOD_MS)
+  .first();
+
+if (claim) {
+  // Won the claim: no reference has arrived since the tombstone was set,
+  // and none can silently reappear without going through the INSERT
+  // above, which would need this same row to still show ref_count > 0.
+  await env.FILES.delete(r2Key);
+} else {
+  // Not eligible: still referenced, tombstone too fresh, or another
+  // reclaimer already claimed it -- leave the object alone.
+}
+```
+
+:::warning[create 側は、それでもブロブを書き込まなければならない。重複排除のヒットでアップロードを省略してはいけない]
+上記の claim は、参照のチェックと削除の判断のあいだのギャップを閉じるが、物理的な `env.FILES.delete()` と並行する creator の D1 挿入は、依然として 2 つの別々のシステムに対する 2 つの別々の操作だ——両者を互いにアトミックにするものは何もない。この残ったわずかな隙間が閉じるのは、重複排除のルックアップでキーがすでに D1 にあると分かったからといって、creator が `env.FILES.put()` を省略することが決してない場合だけだ。コンテンツアドレス化された `put()` は冪等だ——同じキーに同一のバイト列を 2 回書き込んでも、実質的には no-op になる——のだから、D1 の参照を書き込む前に常にそれを呼び出すこと（UUID キーで使ったのと同じ [ブロブを先に、行を最後に](#r2-と-d1-のペアリング-ブロブを先に、行を最後に) の順序だ）。そうすれば、たとえ少し前に回収者がそのオブジェクトを削除していたとしても、何らかの行がそれを参照する瞬間には、オブジェクトが存在することが保証される。
+:::
+
+これは create / delete のたびにテーブル 1 つと書き込み 1 回のコストがかかるが、その代わり回収ジョブが正当な参照を宙ぶらりんのポインタへと追い込むレースを二度と起こさなくなる。
 
 ## 注意点
 

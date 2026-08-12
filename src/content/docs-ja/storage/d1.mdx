@@ -190,10 +190,41 @@ ON CONFLICT(idempotency_key) DO UPDATE SET
   claimed_by  = excluded.claimed_by,
   claim_token = claims.claim_token + 1,
   lease_until = excluded.lease_until
-WHERE claims.lease_until < ?;
+WHERE claims.lease_until < ?
+RETURNING claim_token;
 ```
 
-`meta.changes === 1` は、自分が今その行を確保していることを意味する -- 未確保だったか、期限切れのリースを再確保したかのどちらかで、いずれにせよ `claim_token` は前へ進んでいる。`meta.changes === 0` は、誰かがまだ有効なリースを持っていることを意味する -- 引き下がる。
+確保に勝つこと -- 行が未確保だったか、期限切れのリースを再確保できたか -- は、このステートメントが渡すべきものの半分にすぎない。呼び出し元には、この確保が今持つことになった `claim_token` も必要だ。後続のフェンス付き書き込みすべてに、それを持ち回らなければならないからだ。`meta.changes === 1` を見れば自分が勝ったことは分かるが、トークンが何になったかは分からない。あとから発行する別の `SELECT claim_token FROM claims WHERE idempotency_key = ?` は安全ではない。自分の UPSERT とその `SELECT` の間に別の Worker の再確保が割り込みうるため、自分のトークンではなく相手のトークンを読んでしまいかねないからだ。`RETURNING claim_token` は、その値を生み出したのと同じステートメントからアトミックに返すことで、このギャップを閉じる。
+
+```typescript
+interface ClaimRow {
+  claim_token: number;
+}
+
+const now = Date.now();
+const claimed = await env.DB.prepare(
+  `INSERT INTO claims (idempotency_key, claimed_by, claim_token, lease_until)
+   VALUES (?, ?, 1, ?)
+   ON CONFLICT(idempotency_key) DO UPDATE SET
+     claimed_by  = excluded.claimed_by,
+     claim_token = claims.claim_token + 1,
+     lease_until = excluded.lease_until
+   WHERE claims.lease_until < ?
+   RETURNING claim_token`,
+)
+  .bind(key, workerId, now + LEASE_MS, now)
+  .first<ClaimRow>();
+
+if (!claimed) {
+  // Someone else still holds an active lease -- back off.
+} else {
+  // We now own the row. claimed.claim_token is the fencing value for THIS
+  // claim -- read it here, not from a follow-up SELECT.
+  const claimToken = claimed.claim_token;
+}
+```
+
+`claimed` が非 null なら、自分が今その行を確保していることを意味し、`claimed.claim_token` が以降のすべての書き込みをフェンシングするための値になる。`null` という結果は、誰かがまだ有効なリースを持っていることを意味する -- 引き下がる。
 
 ### ハートビートリース -- 中間の落としどころ
 

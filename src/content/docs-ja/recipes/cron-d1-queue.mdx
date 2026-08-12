@@ -15,9 +15,9 @@ graph TB
   Cron[Cron Trigger every minute] --> Tick[runDeliveryTick]
   Tick --> Query["SELECT due, unclaimed rows<br/>next_fire_at &lt;= now AND error_count &lt; MAX_RETRIES<br/>AND claimed_until expired<br/>LIMIT 100"]
   Query --> Loop[For each row]
-  Loop --> Claim{"Claim row<br/>UPDATE ... WHERE unclaimed"}
-  Claim -->|"changes = 0, lost race"| Skip[Skip to next row]
-  Claim -->|"changes = 1, claimed"| Deliver[Fan out to channels]
+  Loop --> Claim{"Claim row<br/>UPDATE ... WHERE unclaimed<br/>RETURNING claim_token"}
+  Claim -->|"no row, lost race"| Skip[Skip to next row]
+  Claim -->|"row returned, claimed"| Deliver[Fan out to channels]
   Deliver --> Success{Outcome?}
   Success -->|Full success| Advance[Advance next_fire_at / delete one-shot]
   Success -->|Partial success| AdvanceNoCount[Advance next_fire_at, do NOT increment error_count]
@@ -121,6 +121,7 @@ Worker の起動には有限の CPU 時間・サブリクエスト予算があ�
 
 ```sql
 ALTER TABLE notifications ADD COLUMN claimed_until INTEGER;
+ALTER TABLE notifications ADD COLUMN claim_token INTEGER NOT NULL DEFAULT 0;
 ```
 
 ```typescript
@@ -146,20 +147,23 @@ export async function runDeliveryTick(env: Env): Promise<void> {
   if (!results || results.length === 0) return;
 
   for (const row of results) {
-    // Claim the row before touching it. If an overlapping tick claimed it
-    // first, meta.changes is 0 and we skip -- we never re-deliver it here.
+    // Claim with a timestamp taken HERE, at claim time -- not the tick's
+    // start time. A tick that runs long must not hand out an expiry that is
+    // already in the past for rows near the end of the batch.
+    const claimedAt = Date.now();
     const claim = await env.NOTIFICATIONS_DB.prepare(
       `UPDATE notifications
-       SET claimed_until = ?
-       WHERE id = ? AND (claimed_until IS NULL OR claimed_until < ?)`,
+       SET claimed_until = ?, claim_token = claim_token + 1
+       WHERE id = ? AND (claimed_until IS NULL OR claimed_until < ?)
+       RETURNING claim_token`,
     )
-      .bind(now + CLAIM_LEASE_MS, row.id, now)
-      .run();
+      .bind(claimedAt + CLAIM_LEASE_MS, row.id, claimedAt)
+      .first<{ claim_token: number }>();
 
-    if (claim.meta.changes === 0) continue;
+    if (!claim) continue; // an overlapping tick already claimed it, or still holds the lease
 
     try {
-      await processRow(row, env);
+      await processRow(row, claim.claim_token, env);
     } catch (err) {
       console.error(`[scheduler] Unexpected error processing row ${row.id}:`, err);
     }
@@ -167,9 +171,9 @@ export async function runDeliveryTick(env: Env): Promise<void> {
 }
 ```
 
-SELECT と行ごとの UPDATE の両方が `claimed_until` でフィルタしている -- SELECT は、すでに確保済みの行を候補リストから外すことで、混み合ったティックがそれらを再チェックするだけのクエリ枠を無駄にしないようにする。だが実際に所有権を決めるのは UPDATE の方だ。SELECT だけではそれができない: 重複する 2 つのティックは、どちらかが確保する前に、同じ未確保の行を両方とも SELECT で見てしまいうるからだ。UPDATE の WHERE 句こそが本物の compare-and-swap であり、どちらのティックの UPDATE が先に着地するかで勝敗が決まる。負けた方の `meta.changes` は `0` で返ってくる。
+SELECT と行ごとの UPDATE の両方が `claimed_until` でフィルタしている -- SELECT は、すでに確保済みの行を候補リストから外すことで、混み合ったティックがそれらを再チェックするだけのクエリ枠を無駄にしないようにする。だが実際に所有権を決めるのは UPDATE の方だ。SELECT だけではそれができない: 重複する 2 つのティックは、どちらかが確保する前に、同じ未確保の行を両方とも SELECT で見てしまいうるからだ。UPDATE の WHERE 句こそが本物の compare-and-swap であり、どちらのティックの UPDATE が先に着地するかで勝敗が決まる。負けた方は `RETURNING` から行を受け取れない。
 
-`processRow` 自身の書き戻し（下の節にある、進める / バックオフ / デッドレターの各分岐）でも `claimed_until = NULL` を設定するべきだ。そうすれば、行はもう不要になったリースの残りを待つのではなく、自分の次の `next_fire_at` が来た時点ですぐに確保可能になる。
+確保は同じステートメントの中でアトミックにインクリメントされた `claim_token` も配り、それを後続の `SELECT` で読み直すのではなく、このステートメント自身から直接受け取る -- D1 ストレージのドキュメントの [期限付きリース](../storage/d1.mdx#アトミックな重複排除と行の確保-期限付きリース) と同じ理由からだ。ほんの少しあとに実行した `SELECT` は、この claim 自身のトークンではなく、より新しい再確保のトークンを見てしまいかねない。`processRow` はそのトークンをすべての書き戻し（下の節にある、進める / バックオフ / デッドレターの各分岐）に持ち回り、それぞれを `claim_token` でフェンシングする。そうすれば、止まっている `processRow()` 呼び出しの下から行が再確保されても、古い確保者がその結果を上書きすることはない。同じ書き戻しは、成功時に `claimed_until = NULL` も設定するべきだ。そうすれば、行はもう不要になったリースの残りを待つのではなく、自分の次の `next_fire_at` が来た時点ですぐに確保可能になる。
 
 :::warning[claimed_until は必ず期限付きのリースにする -- 無期限の未来の値にしてはいけない]
 `claimed_until` は「今からリース期間ぶん先」に設定すること。「自分が解除するまでロック」を意味するつもりの、遠い未来の値にしてはいけない。Worker インスタンスは `processRow()` の途中で -- CPU 時間の上限、キャッチされない例外、再デプロイなど -- 確保を解除する機会もなく退去させられうる。無期限のセンチネルはその行を永遠に立ち往生させる。期限付きのリースなら、リースが切れるまでの間だけ立ち往生させ、次のティックが自動的に再確保する。
@@ -177,11 +181,12 @@ SELECT と行ごとの UPDATE の両方が `claimed_until` でフィルタして
 
 `CLAIM_LEASE_MS = 45_000` を 60 秒周期の cron に対して設定し、行 R が期日を迎えているとする。
 
-1. **ティック #1 が T = 0 秒で発火する。** R を選び、確保し（`claimed_until = T + 45秒`）、`processRow(R)` を開始する -- Webhook チャネルの応答が遅いとしよう。
-2. **T = 50 秒 -- Worker インスタンスが退去させられる**（CPU 上限、キャッチされない例外、再デプロイなど）。配信の途中、`processRow` が `notifications` へ書き戻す前だ。R には `claimed_until = T + 45秒` が残るが、これはすでに過去であり、`next_fire_at` / `error_count` はティックが始まる前のままだ。
+1. **ティック #1 が T = 0 秒で発火する。** R を選び、その瞬間に取ったタイムスタンプで確保し（`claimed_until = T + 45秒`、`claim_token` が `0` から `1` へ進む）、`processRow(R, claimToken=1)` を開始する -- Webhook チャネルの応答が遅いとしよう。
+2. **T = 50 秒 -- Worker インスタンスが退去させられる**（CPU 上限、キャッチされない例外、再デプロイなど）。配信の途中、`processRow` が `notifications` へ書き戻す前だ。R には `claimed_until = T + 45秒`（すでに過去）、`claim_token = 1` が残り、`next_fire_at` / `error_count` はティックが始まる前のままだ。
 3. **ティック #2 が T = 60 秒で発火する。** その SELECT は R を再び含める: `next_fire_at <= now` はまだ成立し、`claimed_until（T+45秒）< now（T+60秒）` -- リースはすでに切れているので、R は再び候補になる。
-4. **ティック #2 が R を確保し**（`claimed_until = T + 60秒 + 45秒`）、最初から再処理する。
+4. **ティック #2 が R を確保し**（`claimed_until = T + 60秒 + 45秒`、`claim_token` が `2` へ進む）、`claimToken = 2` で最初から再処理する。
 5. **もしティック #1 の配信が、クラッシュの直前に実際には成功していたなら** -- Webhook 呼び出しは成功したが書き戻しが実行されなかった場合 -- ティック #2 の再処理は重複配信を送ってしまう。これは上で述べた部分成功の重複配信のルールと同じ危険性だ: リースは、動かなくなった行が見えなくなっている時間の長さを制限するだけであり、それ単体で配信を冪等にするわけではない。`CLAIM_LEASE_MS` は現実的な最悪ケースに対してタイトに保ち、このウィンドウを小さく保つこと。そして重複送信が許容できない場合は、リースだけに頼るのではなく、配信そのものを冪等にすること。
+6. **もしティック #1 の Worker インスタンスが、退去させられたのではなく単に止まっていただけだったら** -- まだ生きていて `claimToken = 1` を持ったまま、ただ遅いだけだとする -- そしてティック #2 がすでに R を再確保し、場合によっては完了させたあとになって書き戻しを試みたとしても、その書き戻しのステートメントは `claim_token = 1` でフェンシングされている。行の `claim_token` はもう `2` になっているので、ティック #1 のすべての書き込みは 0 行にマッチし、黙って拒否される -- ティック #1 の古い結果が、ティック #2（あるいはさらに後のティック）が書き込んだものを上書きすることは決してない。
 
 ## バックオフとデッドレター -- すべて D1 の中で
 
@@ -238,15 +243,23 @@ const isFullSuccess = failedChannels.length === 0;
 
 そして書き戻しはこれで分岐する。**完全成功と部分成功の両方**が同じ方法でスケジュールを進める点に注意 -- 唯一の違いは、部分成功が `last_error` 文字列を記録し、完全成功がそれをクリアすることだけだ。決定的に重要なのは、どちらも再試行の意味で `error_count` に触れないことで、繰り返しのパスではむしろ `0` にリセットする。
 
+どの分岐も、前節の確保から返ってきた `claimToken` を `WHERE` 句に持ち回り、`meta.changes` を確認する。`processRow()` が自分のリースより長生きすると、この呼び出しがまだ実行中の間に、後続のティックが同じ行を再確保して `claim_token` をさらに進めてしまいうる。フェンシングがなければ、この古い呼び出しの書き戻しは `id` だけを条件に無条件で着地し、新しい確保者の結果を上書きしたり、自分のものではない `claimed_until` をクリアしたりしかねない。ここで `meta.changes === 0` になるのはまさにその意味だ: 行は自分たちの知らないところで先へ進んでしまったので、この結果はもう古く、適用してはならない。
+
 ```typescript
 if (isFullSuccess || isPartialSuccess) {
   const nextFire = nextFireAt(new Date(now), recurrenceRule);
 
   if (nextFire === null) {
-    // One-shot: delete the row on success.
-    await env.NOTIFICATIONS_DB.prepare(
-      "DELETE FROM notifications WHERE id = ?",
-    ).bind(row.id).run();
+    // One-shot: delete the row on success -- fenced on claim_token so a
+    // row reclaimed by a later tick is never deleted out from under its
+    // new owner.
+    const del = await env.NOTIFICATIONS_DB.prepare(
+      "DELETE FROM notifications WHERE id = ? AND claim_token = ?",
+    ).bind(row.id, claimToken).run();
+
+    if (del.meta.changes === 0) {
+      console.error(`[scheduler] fenced out on delete for row ${row.id}, claim_token=${claimToken}`);
+    }
   } else {
     // Recurring: advance to next fire time. error_count resets to 0;
     // a partial failure is recorded in last_error but is NOT a retry.
@@ -254,17 +267,22 @@ if (isFullSuccess || isPartialSuccess) {
       ? `partial: ${failedChannels.join(", ")}`
       : null;
 
-    await env.NOTIFICATIONS_DB.prepare(
+    const advance = await env.NOTIFICATIONS_DB.prepare(
       `UPDATE notifications
        SET next_fire_at = ?,
            last_fired_at = ?,
            error_count = 0,
            last_error = ?,
+           claimed_until = NULL,
            updated_at = ?
-       WHERE id = ?`,
+       WHERE id = ? AND claim_token = ?`,
     )
-      .bind(nextFire.getTime(), now, lastError, now, row.id)
+      .bind(nextFire.getTime(), now, lastError, now, row.id, claimToken)
       .run();
+
+    if (advance.meta.changes === 0) {
+      console.error(`[scheduler] fenced out on advance for row ${row.id}, claim_token=${claimToken}`);
+    }
   }
 } else if (isFullFailure) {
   // Only here does error_count climb and backoff / dead-lettering apply.
@@ -274,16 +292,21 @@ if (isFullSuccess || isPartialSuccess) {
     // Park (one-shot: next_fire_at = NULL) or skip-forward (recurring).
   } else {
     const nextRetryAt = retryNextFireAt(now, row.error_count);
-    await env.NOTIFICATIONS_DB.prepare(
+    const retry = await env.NOTIFICATIONS_DB.prepare(
       `UPDATE notifications
        SET next_fire_at = ?,
            error_count = ?,
            last_error = ?,
+           claimed_until = NULL,
            updated_at = ?
-       WHERE id = ?`,
+       WHERE id = ? AND claim_token = ?`,
     )
-      .bind(nextRetryAt, newErrorCount, errorSummary, now, row.id)
+      .bind(nextRetryAt, newErrorCount, errorSummary, now, row.id, claimToken)
       .run();
+
+    if (retry.meta.changes === 0) {
+      console.error(`[scheduler] fenced out on backoff for row ${row.id}, claim_token=${claimToken}`);
+    }
   }
 }
 ```
