@@ -13,9 +13,11 @@ sidebar_position: 8
 ```mermaid
 graph TB
   Cron[Cron Trigger every minute] --> Tick[runDeliveryTick]
-  Tick --> Query["SELECT due rows<br/>next_fire_at &lt;= now AND error_count &lt; MAX_RETRIES<br/>LIMIT 100"]
+  Tick --> Query["SELECT due, unclaimed rows<br/>next_fire_at &lt;= now AND error_count &lt; MAX_RETRIES<br/>AND claimed_until expired<br/>LIMIT 100"]
   Query --> Loop[For each row]
-  Loop --> Deliver[Fan out to channels]
+  Loop --> Claim{"Claim row<br/>UPDATE ... WHERE unclaimed"}
+  Claim -->|"changes = 0, lost race"| Skip[Skip to next row]
+  Claim -->|"changes = 1, claimed"| Deliver[Fan out to channels]
   Deliver --> Success{Outcome?}
   Success -->|Full success| Advance[Advance next_fire_at / delete one-shot]
   Success -->|Partial success| AdvanceNoCount[Advance next_fire_at, do NOT increment error_count]
@@ -110,6 +112,76 @@ export async function runDeliveryTick(env: Env): Promise<void> {
 :::tip[1 ティックで処理しきれる LIMIT を選ぶ]
 Worker の起動には有限の CPU 時間・サブリクエスト予算がある。現実的に最も遅いバッチ（行数 × チャネル数 × チャネルごとのタイムアウト）が余裕をもってその中に収まるよう `LIMIT` を決める。常に上限に張り付くなら、チャネルごとのタイムアウトを短くするかバッチを小さくする -- cron の頻度を 1 分より細かくしてはいけない。1 分が cron の最小粒度だ。
 :::
+
+## 重複するティックに対して行を確保する
+
+上のクエリは、各ティックがキューを独り占めしている前提だ。だが cron は、前のティックが終わっていようといまいと、厳密に毎分発火する -- あるティックが長引けば（上流チャネルが遅い、D1 が一瞬詰まる、期日の行がバーストする）、次のティックの `scheduled()` 起動は、前のティックがまだ `processRow()` の中にいる間に始まりうる。両方の起動が同じ SELECT を実行し、両方が同じ期日の行を見る。それを止めるものが何もなければ、両方が同じ行を処理し -- 配信し -- 二重に送ってしまう。
+
+その対策は、D1 ストレージのドキュメントにある [フェンシングトークンによる確保の保護](../storage/d1.mdx#アトミックな重複排除と行の確保) と同じプリミティブだ: 1 つのティックが、何かをする前にアトミックに確保するセンチネルカラムを持たせ、同じ行を確保しようとした 2 つ目のティックが負けるようにする。
+
+```sql
+ALTER TABLE notifications ADD COLUMN claimed_until INTEGER;
+```
+
+```typescript
+// Bounded claim lease: long enough to cover this tick's worst case
+// (TICK_LIMIT rows x per-channel timeout with margin), short enough
+// that a crashed tick's rows are reclaimable well before it matters.
+const CLAIM_LEASE_MS = 45_000; // cron fires every 60s
+
+export async function runDeliveryTick(env: Env): Promise<void> {
+  const now = Date.now();
+
+  const { results } = await env.NOTIFICATIONS_DB.prepare(
+    `SELECT * FROM notifications
+     WHERE next_fire_at <= ?
+       AND error_count < ?
+       AND (claimed_until IS NULL OR claimed_until < ?)
+     ORDER BY next_fire_at ASC
+     LIMIT ?`,
+  )
+    .bind(now, MAX_RETRIES, now, TICK_LIMIT)
+    .all<NotificationRow>();
+
+  if (!results || results.length === 0) return;
+
+  for (const row of results) {
+    // Claim the row before touching it. If an overlapping tick claimed it
+    // first, meta.changes is 0 and we skip -- we never re-deliver it here.
+    const claim = await env.NOTIFICATIONS_DB.prepare(
+      `UPDATE notifications
+       SET claimed_until = ?
+       WHERE id = ? AND (claimed_until IS NULL OR claimed_until < ?)`,
+    )
+      .bind(now + CLAIM_LEASE_MS, row.id, now)
+      .run();
+
+    if (claim.meta.changes === 0) continue;
+
+    try {
+      await processRow(row, env);
+    } catch (err) {
+      console.error(`[scheduler] Unexpected error processing row ${row.id}:`, err);
+    }
+  }
+}
+```
+
+SELECT と行ごとの UPDATE の両方が `claimed_until` でフィルタしている -- SELECT は、すでに確保済みの行を候補リストから外すことで、混み合ったティックがそれらを再チェックするだけのクエリ枠を無駄にしないようにする。だが実際に所有権を決めるのは UPDATE の方だ。SELECT だけではそれができない: 重複する 2 つのティックは、どちらかが確保する前に、同じ未確保の行を両方とも SELECT で見てしまいうるからだ。UPDATE の WHERE 句こそが本物の compare-and-swap であり、どちらのティックの UPDATE が先に着地するかで勝敗が決まる。負けた方の `meta.changes` は `0` で返ってくる。
+
+`processRow` 自身の書き戻し（下の節にある、進める / バックオフ / デッドレターの各分岐）でも `claimed_until = NULL` を設定するべきだ。そうすれば、行はもう不要になったリースの残りを待つのではなく、自分の次の `next_fire_at` が来た時点ですぐに確保可能になる。
+
+:::warning[claimed_until は必ず期限付きのリースにする -- 無期限の未来の値にしてはいけない]
+`claimed_until` は「今からリース期間ぶん先」に設定すること。「自分が解除するまでロック」を意味するつもりの、遠い未来の値にしてはいけない。Worker インスタンスは `processRow()` の途中で -- CPU 時間の上限、キャッチされない例外、再デプロイなど -- 確保を解除する機会もなく退去させられうる。無期限のセンチネルはその行を永遠に立ち往生させる。期限付きのリースなら、リースが切れるまでの間だけ立ち往生させ、次のティックが自動的に再確保する。
+:::
+
+`CLAIM_LEASE_MS = 45_000` を 60 秒周期の cron に対して設定し、行 R が期日を迎えているとする。
+
+1. **ティック #1 が T = 0 秒で発火する。** R を選び、確保し（`claimed_until = T + 45秒`）、`processRow(R)` を開始する -- Webhook チャネルの応答が遅いとしよう。
+2. **T = 50 秒 -- Worker インスタンスが退去させられる**（CPU 上限、キャッチされない例外、再デプロイなど）。配信の途中、`processRow` が `notifications` へ書き戻す前だ。R には `claimed_until = T + 45秒` が残るが、これはすでに過去であり、`next_fire_at` / `error_count` はティックが始まる前のままだ。
+3. **ティック #2 が T = 60 秒で発火する。** その SELECT は R を再び含める: `next_fire_at <= now` はまだ成立し、`claimed_until（T+45秒）< now（T+60秒）` -- リースはすでに切れているので、R は再び候補になる。
+4. **ティック #2 が R を確保し**（`claimed_until = T + 60秒 + 45秒`）、最初から再処理する。
+5. **もしティック #1 の配信が、クラッシュの直前に実際には成功していたなら** -- Webhook 呼び出しは成功したが書き戻しが実行されなかった場合 -- ティック #2 の再処理は重複配信を送ってしまう。これは上で述べた部分成功の重複配信のルールと同じ危険性だ: リースは、動かなくなった行が見えなくなっている時間の長さを制限するだけであり、それ単体で配信を冪等にするわけではない。`CLAIM_LEASE_MS` は現実的な最悪ケースに対してタイトに保ち、このウィンドウを小さく保つこと。そして重複送信が許容できない場合は、リースだけに頼るのではなく、配信そのものを冪等にすること。
 
 ## バックオフとデッドレター -- すべて D1 の中で
 
@@ -270,4 +342,4 @@ await Promise.all(
 
 Queues は、バッファして自分のペースで処理したい高ボリュームのイベントストリームとして処理が届くときに輝く。各アイテムが*期日*を持つ時計駆動の処理には、D1 テーブル上の cron の鼓動のほうが仕掛けが少なく、完全に検査でき、再試行ポリシーをユニットテスト可能なコードに保てる。
 
-`ctx.waitUntil()` にも依存する即時レスポンス型の Webhook パターンについては [Bot Worker パターン](./bot-worker.mdx) を参照。D1 の基礎については [ストレージのドキュメント](../storage/d1.mdx) を参照。
+`ctx.waitUntil()` にも依存する即時レスポンス型の Webhook パターンについては [Bot Worker パターン](./bot-worker.mdx) を参照。D1 の基礎については -- [複数ライターの並行制御](../storage/d1.mdx#複数ライターの並行制御) や [アトミックな重複排除と行の確保](../storage/d1.mdx#アトミックな重複排除と行の確保) を含め -- [ストレージのドキュメント](../storage/d1.mdx) を参照。

@@ -13,9 +13,11 @@ This recipe is grounded in a notifications worker that delivers reminders over e
 ```mermaid
 graph TB
   Cron[Cron Trigger every minute] --> Tick[runDeliveryTick]
-  Tick --> Query["SELECT due rows<br/>next_fire_at &lt;= now AND error_count &lt; MAX_RETRIES<br/>LIMIT 100"]
+  Tick --> Query["SELECT due, unclaimed rows<br/>next_fire_at &lt;= now AND error_count &lt; MAX_RETRIES<br/>AND claimed_until expired<br/>LIMIT 100"]
   Query --> Loop[For each row]
-  Loop --> Deliver[Fan out to channels]
+  Loop --> Claim{"Claim row<br/>UPDATE ... WHERE unclaimed"}
+  Claim -->|"changes = 0, lost race"| Skip[Skip to next row]
+  Claim -->|"changes = 1, claimed"| Deliver[Fan out to channels]
   Deliver --> Success{Outcome?}
   Success -->|Full success| Advance[Advance next_fire_at / delete one-shot]
   Success -->|Partial success| AdvanceNoCount[Advance next_fire_at, do NOT increment error_count]
@@ -110,6 +112,76 @@ The query encodes two filters at once:
 :::tip[Pick a LIMIT you can finish in one tick]
 A Worker invocation has a finite CPU-time and subrequest budget. Size `LIMIT` so the slowest realistic batch (rows times channels times per-channel timeout) fits comfortably inside it. If you routinely hit the limit, shorten the per-channel timeout or shrink the batch -- do not raise the cron frequency past one minute, which is the finest cron granularity.
 :::
+
+## Claiming rows against overlapping ticks
+
+The query above assumes each tick has the queue to itself. Cron fires strictly every minute regardless of whether the previous tick has finished -- if a tick runs long (a slow upstream channel, a D1 hiccup, a burst of due rows), the next tick's `scheduled()` invocation can start while the previous one is still inside `processRow()`. Both invocations run the same SELECT, both see the same due rows, and without anything to stop it, both process -- and deliver -- the same row twice.
+
+The fix is the same primitive as [claim-token fencing](../storage/d1.mdx#atomic-dedupe-and-claims) in the D1 storage docs: a sentinel column that one tick claims atomically before it does any work, so a second tick claiming the same row loses.
+
+```sql
+ALTER TABLE notifications ADD COLUMN claimed_until INTEGER;
+```
+
+```typescript
+// Bounded claim lease: long enough to cover this tick's worst case
+// (TICK_LIMIT rows x per-channel timeout with margin), short enough
+// that a crashed tick's rows are reclaimable well before it matters.
+const CLAIM_LEASE_MS = 45_000; // cron fires every 60s
+
+export async function runDeliveryTick(env: Env): Promise<void> {
+  const now = Date.now();
+
+  const { results } = await env.NOTIFICATIONS_DB.prepare(
+    `SELECT * FROM notifications
+     WHERE next_fire_at <= ?
+       AND error_count < ?
+       AND (claimed_until IS NULL OR claimed_until < ?)
+     ORDER BY next_fire_at ASC
+     LIMIT ?`,
+  )
+    .bind(now, MAX_RETRIES, now, TICK_LIMIT)
+    .all<NotificationRow>();
+
+  if (!results || results.length === 0) return;
+
+  for (const row of results) {
+    // Claim the row before touching it. If an overlapping tick claimed it
+    // first, meta.changes is 0 and we skip -- we never re-deliver it here.
+    const claim = await env.NOTIFICATIONS_DB.prepare(
+      `UPDATE notifications
+       SET claimed_until = ?
+       WHERE id = ? AND (claimed_until IS NULL OR claimed_until < ?)`,
+    )
+      .bind(now + CLAIM_LEASE_MS, row.id, now)
+      .run();
+
+    if (claim.meta.changes === 0) continue;
+
+    try {
+      await processRow(row, env);
+    } catch (err) {
+      console.error(`[scheduler] Unexpected error processing row ${row.id}:`, err);
+    }
+  }
+}
+```
+
+Both the SELECT and the per-row UPDATE filter on `claimed_until` -- the SELECT keeps already-claimed rows out of the candidate list so a busy tick doesn't waste a query slot re-checking them, but the UPDATE is what actually decides ownership, because the SELECT alone can't: two overlapping ticks can both run the SELECT and both see the same unclaimed row before either one claims it. The UPDATE's WHERE clause is the real compare-and-swap; whichever tick's UPDATE lands first wins, and the loser's `meta.changes` comes back `0`.
+
+`processRow`'s own write-back (the advance / backoff / dead-letter branches from the section below) should also set `claimed_until = NULL`, so a row becomes claimable again on its own next `next_fire_at` instead of waiting out the rest of a lease it no longer needs.
+
+:::warning[claimed_until must be a bounded lease, never an indefinitely-future value]
+Set `claimed_until` to "now plus a lease duration," never to a value far in the future meant to mean "locked until I say otherwise." A Worker instance can be evicted mid-`processRow()` -- a CPU-time limit, an uncaught exception, a redeploy -- with no chance to clear the claim. An unbounded sentinel strands that row forever. A bounded lease strands it only until the lease expires, and the next tick reclaims it automatically.
+:::
+
+Say `CLAIM_LEASE_MS = 45_000` against a 60-second cron, and row R is due:
+
+1. **Tick #1 fires at T = 0s.** It selects R, claims it (`claimed_until = T + 45s`), and starts `processRow(R)` -- say the webhook channel is slow to respond.
+2. **T = 50s -- the Worker instance is evicted** (CPU limit, uncaught exception, redeploy) mid-delivery, before `processRow` writes back to `notifications`. R is left with `claimed_until = T + 45s`, already in the past, and its `next_fire_at` / `error_count` untouched from before the tick started.
+3. **Tick #2 fires at T = 60s.** Its SELECT includes R again: `next_fire_at <= now` still holds, and `claimed_until (T+45s) < now (T+60s)` -- the lease has expired, so R is a candidate again.
+4. **Tick #2 claims R** (`claimed_until = T + 60s + 45s`) and reprocesses it from scratch.
+5. **If Tick #1's delivery had actually gone through** just before the crash -- the webhook call succeeded but the write-back never ran -- Tick #2's reprocessing sends a duplicate. This is the same hazard as the partial-success duplicate-delivery rule documented above: a lease bounds how long a stuck row is invisible, it does not by itself make delivery idempotent. Keep `CLAIM_LEASE_MS` tight against the realistic worst case so this window stays small, and where a duplicate send is unacceptable, make the delivery itself idempotent rather than relying on the lease alone.
 
 ## Backoff and dead-lettering -- all in D1
 
@@ -270,4 +342,4 @@ A channel helper returns `null` on success or an error string on failure -- neve
 
 Queues shine when work arrives as a high-volume event stream you want to buffer and process at your own pace. For clock-driven work where every item has a *due time*, a cron heartbeat over a D1 table is less machinery, fully inspectable, and keeps the retry policy in code you can unit-test.
 
-For the immediate-response webhook pattern that also leans on `ctx.waitUntil()`, see [Bot Worker Pattern](./bot-worker.mdx). For D1 fundamentals, see the [storage docs](../storage/d1.mdx).
+For the immediate-response webhook pattern that also leans on `ctx.waitUntil()`, see [Bot Worker Pattern](./bot-worker.mdx). For D1 fundamentals -- including [multi-writer concurrency](../storage/d1.mdx#multi-writer-concurrency) and [atomic dedupe and claims](../storage/d1.mdx#atomic-dedupe-and-claims) -- see the [storage docs](../storage/d1.mdx).
