@@ -63,8 +63,171 @@ const batch = [
 await env.DB.batch(batch);
 ```
 
+## 複数ライターの並行制御
+
+D1 は個々のステートメントを SQLite に対する本物の SQL として実行するが、`env.DB.prepare(...).run()` そのものは、2 つの Worker 起動が同じ行を読み、それぞれ独立に書き戻すのを止めてくれるわけではない。同じ行に複数のライターがほぼ同時に触れうるなら、アプリケーション層でのガードが必要になる -- Workers の API は行ロックを渡してくれない。
+
+### version カラムによる楽観的並行制御
+
+`version` カラムを追加し、行と一緒に読み取り、書き込みは「読み取った時点の version のままであること」を条件にする。
+
+```typescript
+interface Env {
+  DB: D1Database;
+}
+
+interface SeatRow {
+  id: number;
+  available: number;
+  version: number;
+}
+
+// Read
+const row = await env.DB.prepare(
+  "SELECT id, available, version FROM event_seats WHERE id = ?",
+).bind(eventId).first<SeatRow>();
+
+if (!row) throw new Error("event not found");
+
+// Guarded write -- only applies if version hasn't moved since the read
+const result = await env.DB.prepare(
+  `UPDATE event_seats
+   SET available = available - 1, version = version + 1
+   WHERE id = ? AND version = ? AND available > 0`,
+).bind(eventId, row.version).run();
+
+if (result.meta.changes === 0) {
+  // Lost the race -- another writer moved the row first. Re-read and
+  // retry, or surface a conflict to the caller.
+}
+```
+
+`meta.changes` は、そのステートメントが実際に変更した行数だ。ガード付きの UPDATE は、自分の行にマッチする（読み取り以降誰も書いていない）か、何もマッチしない（誰かが書いた）かのどちらかになる。
+
+### ABA 問題 -- 値の比較ではなく version カウンタが必要な理由
+
+追加のカラムを省いて、すでに持っている値でガードしたくなる: `WHERE available = ?`。これは、その値が過去と同じ値に戻ってくるまでは機能する。別のライターが `available` を減らし、その後のキャンセルによって元々読み取った数へちょうど戻った場合、`WHERE available = ?` というガードは、その間に行が -- そしておそらく他の不変条件も -- 変化していたにもかかわらずマッチしてしまう。これが典型的な ABA 問題だ: 見ていない間に値は A -> B -> A と動いたのに、変わっていないように見える。
+
+一方向にしか増えない `version` カラムはこれを回避する。version は前にしか進めないので、「読み取った時点の version のままである」ことは、正真正銘「自分が読んでから誰もこの行に書いていない」ことを意味する -- 例外はない。
+
+### ゼロ行 UPDATE の罠
+
+WHERE 句が 0 行にしかマッチしない UPDATE は SQL エラーにはならない。D1 は `{ success: true, meta: { changes: 0 } }` を返す -- これは更新が適用されたときと同じ `success: true` だ。`result.success` だけを見るコード、あるいは呼び出しが例外を投げなかったことだけを見るコードには、レースに負けたことと本当に更新できたことの区別がつかない。
+
+:::danger[ガード付きの書き込みでは必ず meta.changes を確認する -- success だけでは不十分]
+`result.success` は SQL が正しく実行されたことを意味するだけで、自分の行が変わったかどうかは何も語らない。条件付きの UPDATE や、後述する `INSERT ... ON CONFLICT DO NOTHING` にとって、信頼できる唯一のシグナルは `result.meta.changes` だ。
+:::
+
+`env.DB.prepare(...)` を直接使わず ORM（Drizzle、Kysely など）経由で書き込んでいる場合は、このガードに使う前に、その ORM の更新結果が実際に変更行数を露出しているか確認すること。クエリビルダーの中にはマッピング済みの結果行しか返さないものがあり、ゼロ行マッチのときの空配列は「マッチする行がそもそも存在しなかった」ケースと見分けがつきにくい -- これはまさに検出したいケースを隠してしまう。迷ったら、ガード付きの書き込みだけは生の `env.DB.prepare(...).run()` に落とし、`meta.changes` を自分で読むこと。
+
+### 具体例: 1 つの行を奪い合う 2 つのライター
+
+残り座席 1 の予約行があるとする: `available = 1, version = 5`。Writer A と Writer B が、ネットワークのジッターがもたらすほぼ同じ瞬間に、同じイベントへの予約リクエストをそれぞれ処理する。
+
+1. **両者が読む。** A と B はそれぞれ上の SELECT を実行し、どちらも `{ available: 1, version: 5 }` を見る。まだどちらも書き込んでいない -- これがレースのウィンドウだ。
+2. **Writer A が先に書く。** A は `version = 5` を束縛したガード付き UPDATE を実行する。行の version はまだ 5 なので WHERE 句がマッチする: `available` は `0` に、`version` は `6` になる。A は `{ success: true, meta: { changes: 1 } }` を受け取り、呼び出し元に予約確定を返す。
+3. **Writer B が後に書く。** B は同一の UPDATE を、こちらも `version = 5` を束縛して実行する。だが行の version はすでに `6` だ -- A がすでに動かしている。WHERE 句は 0 行にマッチする。B は `{ success: true, meta: { changes: 0 } }` を受け取る。
+4. **Writer B がガードを確認する。** `meta.changes === 0` なので、B は自分がレースに負けたと分かる。行を読み直し（`available: 0, version: 6`）、もう売る席がないと分かり、誤った確定応答の代わりに呼び出し元へ「満席」を返す。
+
+もし Writer B が `result.success` だけを見ていたら、ステップ 3 で `true` を見て、もう存在しない座席の確定を返していただろう -- 並行負荷の下でしか現れないオーバーブッキングのバグであり、まさにこのガードが捕まえるために存在する失敗そのものだ。
+
+## アトミックな重複排除と行の確保
+
+### なぜ KV ではこれができないのか
+
+Workers KV は結果整合であり -- `put()` はすべての拠点へ伝播するのに最大 60 秒かかることがある -- しかも compare-and-swap を持たない。`put()` は無条件にそこにあったものを上書きする。2 つの Worker が同じキーへのミスを読み、両方が `put()` を呼びうる。どちらの呼び出しも失敗せず、「まだ存在しない場合にだけ書き込む」をサーバー側で問う手段がない。KV はキャッシュには向いているが、アトミックな「最初の書き手が勝つ」確保は与えてくれない。
+
+D1 にはそれができる。SQLite が本物の制約とトランザクションを与えてくれるからだ: `PRIMARY KEY` や `UNIQUE` カラムがあれば、行がすでに存在するとき `INSERT` はアトミックに失敗するか何もしないかのどちらかになり、「自分が最初だったか」に対する信頼できる答えが得られる。
+
+### INSERT ... ON CONFLICT DO NOTHING によるアトミックな重複排除
+
+```sql
+CREATE TABLE claims (
+  idempotency_key TEXT PRIMARY KEY,
+  claimed_by      TEXT NOT NULL,
+  claim_token     INTEGER NOT NULL DEFAULT 1,
+  lease_until     INTEGER NOT NULL
+);
+```
+
+```typescript
+const claim = await env.DB.prepare(
+  `INSERT INTO claims (idempotency_key, claimed_by, lease_until)
+   VALUES (?, ?, ?)
+   ON CONFLICT(idempotency_key) DO NOTHING`,
+).bind(key, workerId, Date.now() + LEASE_MS).run();
+
+if (claim.meta.changes === 0) {
+  // A row for this key already existed -- this is a duplicate. Skip the
+  // side-effecting work (or return the cached result of the first attempt).
+} else {
+  // We created the row -- we own this key. Proceed.
+}
+```
+
+### ON CONFLICT + SELECT changes() の「同一バッチ」ルール
+
+上の `claim.meta.changes` は、これを読み取る最もシンプルで常に正しい方法だ -- INSERT 自身のレスポンスにそのまま返ってくるので、これを使えばよい。落とし穴が現れるのは、代わりに後続のステートメントで SQLite の `changes()` という SQL 関数に頼ったときだ。たとえば行数による分岐を JS ではなく SQL 側でつなげたい場合などがそれにあたる。`changes()` が返すのは*同じコネクション上の直前のステートメント*の行数であり、D1 がその「同じコネクション」という関係を保証するのは、`env.DB.batch([...])` で一緒に送られたステートメント同士に限られる。無関係な以前の呼び出しの後で、独立した `.prepare().run()` として発行した `SELECT changes()` が、その呼び出しの結果を見られる保証はない。
+
+:::tip[changes() に依存するステートメントは同じバッチにまとめる。さもなければ使わない]
+SQL の中で `changes()` が必要なら、書き込みと `SELECT changes()` を同じ `env.DB.batch([...])` の配列にまとめること。そうでなければ `changes()` に頼る必要はまったくない -- どの `D1Response` にも、そのステートメント自身の `meta.changes` がすでに入っている。
+:::
+
+### フェンシングトークンによる確保の保護
+
+一度きりの重複排除チェックなら重複を弾くだけで十分だが、より長い作業に対して排他的な所有権を与える「確保」にはもう一段の対策が要る: GC の一時停止、ネットワーク分断、遅れて発火したリトライなどで止まっていた確保者が、別の誰かがすでに同じキーを再確保した後に書き戻してしまうのを止めなければならない。
+
+その解決策がフェンシングトークンだ: 一方向にしか増えない番号を、確保のたびに配る。確保者はそれをすべての後続の書き込みに持ち回り、それぞれを `WHERE idempotency_key = ? AND claim_token = ?` でガードする。誰かがその行を再確保した時点で、古い確保者のトークンはもうマッチしなくなるので、その書き込みは新しい確保者の作業を上書きする代わりに no-op になる（`meta.changes === 0`）-- これは上の並行制御の節で見たゼロ行 UPDATE のシグナルを、そのままフェンシングのチェックに転用したものだ。
+
+### 期限付きリース
+
+無条件に、期限なしで確保できてしまうのは生存性のハザードだ。確保した Worker が作業の途中でクラッシュすると、そのキーは永遠に確保されたままになり、誰も再試行できなくなる。確保は、リースが切れたら再確保できるようにしておかなければならない。
+
+```sql
+INSERT INTO claims (idempotency_key, claimed_by, claim_token, lease_until)
+VALUES (?, ?, 1, ?)
+ON CONFLICT(idempotency_key) DO UPDATE SET
+  claimed_by  = excluded.claimed_by,
+  claim_token = claims.claim_token + 1,
+  lease_until = excluded.lease_until
+WHERE claims.lease_until < ?;
+```
+
+`meta.changes === 1` は、自分が今その行を確保していることを意味する -- 未確保だったか、期限切れのリースを再確保したかのどちらかで、いずれにせよ `claim_token` は前へ進んでいる。`meta.changes === 0` は、誰かがまだ有効なリースを持っていることを意味する -- 引き下がる。
+
+### ハートビートリース -- 中間の落としどころ
+
+固定のリース期間はどちらに転んでもトレードオフになる: 短すぎれば、本当に時間のかかる作業の途中でもまだ健全なワーカーを再確保してしまう危険がある。長すぎれば、クラッシュからの回復にそれだけの時間がかかる。ハートビートはその中間を取る -- 確保者は生きている間、自分のリースを定期的に延長し続け（`UPDATE claims SET lease_until = ? WHERE idempotency_key = ? AND claim_token = ?`）、リースのウィンドウはハートビートの*間隔*だけをカバーすればよくなり、ジョブ全体をカバーする必要がなくなる。クラッシュした確保者はハートビートを止め、すぐに再確保される。生きているが遅いだけの確保者は更新を続け、ジョブが正当にどれだけ長くかかろうと再確保されることはない。
+
+このリースのパターンを実際のポーリングキューへ適用した例は、[Cron 起動の D1 ワークキュー](../recipes/cron-d1-queue.mdx#重複するティックに対して行を確保する) を参照。
+
+## Time Travel によるバックアップ
+
+D1 の [Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/) は自動のポイントインタイムリカバリで、スナップショットのスケジュールを設定する必要はない。すべての書き込みが保持されるので、保持期間内であればどの分にでもデータベースを復元できる: Workers Paid プランでは 30 日、Workers Free プランでは 7 日だ。
+
+D1 は内部で復元ポイントを「ブックマーク」として追跡する -- タイムスタンプから決定的に導出され、古い順から新しい順にソート可能だ。あるブックマークへ復元しても、それより前のブックマークは失われないので、誤った復元自体も、その直前のブックマークへもう一度復元すれば取り消せる。
+
+```bash
+# Get the current bookmark
+npx wrangler d1 time-travel info my-database
+
+# Get the bookmark for a specific past moment
+npx wrangler d1 time-travel info my-database --timestamp="2026-08-01T00:00:00Z"
+
+# Restore to a specific point in time
+npx wrangler d1 time-travel restore my-database --timestamp=1735689600
+
+# Restore to a specific bookmark
+npx wrangler d1 time-travel restore my-database --bookmark=00000041-00000000-00004c4f-f4027f22834a840cd11289ad74a30edb
+```
+
+:::warning[復元は上書きであり、分岐ではない]
+`time-travel restore` は、データベースの現在のデータをその場で丸ごと上書きする -- 本番と並べて確認できるコピーオンライトのブランチではない。復元する前に、コマンドが出力するブックマークを控えておけば、誤った時点への復元自体も取り消せる。
+:::
+
 ## 注意点
 
 - **SQLite 構文**: D1 は PostgreSQL や MySQL ではなく SQLite を使用。一部の SQL 機能が異なる。
 - **サイズ制限**: 無料プランでは各データベースに 10 GB の制限がある。
+- **行サイズの上限**: 1 行（すべてのカラムを合わせたもの）は 2,000,000 バイト（2 MB）が上限だ -- これは文字数ではなくバイト数の上限。マルチバイトの UTF-8 テキスト（日本語、絵文字など）は、同じ文字数の ASCII 文字列よりずっと少ない文字数で上限に達する。行サイズは `.length` ではなく、エンコード後のバイト数で見積もること。
 - **マイグレーション**: 本番環境（`--remote`）に適用する前に、必ずローカル（`--local`）でテストする。
