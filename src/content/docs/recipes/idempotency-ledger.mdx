@@ -8,7 +8,7 @@ sidebar_position: 11
 
 A client that does not know whether its last request succeeded -- the connection dropped, a proxy timed out, the Worker was recycled mid-response -- has exactly one safe move: retry. For a `GET`, retrying is free. For a `POST` that charges a card, sends an email, or creates an order, retrying blind risks doing it twice. The `Idempotency-Key` header pattern (the same shape used by Stripe and most payment APIs) solves this by having the client name the operation once and the server remember what happened the first time it saw that name.
 
-This recipe builds the server side of that contract on D1: a ledger table that claims a key atomically, executes the mutation exactly once per key, and replays the stored result for every retry -- including retries that arrive after the original attempt is presumed dead.
+This recipe builds the server side of that contract on D1: a ledger table that claims a key atomically, executes the mutation once per key under normal conditions, and replays the same stored result for every retry that arrives while the key is still retained -- including retries that arrive after the original attempt is presumed dead. The exact boundary of that guarantee -- what happens when a takeover follows a mutation that actually finished -- is covered under [Fencing a Pending-Reservation Takeover](#fencing-a-pending-reservation-takeover).
 
 ## The Idempotency-Key Header Contract
 
@@ -16,7 +16,9 @@ This recipe builds the server side of that contract on D1: a ledger table that c
 - Every retry of that same logical operation reuses the **same** key. A genuinely new operation (a second, different order) must use a **new** key. The server has no way to tell these apart except by the key itself.
 - Idempotency protection applies to unsafe methods only (`POST`, `PATCH`, `DELETE` -- whichever your endpoint uses to mutate). `GET` does not need it.
 - If a required endpoint receives no `Idempotency-Key` header, reject it with `400 Bad Request`. Executing a mutation without idempotency protection when the caller expected it is worse than refusing to run it -- the caller may retry the same request believing it is protected when it is not.
-- Bound the key format server-side (for example, 1-255 printable ASCII characters) so a malformed or oversized key cannot be used to bloat the ledger table.
+- Bound the key format server-side (this recipe enforces 1-255 printable ASCII characters, see the handler below) so a malformed or oversized key cannot be used to bloat the ledger table.
+- Keys are scoped to the authenticated caller, not global. The server always combines the client-supplied key with a server-derived principal (the session's account ID, the API key's owner) before storing or looking it up, so the same key value sent by two different accounts is two different rows -- never a replay of one account's response to another, and never one account's in-flight reservation blocking a different account's identical key.
+- The server retains a completed key's stored response for a bounded window, not indefinitely -- this recipe's sweep keeps rows for 24 hours (see [Bounded Opportunistic Sweep](#bounded-opportunistic-sweep)). A retry that arrives after that window has swept the row is indistinguishable from a new operation and the mutation runs again. Document your actual retention window in your API reference, and pick one comfortably longer than the slowest realistic client retry.
 
 :::warning[This is a contract, not a detection heuristic]
 The server cannot infer "this is a retry" from request content alone -- two identical bodies can be two legitimately identical operations. The `Idempotency-Key` is the client's explicit signal, and this whole pattern only works because both sides honor it: same operation, same key; different operation, different key.
@@ -24,11 +26,12 @@ The server cannot infer "this is a retry" from request content alone -- two iden
 
 ## Schema
 
-One table carries the whole ledger. `generation` is the fencing token explained below; `status` gates whether a stored response is safe to replay.
+One table carries the whole ledger. `principal` scopes every row to the authenticated caller so two different accounts can never collide on, block, or replay each other's keys; `generation` is the fencing token explained below; `status` gates whether a stored response is safe to replay.
 
 ```sql
 CREATE TABLE idempotency_keys (
-  key               TEXT PRIMARY KEY,
+  principal         TEXT NOT NULL,                   -- server-derived account/user id, never client-supplied
+  key               TEXT NOT NULL,
   fingerprint       TEXT NOT NULL,
   status            TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'completed'
   generation        INTEGER NOT NULL DEFAULT 1,      -- fencing token, bumped on takeover
@@ -36,7 +39,8 @@ CREATE TABLE idempotency_keys (
   response_body     TEXT,                            -- bounded, see Response Lifecycle
   response_headers  TEXT,                             -- JSON-encoded allowlisted headers
   created_at        INTEGER NOT NULL,
-  updated_at        INTEGER NOT NULL
+  updated_at        INTEGER NOT NULL,
+  PRIMARY KEY (principal, key)
 );
 
 CREATE INDEX idx_idempotency_keys_updated_at ON idempotency_keys (updated_at);
@@ -46,7 +50,7 @@ CREATE INDEX idx_idempotency_keys_updated_at ON idempotency_keys (updated_at);
 
 ## Claim Before Mutate
 
-The claim has to happen with a single atomic statement, not a `SELECT` to check for an existing key followed by an `INSERT` if none is found. Two concurrent requests carrying the same key can both run that `SELECT` before either `INSERT` lands -- both see "no row", both decide they are the owner, and both proceed to execute the mutation. The check and the insert have to be the same operation for the race to close.
+The claim has to happen with a single atomic statement, not a `SELECT` to check for an existing key followed by an `INSERT` if none is found. Two concurrent requests carrying the same principal and key can both run that `SELECT` before either `INSERT` lands -- both see "no row", both decide they are the owner, and both proceed to execute the mutation. The check and the insert have to be the same operation for the race to close.
 
 D1's SQLite dialect supports `INSERT ... ON CONFLICT DO NOTHING RETURNING`, which is exactly that: an atomic test-and-set. Exactly one concurrent caller gets a row back from `RETURNING`; every other caller -- no matter how many arrive at once -- gets nothing back and must fall through to the lookup path instead of mutating.
 
@@ -63,21 +67,24 @@ interface ClaimResult {
 const now = Date.now();
 
 const claim = await env.DB.prepare(
-  `INSERT INTO idempotency_keys (key, fingerprint, status, generation, created_at, updated_at)
-   VALUES (?, ?, 'pending', 1, ?, ?)
-   ON CONFLICT (key) DO NOTHING
+  `INSERT INTO idempotency_keys (principal, key, fingerprint, status, generation, created_at, updated_at)
+   VALUES (?, ?, ?, 'pending', 1, ?, ?)
+   ON CONFLICT (principal, key) DO NOTHING
    RETURNING key, generation`,
 )
-  .bind(idempotencyKey, fingerprint, now, now)
+  .bind(principal, idempotencyKey, fingerprint, now, now)
   .first<ClaimResult>();
 
 if (claim) {
   // Won the claim: this request owns the reservation and must execute the
   // mutation, then transition the row to 'completed' (see Response Lifecycle).
 } else {
-  // Key already exists. Fall through to the fingerprint/status branch below.
+  // Key already exists for this principal. Fall through to the
+  // fingerprint/status branch below.
 }
 ```
+
+`principal` is a stable, server-derived account or user identifier -- resolved by your own authentication middleware before any of this code runs, never taken from a client-controlled header or query parameter. It is what makes the ledger safe to share across accounts: two different principals can submit the identical key, method, path, and body, and land two independent claims instead of one replaying the other's response.
 
 :::danger[Claim before you mutate, never after]
 Inserting the ledger row **after** running the mutation reopens the exact race this pattern exists to close: two concurrent retries both find no row, both run the mutation, and only then does one of them win the insert. By the time that happens the damage -- the double charge, the duplicate order -- is already done. The claim has to be the first write, before any side effect.
@@ -85,32 +92,52 @@ Inserting the ledger row **after** running the mutation reopens the exact race t
 
 ## Fingerprinting the Request
 
-`claim` being empty means the key was seen before. Before doing anything else, the server must decide whether this is a **genuine retry** of the same request, or the **same key reused** on a materially different request. Replaying a stored result for the wrong request, or re-executing a mutation that already ran, are both worse failures than a false-positive rejection -- so the fingerprint comparison is deliberately strict.
+`claim` being empty means this principal already claimed this exact key before. Before doing anything else, the server must decide whether this is a **genuine retry** of the same request, or the **same key reused** on a materially different request. Replaying a stored result for the wrong request, or re-executing a mutation that already ran, are both worse failures than a false-positive rejection -- so the fingerprint comparison is deliberately strict.
 
-The fingerprint is a SHA-256 hex digest computed over three normalized inputs:
+The fingerprint is a SHA-256 hex digest computed over four normalized inputs:
 
 - **Method**, uppercased. `post` and `POST` are the same request.
 - **Path + query string, verbatim** -- exactly as received, no key sorting, no reordering, no dropping. Canonicalizing the query string (say, sorting parameters) trades a rare false-positive (a harmless client-side param reorder gets flagged as key reuse) for a subtle false-negative risk in any API where query order or repeated keys carry meaning (`id=1&id=2` is not the same request as `id=2&id=1` if the endpoint treats them as an ordered list). A false positive costs the client a `409` and a fresh key; a false negative can execute or replay the wrong operation. Verbatim comparison is the conservative choice.
-- **Raw body bytes**, read once and hashed exactly as received -- never `JSON.parse` then re-`JSON.stringify` before hashing. The same re-serialization trap covered in [Signing Webhooks with HMAC-SHA256](./webhook-signing.mdx) applies here: key order, whitespace, and number formatting all survive a round-trip through a parser and change the byte sequence, which would make two identical requests hash differently.
+- **A fixed allowlist of headers that can change what the mutation does** -- `Content-Type`, an API-version header, any conditional header your endpoint honors, anything else your handler branches on. A header that isn't on the allowlist never affects the fingerprint, so a harmless difference (a trace ID, a user-agent string) doesn't falsely flag two identical operations as key reuse. A header that IS on the allowlist and differs between two requests sharing the same method, path, and body means the requests are not the same operation -- without this, reusing a key across a `Content-Type` change would replay a JSON response for what the client now sends as multipart.
+- **Raw body bytes**, read once as binary and hashed exactly as received -- never `request.text()`, and never `JSON.parse` then re-`JSON.stringify` before hashing. Two separate failure modes, one fix: `request.text()` decodes the body as UTF-8, and every invalid byte sequence -- binary payloads, multipart bodies, malformed encoding -- collapses to the same U+FFFD replacement character, so distinct requests can hash identically and collide on the same fingerprint. And the re-serialization trap covered in [Signing Webhooks with HMAC-SHA256](./webhook-signing.mdx) applies here too: key order, whitespace, and number formatting all survive a round-trip through a parser and change the byte sequence, which would make two identical requests hash differently. Reading `request.arrayBuffer()` once and hashing those raw bytes directly avoids both problems.
 
 ```typescript
+// Headers that can change what the mutation does. Anything not on this list
+// cannot affect the fingerprint -- keep it to headers your handler actually
+// branches on.
+const FINGERPRINT_HEADERS = ["content-type", "x-api-version"] as const;
+
 async function computeFingerprint(
   method: string,
   pathAndQuery: string,
-  rawBody: string,
+  headers: Headers,
+  bodyBytes: ArrayBuffer,
 ): Promise<string> {
-  const canonical = `${method.toUpperCase()}\n${pathAndQuery}\n${rawBody}`;
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
+  const headerPart = FINGERPRINT_HEADERS.map(
+    (name) => `${name}:${headers.get(name) ?? ""}`,
+  ).join("\n");
+  const prefix = new TextEncoder().encode(`${method.toUpperCase()}\n${pathAndQuery}\n${headerPart}\n`);
+  const combined = new Uint8Array(prefix.byteLength + bodyBytes.byteLength);
+  combined.set(prefix, 0);
+  combined.set(new Uint8Array(bodyBytes), prefix.byteLength);
+  const digest = await crypto.subtle.digest("SHA-256", combined);
   return Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
 
 // pathAndQuery must come from the same URL the request was routed on, taken
-// verbatim -- do not rebuild it from parsed route params.
+// verbatim -- do not rebuild it from parsed route params. bodyBytes is read
+// ONCE, here, as raw bytes, and threaded into runMutation() below instead of
+// being re-read from `request` -- the body stream is already consumed by now.
 const url = new URL(request.url);
-const rawBody = await request.text();
-const fingerprint = await computeFingerprint(request.method, url.pathname + url.search, rawBody);
+const bodyBytes = await request.arrayBuffer();
+const fingerprint = await computeFingerprint(
+  request.method,
+  url.pathname + url.search,
+  request.headers,
+  bodyBytes,
+);
 ```
 
 A small helper turns a status code and a JSON body (with optional extra headers) into a `Response`, reused by every rejection path below:
@@ -143,9 +170,9 @@ interface LedgerRow {
 if (!claim) {
   const existing = await env.DB.prepare(
     `SELECT fingerprint, status, generation, response_status, response_body, response_headers
-     FROM idempotency_keys WHERE key = ?`,
+     FROM idempotency_keys WHERE principal = ? AND key = ?`,
   )
-    .bind(idempotencyKey)
+    .bind(principal, idempotencyKey)
     .first<LedgerRow>();
 
   if (!existing) {
@@ -176,12 +203,18 @@ Time alone cannot distinguish these. A pending row older than some TTL is only e
 
 The fix is a fencing token: a `generation` column that a takeover always increments, and a completion write that is only accepted if it targets the **current** generation.
 
-**The fencing invariant:** every reservation carries a `generation`. Claiming a fresh key starts it at `1`. Taking over a stale pending row atomically increments it and hands the new value to the new owner. A completion write is only accepted -- `UPDATE ... WHERE key = ? AND generation = ? AND status = 'pending'` -- if the generation it targets still matches the row's current generation. Because a takeover always advances the generation, at most one owner's generation is ever current at a time, so at most one completion write can ever succeed, no matter how many owners are concurrently executing the mutation.
+**The fencing invariant:** every reservation carries a `generation`. Claiming a fresh key starts it at `1`. Taking over a stale pending row atomically increments it and hands the new value to the new owner. A completion write is only accepted -- `UPDATE ... WHERE principal = ? AND key = ? AND generation = ? AND status = 'pending'` -- if the generation it targets still matches the row's current generation. Because a takeover always advances the generation, at most one owner's generation is ever current at a time, so at most one completion write can ever succeed, no matter how many owners are concurrently executing the mutation.
 
 Walk it through: Worker A claims the key at generation 1 and stalls on a slow downstream call. The client times out and retries with the same key. Worker B sees a stale pending row and takes it over, atomically bumping the row to generation 2. Both A and B may now go on to run the mutation -- the fencing token does not stop that part, which is exactly why the TTL should be set well above the slowest realistic completion time, so a takeover is a rare true-death recovery path and not a routine race. But when they each try to write the completion:
 
 - Worker B's write targets `generation = 2`, matching the row -- it succeeds, and its response becomes the ledger's canonical, replayable result.
 - Worker A's write targets `generation = 1`, which the row no longer has -- it matches zero rows and is silently rejected. The ledger never ends up holding a stale response that a takeover has already superseded.
+
+:::warning[This closes the response race, not the mutation-execution race]
+The generation fence guarantees that at most one owner's response is ever recorded and replayed -- it does not guarantee `runMutation()` itself only ever runs once. If Worker A's side effect actually completes -- the card is charged, the email is sent -- but A dies before writing the `completed` row, a takeover by Worker B re-executes the mutation from scratch, because a pending row past its TTL is indistinguishable from "still legitimately running." The ledger has no way to tell "finished but didn't get to report it" apart from "still in flight."
+
+If a duplicate execution is unacceptable for your mutation, one of two things has to be true: either the downstream mutation is itself idempotent under the same key (a payment API that accepts its own idempotency key, a queue send deduplicated on the same value), or you state the guarantee this pattern actually provides honestly -- **at-least-once execution, exactly-once recorded and replayed response** -- rather than advertising exactly-once execution.
+:::
 
 ```typescript
 const PENDING_TTL_MS = 30_000; // set well above the slowest realistic mutation
@@ -193,10 +226,10 @@ interface TakeoverResult {
 const takeover = await env.DB.prepare(
   `UPDATE idempotency_keys
    SET generation = generation + 1, updated_at = ?
-   WHERE key = ? AND status = 'pending' AND updated_at < ?
+   WHERE principal = ? AND key = ? AND status = 'pending' AND updated_at < ?
    RETURNING generation`,
 )
-  .bind(now, idempotencyKey, now - PENDING_TTL_MS)
+  .bind(now, principal, idempotencyKey, now - PENDING_TTL_MS)
   .first<TakeoverResult>();
 
 if (takeover) {
@@ -260,6 +293,16 @@ if (new TextEncoder().encode(result.body).byteLength > RESPONSE_BODY_MAX_BYTES) 
 }
 ```
 
+A handful of status codes are defined to never carry a body: `204 No Content`, `205 Reset Content`, and `304 Not Modified` if your endpoint supports conditional semantics on a mutating verb. The Fetch `Response` constructor enforces this at the platform level -- passing a non-null body string alongside one of these statuses throws `TypeError: Response with null body status cannot have body`. It's fine to store whatever `result.body` actually was in D1 (an empty string is a perfectly good column value), but every place that constructs a `Response` from a stored or fresh result has to route the body through this check first:
+
+```typescript
+const NULL_BODY_STATUSES = new Set([204, 205, 304]);
+
+function bodyForStatus(status: number, body: string | null): string | null {
+  return NULL_BODY_STATUSES.has(status) ? null : body;
+}
+```
+
 The transition to `completed` is the fenced `UPDATE` from the previous section, shown here in full with the response fields wired in:
 
 ```typescript
@@ -272,10 +315,10 @@ const completed = await env.DB.prepare(
        response_body = ?,
        response_headers = ?,
        updated_at = ?
-   WHERE key = ? AND generation = ? AND status = 'pending'
+   WHERE principal = ? AND key = ? AND generation = ? AND status = 'pending'
    RETURNING key`,
 )
-  .bind(responseStatus, responseBody, headersJson, Date.now(), idempotencyKey, generation)
+  .bind(responseStatus, responseBody, headersJson, Date.now(), principal, idempotencyKey, generation)
   .first();
 
 if (!completed) {
@@ -286,18 +329,19 @@ if (!completed) {
   // real completion latency, and unless the mutation itself is safely
   // repeatable, it may have just run twice.
   console.error(
-    `[idempotency] fenced out for key=${idempotencyKey}, generation=${generation} superseded`,
+    `[idempotency] fenced out for principal=${principal}, key=${idempotencyKey}, generation=${generation} superseded`,
   );
 }
 ```
 
-Replaying a `completed` row is the mirror image -- no mutation, just reconstructing the response from the stored columns:
+Replaying a `completed` row is the mirror image -- no mutation, just reconstructing the response from the stored columns, with the same null-body check applied:
 
 ```typescript
 function replayResponse(row: LedgerRow): Response {
   const headers = JSON.parse(row.response_headers ?? "{}") as Record<string, string>;
-  return new Response(row.response_body, {
-    status: row.response_status ?? 500,
+  const status = row.response_status ?? 500;
+  return new Response(bodyForStatus(status, row.response_body), {
+    status,
     headers,
   });
 }
@@ -330,6 +374,8 @@ async function sweepExpired(db: D1Database, now: number): Promise<void> {
 
 `updated_at < now - RETENTION_MS` catches both old `completed` rows past their retention window and `pending` rows that were never taken over -- a reservation nobody ever revisited is exactly as dead as one whose TTL expired. A small, bounded batch on every request keeps each sweep cheap and self-pacing: a backlog clears itself over many requests instead of one query trying to clear it all at once and blowing the CPU-time budget, the same shape as the bounded `LIMIT` batch in [Cron + D1 Queue](./cron-d1-queue.mdx).
 
+`RETENTION_MS` is the retention window promised in [the client contract](#the-idempotency-key-header-contract) above -- if you change it, update that promise too. The two must never drift apart: a shorter sweep than the advertised window silently breaks the guarantee for a client that retries near the edge of it, and a longer sweep than advertised just holds rows you told clients not to rely on.
+
 :::tip[Piggyback the sweep, don't schedule it separately]
 `ctx.waitUntil(sweepExpired(env.DB, now))` after the response is already being sent costs nothing on the request's critical path and needs no separate cron trigger. It only runs as often as the endpoint receives traffic, which is exactly when the ledger needs tending.
 :::
@@ -357,34 +403,48 @@ graph TB
   RespondAnyway --> Sweep
 ```
 
-Every piece above composes into one handler: claim, branch on the lookup, take over a stale reservation if needed, execute the mutation exactly once per generation, write the fenced completion, and sweep opportunistically before returning.
+Every piece above composes into one handler: validate the key, claim, branch on the lookup, take over a stale reservation if needed, execute the mutation exactly once per generation, write the fenced completion, and sweep opportunistically before returning. `principal` is resolved by your own authentication middleware and passed in -- never taken from anything the client controls.
 
 ```typescript
+const IDEMPOTENCY_KEY_PATTERN = /^[\x20-\x7e]{1,255}$/; // printable ASCII, 1-255 chars
+
 export async function handleIdempotentMutation(
   request: Request,
   env: Env,
   ctx: ExecutionContext,
-  runMutation: () => Promise<{ status: number; body: string; headers: Headers }>,
+  principal: string,
+  runMutation: (bodyBytes: ArrayBuffer) => Promise<{ status: number; body: string; headers: Headers }>,
 ): Promise<Response> {
   const idempotencyKey = request.headers.get("Idempotency-Key");
   if (!idempotencyKey) {
     return jsonResponse(400, { error: "idempotency_key_required" });
   }
+  if (!IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
+    return jsonResponse(400, {
+      error: "idempotency_key_invalid",
+      message: "Idempotency-Key must be 1-255 printable ASCII characters.",
+    });
+  }
 
   const now = Date.now();
   const url = new URL(request.url);
-  const rawBody = await request.text();
-  const fingerprint = await computeFingerprint(request.method, url.pathname + url.search, rawBody);
+  const bodyBytes = await request.arrayBuffer();
+  const fingerprint = await computeFingerprint(
+    request.method,
+    url.pathname + url.search,
+    request.headers,
+    bodyBytes,
+  );
 
   let generation: number;
 
   const claim = await env.DB.prepare(
-    `INSERT INTO idempotency_keys (key, fingerprint, status, generation, created_at, updated_at)
-     VALUES (?, ?, 'pending', 1, ?, ?)
-     ON CONFLICT (key) DO NOTHING
+    `INSERT INTO idempotency_keys (principal, key, fingerprint, status, generation, created_at, updated_at)
+     VALUES (?, ?, ?, 'pending', 1, ?, ?)
+     ON CONFLICT (principal, key) DO NOTHING
      RETURNING key, generation`,
   )
-    .bind(idempotencyKey, fingerprint, now, now)
+    .bind(principal, idempotencyKey, fingerprint, now, now)
     .first<ClaimResult>();
 
   if (claim) {
@@ -392,9 +452,9 @@ export async function handleIdempotentMutation(
   } else {
     const existing = await env.DB.prepare(
       `SELECT fingerprint, status, generation, response_status, response_body, response_headers
-       FROM idempotency_keys WHERE key = ?`,
+       FROM idempotency_keys WHERE principal = ? AND key = ?`,
     )
-      .bind(idempotencyKey)
+      .bind(principal, idempotencyKey)
       .first<LedgerRow>();
 
     if (!existing) {
@@ -410,10 +470,10 @@ export async function handleIdempotentMutation(
     const takeover = await env.DB.prepare(
       `UPDATE idempotency_keys
        SET generation = generation + 1, updated_at = ?
-       WHERE key = ? AND status = 'pending' AND updated_at < ?
+       WHERE principal = ? AND key = ? AND status = 'pending' AND updated_at < ?
        RETURNING generation`,
     )
-      .bind(now, idempotencyKey, now - PENDING_TTL_MS)
+      .bind(now, principal, idempotencyKey, now - PENDING_TTL_MS)
       .first<TakeoverResult>();
 
     if (!takeover) {
@@ -426,7 +486,7 @@ export async function handleIdempotentMutation(
     generation = takeover.generation;
   }
 
-  const result = await runMutation();
+  const result = await runMutation(bodyBytes);
   let responseBody: string | null = result.body;
   let responseStatus = result.status;
 
@@ -440,21 +500,24 @@ export async function handleIdempotentMutation(
   const completed = await env.DB.prepare(
     `UPDATE idempotency_keys
      SET status = 'completed', response_status = ?, response_body = ?, response_headers = ?, updated_at = ?
-     WHERE key = ? AND generation = ? AND status = 'pending'
+     WHERE principal = ? AND key = ? AND generation = ? AND status = 'pending'
      RETURNING key`,
   )
-    .bind(responseStatus, responseBody, headersJson, Date.now(), idempotencyKey, generation)
+    .bind(responseStatus, responseBody, headersJson, Date.now(), principal, idempotencyKey, generation)
     .first();
 
   if (!completed) {
     console.error(
-      `[idempotency] fenced out for key=${idempotencyKey}, generation=${generation} superseded`,
+      `[idempotency] fenced out for principal=${principal}, key=${idempotencyKey}, generation=${generation} superseded`,
     );
   }
 
   ctx.waitUntil(sweepExpired(env.DB, now));
 
-  return new Response(responseBody, { status: responseStatus, headers: JSON.parse(headersJson) });
+  return new Response(bodyForStatus(responseStatus, responseBody), {
+    status: responseStatus,
+    headers: JSON.parse(headersJson),
+  });
 }
 ```
 

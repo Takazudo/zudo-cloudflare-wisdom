@@ -8,7 +8,7 @@ sidebar_position: 11
 
 直前のリクエストが成功したかどうかわからないクライアント -- 接続が切れた、プロキシがタイムアウトした、レスポンスの途中で Worker が再生成された -- が取れる安全な手段はただ一つ、再試行だ。`GET` なら再試行は無料だ。だがカードに課金する、メールを送る、注文を作成するといった `POST` を当てずっぽうに再試行すれば、二重実行のリスクを冒すことになる。`Idempotency-Key` ヘッダーパターン（Stripe をはじめ多くの決済 API が使うのと同じ形）は、クライアントが操作に一度だけ名前を付け、サーバーがその名前を最初に見たときに何が起きたかを覚えておくことでこれを解決する。
 
-このレシピは、この契約のサーバー側を D1 の上に構築する。キーをアトミックに claim する台帳テーブルを用意し、mutation をキーごとにちょうど 1 回だけ実行し、すべての再試行に対して保存済みの結果を再生する -- 元の試行が死んだとみなされたあとに届く再試行も含めて。
+このレシピは、この契約のサーバー側を D1 の上に構築する。キーをアトミックに claim する台帳テーブルを用意し、通常の条件下では mutation をキーごとに 1 回だけ実行し、キーがまだ保持されている間に届くすべての再試行に対して、同じ保存済みの結果を再生する -- 元の試行が死んだとみなされたあとに届く再試行も含めて。この保証の正確な境界 -- 実際には完了していた mutation のあとに引き継ぎが起きるとどうなるか -- については、[pending 予約の引き継ぎをフェンシングする](#pending-予約の引き継ぎをフェンシングする) で扱う。
 
 ## Idempotency-Key ヘッダーの契約
 
@@ -16,7 +16,9 @@ sidebar_position: 11
 - 同じ論理操作の再試行はすべて**同じ**キーを再利用する。本当に新しい操作（2 つ目の、別の注文）は**新しい**キーを使わなければならない。サーバー側にはキー以外にこれらを区別する手段がない。
 - Idempotency による保護は安全でないメソッドにのみ適用する（`POST`、`PATCH`、`DELETE` -- エンドポイントが mutation に使うものならどれでも）。`GET` には不要だ。
 - 必須のエンドポイントが `Idempotency-Key` ヘッダーを受け取らなかった場合は `400 Bad Request` で拒否する。呼び出し元が保護を期待しているのに idempotency の保護なしで mutation を実行してしまうのは、実行を拒否するよりも悪い -- 呼び出し元は保護されていると信じたまま同じリクエストを再試行しかねない。
-- キーの形式はサーバー側で制限する（たとえば印字可能な ASCII 文字 1〜255 文字）。不正な形式や過大なキーで台帳テーブルを肥大化させられないようにするためだ。
+- キーの形式はサーバー側で制限する（このレシピでは印字可能な ASCII 文字 1〜255 文字を強制する。後述のハンドラを参照）。不正な形式や過大なキーで台帳テーブルを肥大化させられないようにするためだ。
+- idempotency キーは認証された呼び出し元にスコープされ、グローバルではない。サーバーは常に、クライアントが指定したキーをサーバー側で導出した `principal`（セッションのアカウント ID、API キーの所有者）と組み合わせてから保存・検索する。そのため異なる 2 つのアカウントが同じキー値を送っても、それは別々の行になる -- 一方のアカウントのレスポンスがもう一方に再生されることも、あるアカウントの進行中の予約が別アカウントの同一キーをブロックすることも決してない。
+- サーバーは完了したキーの保存済みレスポンスを、無期限にではなく、一定の期間だけ保持する -- このレシピのスイープは行を 24 時間保持する（[上限付きの機会的スイープ](#上限付きの機会的スイープ) 参照）。その期間を過ぎてから届いた再試行は新しい操作と区別がつかず、mutation が再実行される。実際の保持期間を API リファレンスに明記し、現実的に最も遅いクライアントの再試行より十分長い値を選ぶこと。
 
 :::warning[これは契約であり、検知のヒューリスティックではない]
 サーバーはリクエストの内容だけから「これは再試行だ」と推測することはできない -- 2 つの同一なボディが、正当に同一な 2 つの操作であることもありうる。`Idempotency-Key` はクライアントからの明示的なシグナルであり、このパターン全体は両側がそれを守ることによってのみ機能する。同じ操作には同じキー、違う操作には違うキーを。
@@ -24,11 +26,12 @@ sidebar_position: 11
 
 ## スキーマ
 
-台帳全体を 1 つのテーブルが担う。`generation` は後述するフェンシングトークンであり、`status` は保存済みレスポンスを再生してよいかどうかを決める。
+台帳全体を 1 つのテーブルが担う。`principal` はすべての行を認証された呼び出し元にスコープし、異なる 2 つのアカウントが互いのキーに衝突したり、ブロックしたり、再生したりできないようにする。`generation` は後述するフェンシングトークンであり、`status` は保存済みレスポンスを再生してよいかどうかを決める。
 
 ```sql
 CREATE TABLE idempotency_keys (
-  key               TEXT PRIMARY KEY,
+  principal         TEXT NOT NULL,                   -- server-derived account/user id, never client-supplied
+  key               TEXT NOT NULL,
   fingerprint       TEXT NOT NULL,
   status            TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'completed'
   generation        INTEGER NOT NULL DEFAULT 1,      -- fencing token, bumped on takeover
@@ -36,7 +39,8 @@ CREATE TABLE idempotency_keys (
   response_body     TEXT,                            -- bounded, see Response Lifecycle
   response_headers  TEXT,                             -- JSON-encoded allowlisted headers
   created_at        INTEGER NOT NULL,
-  updated_at        INTEGER NOT NULL
+  updated_at        INTEGER NOT NULL,
+  PRIMARY KEY (principal, key)
 );
 
 CREATE INDEX idx_idempotency_keys_updated_at ON idempotency_keys (updated_at);
@@ -46,7 +50,7 @@ CREATE INDEX idx_idempotency_keys_updated_at ON idempotency_keys (updated_at);
 
 ## mutate の前に claim する
 
-claim は、既存キーの有無を確認する `SELECT` のあとに見つからなければ `INSERT` する、という形ではなく、単一のアトミックなステートメントで行わなければならない。同じキーを持つ 2 つの同時リクエストは、どちらの `INSERT` も着地する前に両方がその `SELECT` を実行しうる -- どちらも「行がない」と見て、どちらも自分がオーナーだと判断し、どちらも mutation の実行へ進んでしまう。レースを閉じるには、チェックと挿入が同一の操作でなければならない。
+claim は、既存キーの有無を確認する `SELECT` のあとに見つからなければ `INSERT` する、という形ではなく、単一のアトミックなステートメントで行わなければならない。同じ `principal` と同じキーを持つ 2 つの同時リクエストは、どちらの `INSERT` も着地する前に両方がその `SELECT` を実行しうる -- どちらも「行がない」と見て、どちらも自分がオーナーだと判断し、どちらも mutation の実行へ進んでしまう。レースを閉じるには、チェックと挿入が同一の操作でなければならない。
 
 D1 の SQLite 方言は `INSERT ... ON CONFLICT DO NOTHING RETURNING` をサポートしており、これがまさにアトミックな test-and-set だ。同時に呼び出したちょうど 1 者だけが `RETURNING` から行を受け取る。他のすべての呼び出し元は -- 何者が同時に到着しようと -- 何も受け取れず、mutate する代わりにルックアップのパスへフォールスルーしなければならない。
 
@@ -63,21 +67,24 @@ interface ClaimResult {
 const now = Date.now();
 
 const claim = await env.DB.prepare(
-  `INSERT INTO idempotency_keys (key, fingerprint, status, generation, created_at, updated_at)
-   VALUES (?, ?, 'pending', 1, ?, ?)
-   ON CONFLICT (key) DO NOTHING
+  `INSERT INTO idempotency_keys (principal, key, fingerprint, status, generation, created_at, updated_at)
+   VALUES (?, ?, ?, 'pending', 1, ?, ?)
+   ON CONFLICT (principal, key) DO NOTHING
    RETURNING key, generation`,
 )
-  .bind(idempotencyKey, fingerprint, now, now)
+  .bind(principal, idempotencyKey, fingerprint, now, now)
   .first<ClaimResult>();
 
 if (claim) {
   // Won the claim: this request owns the reservation and must execute the
   // mutation, then transition the row to 'completed' (see Response Lifecycle).
 } else {
-  // Key already exists. Fall through to the fingerprint/status branch below.
+  // Key already exists for this principal. Fall through to the
+  // fingerprint/status branch below.
 }
 ```
+
+`principal` は、サーバー側で導出される安定したアカウントまたはユーザーの識別子だ -- このコードが実行される前に、自前の認証ミドルウェアによって解決され、クライアントが制御できるヘッダーやクエリパラメータから取られることは決してない。これがあるからこそ台帳は複数アカウント間で安全に共有できる: 2 つの異なる `principal` が、メソッド・パス・ボディまで完全に同一のリクエストを送っても、一方が他方のレスポンスを再生するのではなく、それぞれ独立した claim になる。
 
 :::danger[mutate の前に claim する、あとには決してしない]
 mutation を実行した**あとに**台帳の行を挿入すると、このパターンが閉じるために存在するまさにそのレースを再び開いてしまう -- 2 つの同時再試行はどちらも行を見つけられず、どちらも mutation を実行し、そのあとになってようやくどちらかが挿入に勝つ。そのときにはもう、二重課金や注文の重複といった被害は起きてしまっている。claim は、あらゆる副作用より前の最初の書き込みでなければならない。
@@ -85,32 +92,52 @@ mutation を実行した**あとに**台帳の行を挿入すると、このパ�
 
 ## リクエストのフィンガープリント計算
 
-`claim` が空だったということは、そのキーは以前にも見たということだ。他の何よりも先に、サーバーはこれが同じリクエストの**正当な再試行**なのか、それとも実質的に異なるリクエストへの**同じキーの再利用**なのかを判断しなければならない。誤ったリクエストに対して保存済みの結果を再生してしまうことや、すでに実行済みの mutation を再実行してしまうことは、どちらも偽陽性の拒否より悪い失敗だ -- だからフィンガープリントの比較は意図的に厳格にしてある。
+`claim` が空だったということは、この `principal` はこのキーをすでに claim したことがあるということだ。他の何よりも先に、サーバーはこれが同じリクエストの**正当な再試行**なのか、それとも実質的に異なるリクエストへの**同じキーの再利用**なのかを判断しなければならない。誤ったリクエストに対して保存済みの結果を再生してしまうことや、すでに実行済みの mutation を再実行してしまうことは、どちらも偽陽性の拒否より悪い失敗だ -- だからフィンガープリントの比較は意図的に厳格にしてある。
 
-フィンガープリントは、正規化した 3 つの入力に対する SHA-256 の 16 進ダイジェストだ。
+フィンガープリントは、正規化した 4 つの入力に対する SHA-256 の 16 進ダイジェストだ。
 
 - **メソッド**、大文字化する。`post` と `POST` は同じリクエストだ。
 - **パス + クエリ文字列、そのまま** -- 受け取った通りに、キーのソートも並べ替えも削除もしない。クエリ文字列を正規化する（たとえばパラメータをソートする）と、まれな偽陽性（クライアント側での無害なパラメータの並べ替えがキー再利用として検出されてしまう）と引き換えに、クエリの順序や重複キーが意味を持つ API での微妙な偽陰性リスクを負うことになる（エンドポイントが順序付きリストとして扱うなら、`id=1&id=2` と `id=2&id=1` は同じリクエストではない）。偽陽性はクライアントに `409` と新しいキーの発行というコストを課すだけだが、偽陰性は誤った操作を実行または再生しかねない。そのまま比較するのが保守的な選択だ。
-- **生のボディのバイト列**、一度だけ読み取り、受け取った通りにハッシュする -- ハッシュ計算前に `JSON.parse` してから再び `JSON.stringify` することは決してしない。[HMAC-SHA256 によるウェブフック署名](./webhook-signing.mdx)で扱ったのと同じ再シリアライズの罠がここにも当てはまる。キーの順序、空白、数値の表現はすべてパーサーを経由する往復で変化しうり、バイト列を変えてしまう。すると本来同一の 2 つのリクエストが異なるハッシュ値になってしまう。
+- **mutation の内容を変えうるヘッダーの固定された許可リスト** -- `Content-Type`、API バージョンを示すヘッダー、エンドポイントが尊重する条件付きヘッダー、その他ハンドラが分岐に使うものすべて。許可リストにないヘッダーはフィンガープリントに一切影響しないので、無害な違い（トレース ID、ユーザーエージェント文字列）が同一の操作を誤ってキー再利用として検出することはない。許可リストに含まれるヘッダーが、同じメソッド・パス・ボディを持つ 2 つのリクエスト間で異なる場合、それらのリクエストは同じ操作ではない -- これがなければ、`Content-Type` が変わってもキーを使い回すと、クライアントが今はマルチパートで送っているものに対して JSON のレスポンスを再生してしまう。
+- **生のボディのバイト列**、一度だけバイナリとして読み取り、受け取った通りにハッシュする -- `request.text()` は決して使わず、ハッシュ計算前に `JSON.parse` してから再び `JSON.stringify` することも決してしない。これは 2 つの別々の失敗モードに対する 1 つの解決策だ: `request.text()` はボディを UTF-8 としてデコードし、不正なバイト列（バイナリのペイロード、マルチパートのボディ、壊れたエンコーディング）はすべて同じ U+FFFD 置換文字に潰れてしまうため、別々のリクエストが同一のハッシュになり衝突しうる。そして [HMAC-SHA256 によるウェブフック署名](./webhook-signing.mdx)で扱ったのと同じ再シリアライズの罠もここに当てはまる。キーの順序、空白、数値の表現はすべてパーサーを経由する往復で変化しうり、バイト列を変えてしまう。すると本来同一の 2 つのリクエストが異なるハッシュ値になってしまう。`request.arrayBuffer()` を一度だけ読み取り、その生バイト列を直接ハッシュすれば、この両方の問題を避けられる。
 
 ```typescript
+// Headers that can change what the mutation does. Anything not on this list
+// cannot affect the fingerprint -- keep it to headers your handler actually
+// branches on.
+const FINGERPRINT_HEADERS = ["content-type", "x-api-version"] as const;
+
 async function computeFingerprint(
   method: string,
   pathAndQuery: string,
-  rawBody: string,
+  headers: Headers,
+  bodyBytes: ArrayBuffer,
 ): Promise<string> {
-  const canonical = `${method.toUpperCase()}\n${pathAndQuery}\n${rawBody}`;
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
+  const headerPart = FINGERPRINT_HEADERS.map(
+    (name) => `${name}:${headers.get(name) ?? ""}`,
+  ).join("\n");
+  const prefix = new TextEncoder().encode(`${method.toUpperCase()}\n${pathAndQuery}\n${headerPart}\n`);
+  const combined = new Uint8Array(prefix.byteLength + bodyBytes.byteLength);
+  combined.set(prefix, 0);
+  combined.set(new Uint8Array(bodyBytes), prefix.byteLength);
+  const digest = await crypto.subtle.digest("SHA-256", combined);
   return Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
 
 // pathAndQuery must come from the same URL the request was routed on, taken
-// verbatim -- do not rebuild it from parsed route params.
+// verbatim -- do not rebuild it from parsed route params. bodyBytes is read
+// ONCE, here, as raw bytes, and threaded into runMutation() below instead of
+// being re-read from `request` -- the body stream is already consumed by now.
 const url = new URL(request.url);
-const rawBody = await request.text();
-const fingerprint = await computeFingerprint(request.method, url.pathname + url.search, rawBody);
+const bodyBytes = await request.arrayBuffer();
+const fingerprint = await computeFingerprint(
+  request.method,
+  url.pathname + url.search,
+  request.headers,
+  bodyBytes,
+);
 ```
 
 ステータスコードと JSON ボディ（任意の追加ヘッダー付き）を `Response` に変換する小さなヘルパーを用意し、以下のすべての拒否パスで再利用する。
@@ -143,9 +170,9 @@ interface LedgerRow {
 if (!claim) {
   const existing = await env.DB.prepare(
     `SELECT fingerprint, status, generation, response_status, response_body, response_headers
-     FROM idempotency_keys WHERE key = ?`,
+     FROM idempotency_keys WHERE principal = ? AND key = ?`,
   )
-    .bind(idempotencyKey)
+    .bind(principal, idempotencyKey)
     .first<LedgerRow>();
 
   if (!existing) {
@@ -176,12 +203,18 @@ if (!claim) {
 
 解決策はフェンシングトークンだ。引き継ぎが必ずインクリメントする `generation` カラムを用意し、completion の書き込みは**現在の** generation を対象にした場合にのみ受け入れる。
 
-**フェンシングの不変条件:** すべての予約は `generation` を持つ。新しいキーを claim すると `1` から始まる。古びた `pending` の行を引き継ぐと、それをアトミックにインクリメントし、新しい値を新しいオーナーへ渡す。completion の書き込み -- `UPDATE ... WHERE key = ? AND generation = ? AND status = 'pending'` -- は、その書き込みが対象とする generation が行の現在の generation とまだ一致している場合にのみ受け入れられる。引き継ぎは必ず generation を進めるので、ある時点で「現在の」generation を持つオーナーは高々 1 者しかいない。したがって、何者が同時に mutation を実行していようと、成功しうる completion の書き込みは高々 1 回だけだ。
+**フェンシングの不変条件:** すべての予約は `generation` を持つ。新しいキーを claim すると `1` から始まる。古びた `pending` の行を引き継ぐと、それをアトミックにインクリメントし、新しい値を新しいオーナーへ渡す。completion の書き込み -- `UPDATE ... WHERE principal = ? AND key = ? AND generation = ? AND status = 'pending'` -- は、その書き込みが対象とする generation が行の現在の generation とまだ一致している場合にのみ受け入れられる。引き継ぎは必ず generation を進めるので、ある時点で「現在の」generation を持つオーナーは高々 1 者しかいない。したがって、何者が同時に mutation を実行していようと、成功しうる completion の書き込みは高々 1 回だけだ。
 
 実際に追ってみよう。Worker A が generation 1 でキーを claim し、下流の遅い呼び出しで止まっているとする。クライアントはタイムアウトし、同じキーで再試行する。Worker B は古びた `pending` の行を見つけて引き継ぎ、行をアトミックに generation 2 へ進める。A と B の両方がこのあと mutation の実行へ進みうる -- フェンシングトークンはその部分を止めない。だからこそ TTL は現実的にありうる最も遅い完了時間より十分大きく設定すべきで、そうすれば引き継ぎは日常的なレースではなく、まれな「本当に死んだ」ときの復旧経路になる。しかしそれぞれが completion を書き込もうとすると:
 
 - Worker B の書き込みは `generation = 2` を対象にしており、行と一致する -- 成功し、その結果が台帳の正典として再生可能な結果になる。
 - Worker A の書き込みは `generation = 1` を対象にしているが、行はもうそれを持っていない -- 0 行にマッチし、黙って拒否される。台帳が、すでに引き継ぎによって上書きされたはずの古いレスポンスを保持してしまうことは決してない。
+
+:::warning[閉じるのはレスポンスのレースであって、mutation 実行のレースではない]
+generation フェンスが保証するのは、高々 1 者のオーナーのレスポンスだけが記録・再生されるということだ -- `runMutation()` 自体が高々 1 回しか実行されないことは保証しない。Worker A の副作用が実際には完了していた場合 -- カードへの課金が成功した、メールが送信された -- のに、A が `completed` の行を書き込む前に死んでしまうと、Worker B による引き継ぎは mutation を最初から再実行してしまう。TTL を過ぎた pending の行は「正当にまだ動いている」ものと区別がつかないからだ。台帳には「完了したが、それを報告できなかった」ケースを「まだ実行中」のケースと見分ける手段がない。
+
+mutation の重複実行が許容できないなら、次のどちらかが成り立っていなければならない: 下流の mutation 自体が同じキーのもとで冪等であること（決済 API 自身の idempotency キーを受け付ける、同じ値で重複排除されるキュー送信など）、あるいはこのパターンが実際に提供する保証を正直に述べること -- **少なくとも 1 回の実行、正確に 1 回だけ記録・再生されるレスポンス** -- 「厳密に 1 回だけの実行」を謳うのではなく。
+:::
 
 ```typescript
 const PENDING_TTL_MS = 30_000; // set well above the slowest realistic mutation
@@ -193,10 +226,10 @@ interface TakeoverResult {
 const takeover = await env.DB.prepare(
   `UPDATE idempotency_keys
    SET generation = generation + 1, updated_at = ?
-   WHERE key = ? AND status = 'pending' AND updated_at < ?
+   WHERE principal = ? AND key = ? AND status = 'pending' AND updated_at < ?
    RETURNING generation`,
 )
-  .bind(now, idempotencyKey, now - PENDING_TTL_MS)
+  .bind(now, principal, idempotencyKey, now - PENDING_TTL_MS)
   .first<TakeoverResult>();
 
 if (takeover) {
@@ -260,6 +293,16 @@ if (new TextEncoder().encode(result.body).byteLength > RESPONSE_BODY_MAX_BYTES) 
 }
 ```
 
+一部のステータスコードはボディを一切持たないと定義されている: `204 No Content`、`205 Reset Content`、そしてエンドポイントが mutation を行うメソッドに対して条件付きセマンティクスをサポートするなら `304 Not Modified` もそうだ。Fetch の `Response` コンストラクタはこれをプラットフォームレベルで強制する -- これらのステータスのいずれかとともに null でないボディ文字列を渡すと `TypeError: Response with null body status cannot have body` が投げられる。D1 に `result.body` の実際の値をそのまま保存するのは問題ない（空文字列も立派なカラム値だ）が、保存済みまたは新規の結果から `Response` を組み立てるすべての箇所は、まずこのチェックを通してボディを渡さなければならない。
+
+```typescript
+const NULL_BODY_STATUSES = new Set([204, 205, 304]);
+
+function bodyForStatus(status: number, body: string | null): string | null {
+  return NULL_BODY_STATUSES.has(status) ? null : body;
+}
+```
+
 `completed` への遷移は、前節のフェンス付き `UPDATE` そのものであり、ここではレスポンスのフィールドを組み込んだ完全な形で示す。
 
 ```typescript
@@ -272,10 +315,10 @@ const completed = await env.DB.prepare(
        response_body = ?,
        response_headers = ?,
        updated_at = ?
-   WHERE key = ? AND generation = ? AND status = 'pending'
+   WHERE principal = ? AND key = ? AND generation = ? AND status = 'pending'
    RETURNING key`,
 )
-  .bind(responseStatus, responseBody, headersJson, Date.now(), idempotencyKey, generation)
+  .bind(responseStatus, responseBody, headersJson, Date.now(), principal, idempotencyKey, generation)
   .first();
 
 if (!completed) {
@@ -286,18 +329,19 @@ if (!completed) {
   // real completion latency, and unless the mutation itself is safely
   // repeatable, it may have just run twice.
   console.error(
-    `[idempotency] fenced out for key=${idempotencyKey}, generation=${generation} superseded`,
+    `[idempotency] fenced out for principal=${principal}, key=${idempotencyKey}, generation=${generation} superseded`,
   );
 }
 ```
 
-`completed` の行を再生するのはその鏡像だ -- mutation はなく、保存済みのカラムからレスポンスを再構築するだけになる。
+`completed` の行を再生するのはその鏡像だ -- mutation はなく、保存済みのカラムからレスポンスを再構築するだけになる。同じ null ボディのチェックをここにも適用する。
 
 ```typescript
 function replayResponse(row: LedgerRow): Response {
   const headers = JSON.parse(row.response_headers ?? "{}") as Record<string, string>;
-  return new Response(row.response_body, {
-    status: row.response_status ?? 500,
+  const status = row.response_status ?? 500;
+  return new Response(bodyForStatus(status, row.response_body), {
+    status,
     headers,
   });
 }
@@ -330,6 +374,8 @@ async function sweepExpired(db: D1Database, now: number): Promise<void> {
 
 `updated_at < now - RETENTION_MS` は、保持期間を過ぎた古い `completed` の行と、一度も引き継がれなかった `pending` の行の両方を捕える -- 誰も見直さなかった予約は、TTL が失効したものとまったく同じくらい死んでいる。リクエストごとの小さく上限付きのバッチは、各スイープを安価で自己ペース型に保つ。バックログは、1 回のクエリで一気に片付けようとして CPU 時間の予算を吹き飛ばすのではなく、多数のリクエストにわたって自己解消していく。[Cron + D1 Queue](./cron-d1-queue.mdx) の上限付き `LIMIT` バッチと同じ形だ。
 
+`RETENTION_MS` は、上記の [Idempotency-Key ヘッダーの契約](#idempotency-key-ヘッダーの契約) で約束した保持期間そのものだ -- これを変更するなら、その約束も更新すること。両者が食い違ってはならない: 広告している期間よりスイープが短いと、その期間の終わり近くで再試行するクライアントに対して保証が黙って破られる。広告している期間よりスイープが長いと、クライアントに当てにしないよう伝えた行を単に保持し続けるだけになる。
+
 :::tip[スイープは相乗りさせる、別途スケジュールしない]
 レスポンスをすでに送信し始めたあとの `ctx.waitUntil(sweepExpired(env.DB, now))` は、リクエストのクリティカルパス上では何のコストもかからず、別途 cron trigger も必要としない。エンドポイントがトラフィックを受け取ったときにしか実行されないが、それはまさに台帳の手入れが必要なタイミングそのものだ。
 :::
@@ -357,34 +403,48 @@ graph TB
   RespondAnyway --> Sweep
 ```
 
-ここまでのすべての部品は 1 つのハンドラへと組み上がる。claim し、ルックアップで分岐し、必要なら古びた予約を引き継ぎ、generation ごとにちょうど 1 回だけ mutation を実行し、フェンス付きの completion を書き込み、返す前に機会的にスイープする。
+ここまでのすべての部品は 1 つのハンドラへと組み上がる。キーを検証し、claim し、ルックアップで分岐し、必要なら古びた予約を引き継ぎ、generation ごとにちょうど 1 回だけ mutation を実行し、フェンス付きの completion を書き込み、返す前に機会的にスイープする。`principal` は自前の認証ミドルウェアで解決して渡す -- クライアントが制御できるものから取ることは決してない。
 
 ```typescript
+const IDEMPOTENCY_KEY_PATTERN = /^[\x20-\x7e]{1,255}$/; // printable ASCII, 1-255 chars
+
 export async function handleIdempotentMutation(
   request: Request,
   env: Env,
   ctx: ExecutionContext,
-  runMutation: () => Promise<{ status: number; body: string; headers: Headers }>,
+  principal: string,
+  runMutation: (bodyBytes: ArrayBuffer) => Promise<{ status: number; body: string; headers: Headers }>,
 ): Promise<Response> {
   const idempotencyKey = request.headers.get("Idempotency-Key");
   if (!idempotencyKey) {
     return jsonResponse(400, { error: "idempotency_key_required" });
   }
+  if (!IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
+    return jsonResponse(400, {
+      error: "idempotency_key_invalid",
+      message: "Idempotency-Key must be 1-255 printable ASCII characters.",
+    });
+  }
 
   const now = Date.now();
   const url = new URL(request.url);
-  const rawBody = await request.text();
-  const fingerprint = await computeFingerprint(request.method, url.pathname + url.search, rawBody);
+  const bodyBytes = await request.arrayBuffer();
+  const fingerprint = await computeFingerprint(
+    request.method,
+    url.pathname + url.search,
+    request.headers,
+    bodyBytes,
+  );
 
   let generation: number;
 
   const claim = await env.DB.prepare(
-    `INSERT INTO idempotency_keys (key, fingerprint, status, generation, created_at, updated_at)
-     VALUES (?, ?, 'pending', 1, ?, ?)
-     ON CONFLICT (key) DO NOTHING
+    `INSERT INTO idempotency_keys (principal, key, fingerprint, status, generation, created_at, updated_at)
+     VALUES (?, ?, ?, 'pending', 1, ?, ?)
+     ON CONFLICT (principal, key) DO NOTHING
      RETURNING key, generation`,
   )
-    .bind(idempotencyKey, fingerprint, now, now)
+    .bind(principal, idempotencyKey, fingerprint, now, now)
     .first<ClaimResult>();
 
   if (claim) {
@@ -392,9 +452,9 @@ export async function handleIdempotentMutation(
   } else {
     const existing = await env.DB.prepare(
       `SELECT fingerprint, status, generation, response_status, response_body, response_headers
-       FROM idempotency_keys WHERE key = ?`,
+       FROM idempotency_keys WHERE principal = ? AND key = ?`,
     )
-      .bind(idempotencyKey)
+      .bind(principal, idempotencyKey)
       .first<LedgerRow>();
 
     if (!existing) {
@@ -410,10 +470,10 @@ export async function handleIdempotentMutation(
     const takeover = await env.DB.prepare(
       `UPDATE idempotency_keys
        SET generation = generation + 1, updated_at = ?
-       WHERE key = ? AND status = 'pending' AND updated_at < ?
+       WHERE principal = ? AND key = ? AND status = 'pending' AND updated_at < ?
        RETURNING generation`,
     )
-      .bind(now, idempotencyKey, now - PENDING_TTL_MS)
+      .bind(now, principal, idempotencyKey, now - PENDING_TTL_MS)
       .first<TakeoverResult>();
 
     if (!takeover) {
@@ -426,7 +486,7 @@ export async function handleIdempotentMutation(
     generation = takeover.generation;
   }
 
-  const result = await runMutation();
+  const result = await runMutation(bodyBytes);
   let responseBody: string | null = result.body;
   let responseStatus = result.status;
 
@@ -440,21 +500,24 @@ export async function handleIdempotentMutation(
   const completed = await env.DB.prepare(
     `UPDATE idempotency_keys
      SET status = 'completed', response_status = ?, response_body = ?, response_headers = ?, updated_at = ?
-     WHERE key = ? AND generation = ? AND status = 'pending'
+     WHERE principal = ? AND key = ? AND generation = ? AND status = 'pending'
      RETURNING key`,
   )
-    .bind(responseStatus, responseBody, headersJson, Date.now(), idempotencyKey, generation)
+    .bind(responseStatus, responseBody, headersJson, Date.now(), principal, idempotencyKey, generation)
     .first();
 
   if (!completed) {
     console.error(
-      `[idempotency] fenced out for key=${idempotencyKey}, generation=${generation} superseded`,
+      `[idempotency] fenced out for principal=${principal}, key=${idempotencyKey}, generation=${generation} superseded`,
     );
   }
 
   ctx.waitUntil(sweepExpired(env.DB, now));
 
-  return new Response(responseBody, { status: responseStatus, headers: JSON.parse(headersJson) });
+  return new Response(bodyForStatus(responseStatus, responseBody), {
+    status: responseStatus,
+    headers: JSON.parse(headersJson),
+  });
 }
 ```
 

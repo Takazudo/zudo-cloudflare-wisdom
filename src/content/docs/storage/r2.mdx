@@ -208,7 +208,7 @@ Never delete an object younger than the longest plausible gap between "blob fini
 :::
 
 - **Bounded, paginated scan.** `list()` caps out at 1000 keys per call, same as KV — scanning a large bucket means paging through with `cursor` in bounded batches, not enumerating the whole bucket in one pass.
-- **Reference-aware deletion.** If keys are content-addressed (see below), more than one D1 row can point at the same object. Delete on "zero rows still reference this key" — a `COUNT(*)` check against D1 — never on "the row that created this is gone."
+- **Reference-aware deletion, scoped to non-reusable keys.** If every key is a UUID minted once per object (see [Immutable UUID keys](#pairing-r2-with-d1-immutable-uuid-keys)), delete on "zero rows still reference this key" — a `COUNT(*)` check against D1 — never on "the row that created this is gone." That check is safe here because a UUID key with zero references can never gain a new one later: nothing will ever be created that points at that exact UUID again. **It is not safe for content-addressed keys**, where a brand-new upload can reference an old key at any moment — see [Reclaiming content-addressed keys safely](#key-safety-reclaiming-content-addressed-keys-safely) below for why a live `COUNT(*)` races against concurrent uploads, and what to coordinate instead.
 
 ## Coordinating R2 + D1 without transactions
 
@@ -253,6 +253,72 @@ Constrain any client-influenced portion of a key to a safe allowlist (`[a-zA-Z0-
 Keying objects by a hash of their content (`sha256:${hash}`) gives dedup for free: identical content always lands on the same key, so uploading the same file twice costs one object with two referencing D1 rows, not two objects.
 
 The caveat is encryption. If content is encrypted before it reaches R2, hash the **plaintext**, not the ciphertext — a random IV/nonce makes ciphertext differ even for identical plaintext, so hashing ciphertext defeats the dedup entirely. Hashing the plaintext restores it, but the hash itself then reveals when two uploads share identical content, even to someone who can't decrypt either one. Decide whether that leak is acceptable for the data before choosing content-addressing under encryption — if it isn't, accept the storage cost of no dedup instead.
+
+### Reclaiming content-addressed keys safely
+
+A content-addressed key can be referenced by a brand-new D1 row at any time — including the instant after a reclaimer's `COUNT(*)` check finds zero references. If the reclaimer trusts that snapshot and deletes the object afterward, a concurrent create that inserted its reference in between now points at nothing. The reference-aware deletion in [Reclaiming orphaned blobs](#pairing-r2-with-d1-reclaiming-orphaned-blobs) only holds for keys that are never reused; a reusable key needs the reference count and the delete decision coordinated through D1 itself, not read separately and acted on later.
+
+Track each content-addressed key's reference count and a tombstone timestamp in its own row:
+
+```sql
+CREATE TABLE blob_refs (
+  r2_key         TEXT PRIMARY KEY,
+  ref_count      INTEGER NOT NULL DEFAULT 0,
+  tombstoned_at  INTEGER  -- set when ref_count drops to 0; cleared by the next reference
+);
+```
+
+Every write that references a content-addressed key increments the count and clears any tombstone in the same statement, so a reference that arrives after a tombstone was set un-tombstones the key atomically:
+
+```typescript
+await env.DB.prepare(
+  `INSERT INTO blob_refs (r2_key, ref_count, tombstoned_at)
+   VALUES (?, 1, NULL)
+   ON CONFLICT (r2_key) DO UPDATE SET
+     ref_count = blob_refs.ref_count + 1,
+     tombstoned_at = NULL`,
+).bind(r2Key).run();
+```
+
+Every delete of a referencing D1 row decrements the count, and only sets the tombstone once it reaches zero:
+
+```typescript
+await env.DB.prepare(
+  `UPDATE blob_refs
+   SET ref_count = ref_count - 1,
+       tombstoned_at = CASE WHEN ref_count - 1 <= 0 THEN ? ELSE tombstoned_at END
+   WHERE r2_key = ?`,
+).bind(Date.now(), r2Key).run();
+```
+
+The reclaimer claims a tombstone — past the grace period — atomically before touching R2, the same claim-before-mutate shape used throughout this site:
+
+```typescript
+const claim = await env.DB.prepare(
+  `UPDATE blob_refs
+   SET tombstoned_at = NULL
+   WHERE r2_key = ? AND ref_count <= 0 AND tombstoned_at < ?
+   RETURNING r2_key`,
+)
+  .bind(r2Key, Date.now() - GRACE_PERIOD_MS)
+  .first();
+
+if (claim) {
+  // Won the claim: no reference has arrived since the tombstone was set,
+  // and none can silently reappear without going through the INSERT
+  // above, which would need this same row to still show ref_count > 0.
+  await env.FILES.delete(r2Key);
+} else {
+  // Not eligible: still referenced, tombstone too fresh, or another
+  // reclaimer already claimed it -- leave the object alone.
+}
+```
+
+:::warning[Creators must still write the blob, never skip the upload on a dedup hit]
+The claim above closes the gap between checking references and deciding to delete, but a physical `env.FILES.delete()` and a concurrent creator's D1 insert are still two separate operations against two separate systems — nothing makes them atomic with each other. The remaining sliver closes only if creators never skip `env.FILES.put()` just because a dedup lookup found the key already in D1. Content-addressed `put()` is idempotent — writing identical bytes to the same key twice is a no-op in effect — so always call it before writing the D1 reference (the same [blob first, row last](#pairing-r2-with-d1-blob-first-row-last) ordering used for UUID keys). That guarantees the object exists at the moment any row references it, even if a reclaimer deleted it moments earlier in the same narrow window.
+:::
+
+This costs one extra table and one extra write per create/delete, in exchange for a reclamation job that can never race a legitimate reference into a dangling pointer.
 
 ## Gotchas
 
