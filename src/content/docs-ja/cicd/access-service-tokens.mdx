@@ -1,0 +1,145 @@
+---
+title: CI 向けの Access サービストークン
+description: サービストークンで Playwright のスモークテストやヘルスチェックを Cloudflare Access で保護された URL に通す -- それを成立させる Service Auth ポリシーと、2 つの Cloudflare アカウントにまたがる認証情報の扱い方
+sidebar_position: 8
+---
+
+## 概要 -- ログインのリダイレクトは、ヘッドレスなクライアントにとって壁になる
+
+[社内サイト向けの Cloudflare Access](../recipes/cloudflare-access.mdx)は、プレビューデプロイの手前に置くものとして優秀だ -- CI がそれを開こうとする瞬間までは。「`@example.com` の人なら Google 経由で誰でも許可する」というポリシーは、ヘッドレスブラウザには満たしようがない: Playwright は identity プロバイダーへのリダイレクトをたどり、人間向けに作られたログインフォームに行き着き、ステップがタイムアウトするまでそこで止まる。
+
+答えは、IP レンジのためにポリシーを緩めることでも、IdP のログインをスクリプト化することでもない。Access には、この目的のために作られた非対話的な認証情報 -- **サービストークン** -- が用意されており、その仕組みのすべてはリクエストヘッダー 2 つに収まる。
+
+## トークンを作成する
+
+サービストークンは完全に Zero Trust ダッシュボードから作成する。API トークンも Terraform も関わらない。現在のパスは **Access controls > Service credentials > Service Tokens > Create Service Token** だ。Cloudflare はこのナビゲーションを再編しており -- 古いドキュメントは Access > Service Auth と書いている -- パンくずが目の前のものと一致しない場合は、ツリーを探し回るのではなくダッシュボードで **service token** を検索すること。
+
+作成すると 2 つの値が返る。
+
+- **Client ID** -- 秘密ではなく、ログに残しても安全だ。Cloudflare の例では `.access` で終わっているが、そのサフィックスを規則として述べているドキュメントはない。
+- **Client Secret** -- **作成時に一度だけ表示される。** Cloudflare 自身の言葉によれば、これを失った場合は新しいサービストークンを生成しなければならない。読み直す方法は存在しない。
+
+ページを離れる前に、シークレットを行き先（GitHub Actions のシークレット、ローカルの `.env`）へそのままコピーすること。
+
+デフォルトの有効期間は 1 年（`8760h`）だ。API は Go 形式の単位（`300ms`、`2h45m`）で `duration` を受け付けるほか、期限切れしないトークンのための特別な値 `forever` も受け付ける。ダッシュボードの **Refresh** ボタンはちょうど 1 年だけ延長する -- それ以外にするには Edit フォームか、明示的な `duration` を伴う `PUT` が必要だ。
+
+## トークンだけでは何も認可されない
+
+混乱を招く 403 はここから生まれるので、コードより先に書いておく価値がある: **サービストークンを作成しても、何も認可されない。** トークンは、ポリシーがそれを名指しするまで何の意味も持たない認証情報だ。
+
+CI が到達しなければならない Access アプリケーションにはすべて、**action が Service Auth** であり、include ルールがそのトークンを選択しているポリシーが必要になる。Cloudflare はその帰結をはっきり述べている: action を Service Auth に設定すること、「そうしないと Access は identity プロバイダーへのログインを求める」。それこそがトークンで避けようとしていたリダイレクトそのものなので、忘れたときの症状は、トークンがまったく機能していないように見える。
+
+:::warning[Service Auth はポリシーのアクションであってポリシーの種類ではない -- 人間向けのポリシーと共存する]
+アプリケーションには結果として 2 つのポリシーが載る: IdP を通じて人を入れる通常の allow ポリシーと、トークンを入れる Service Auth ポリシーだ。どちらも同じアプリケーション上に同時に存在する。2 つ目を追加しても 1 つ目が弱まることはなく、Service Token のセレクターが有効なのは Service Auth アクションの下だけだ -- `allow` ポリシーで名指しされたトークンは何もしない。
+:::
+
+## Playwright から使う
+
+この 2 つのヘッダーは、トップレベルのナビゲーションだけでなく、ブラウザコンテキスト内のすべてのリクエストに載る -- これこそが、`fetch` だけでなく本物のブラウザでもこの方法が機能する理由だ。サブリソース（JavaScript、CSS、フォント、ページが行う API 呼び出し）はそれぞれ独立に Access の対象となり、そのそれぞれがヘッダーを運ぶ。
+
+```typescript
+const context = await browser.newContext({
+  extraHTTPHeaders: {
+    "CF-Access-Client-Id": process.env.CF_ACCESS_CLIENT_ID!,
+    "CF-Access-Client-Secret": process.env.CF_ACCESS_CLIENT_SECRET!,
+  },
+});
+
+const page = await context.newPage();
+await page.goto("https://pr-42-my-app.example.workers.dev/");
+```
+
+ページ単位の `setExtraHTTPHeaders` でも動くが、欲しいのはコンテキストレベルの形だ -- そのコンテキストが開くすべてのページに適用されるので、リンクをたどって 2 つ目のタブに移るテストが黙って認証情報を失うことがない。
+
+ブラウザをまったく使わない素のヘルスチェックも、同じ 2 つのヘッダーで足りる。
+
+```bash
+code=$(curl -sS -o /dev/null -w '%{http_code}' \
+  -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
+  -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}" \
+  "https://pr-42-my-app.example.workers.dev/")
+[ "$code" = "200" ] || { echo "Access check failed: HTTP $code" >&2; exit 1; }
+```
+
+ステータスコードは明示的に比較すること。`curl` は 403 でも終了コード `0` を返す -- レスポンスは届いており、`curl` が約束しているのはそこまでだからだ -- ので、`%{http_code}` を表示するだけのヘルスチェックは、このページが扱っているまさにその失敗を出力しながら、CI のステップをグリーンのままにしてしまう。
+
+## GitHub Actions に組み込む
+
+リポジトリのシークレットを 2 つ、デプロイ済みの URL に触れるステップへ環境変数として渡す。
+
+```yaml
+- name: Smoke-test the preview
+  env:
+    CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+    CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+  run: pnpm exec playwright test --grep @smoke
+```
+
+アプリケーションが `worker` の destination を使っている場合（[社内サイト向けの Cloudflare Access](../recipes/cloudflare-access.mdx#ホスト名ではなく-worker-に-access-を紐づける)を参照）、1 つのトークンで本番と、[Workers PR プレビュー](./workers-pr-previews.mdx)のフローが生成する PR ごとのプレビューエイリアスのすべてを覆える -- PR ごとに用意するものは何もない。
+
+:::warning[Worker スコープのアプリケーションでサービストークンの認証が同じように振る舞うかどうかは未検証]
+`worker` / `preview_worker` / `all_workers` の destination においてサービストークンがどう振る舞うかを述べた Cloudflare のページは存在しない。Workers の Access ページがサービストークンに触れているのは、アプリケーションを作成したあとに Zero Trust 側で設定するものとしてだけであり -- それは示唆であって、確認ではない。しかも、Worker スコープでの強制がホスト名での強制と単純に同一では**ない**という直接の証拠がある: ドキュメント化されている WebSocket の 403 は、Worker レベルのポリシーには当てはまり、ホスト名のアプリケーションには当てはまらない。置き換えようとしているパスワードゲートを削除する**前に**、本物のプレビューエイリアスに対して上の `curl` で検証すること。
+:::
+
+## 2 つの Cloudflare アカウント、1 組のヘッダー名
+
+ヘッダー名は固定なので、1 つのリクエストに載る認証情報のペアはちょうど 1 組だ。「両方送って、正しいほうに勝たせる」という手はない -- どちらのアカウントのトークンを使うかを、何かが選ばなければならない。
+
+自然なセレクターはすでに存在する: **リポジトリは Cloudflare アカウントと 1 対 1 で対応する。** つまり認証情報はリポジトリに属するものであり、推奨は**正規の**変数名を保持するリポジトリごとの `.env` だ。
+
+```bash
+# .env -- gitignored; commit .env.example with the names and no values
+CF_ACCESS_CLIENT_ID="....access"
+CF_ACCESS_CLIENT_SECRET="..."
+```
+
+正規の名前を使うことが肝心だ。どのリポジトリも `CF_ACCESS_CLIENT_ID` と `CF_ACCESS_CLIENT_SECRET` を使うので、Playwright の設定も、`curl` のスニペットも、エージェント向けのツールも、アカウントに依存しないままでいられる -- どのアカウントかを決めるのはファイルであって、コードは決して決めない。
+
+`curl` や Playwright の実行に際して `.env` を自動で読み込んでくれるものは何もない。シェルでの定石はこうだ。
+
+```bash
+set -a; source .env; set +a
+```
+
+### シークレットの重複が気になる場合の代替案
+
+両方のペアを名前空間付きの名前でシェルのプロファイルに置き、各リポジトリの `.env` にはポインターだけを持たせる。
+
+```bash
+# ~/.zshrc -- the only place the actual secrets live
+export CF_ACCESS_CLIENT_ID_TEAM="....access"
+export CF_ACCESS_CLIENT_SECRET_TEAM="..."
+export CF_ACCESS_CLIENT_ID_PERSONAL="....access"
+export CF_ACCESS_CLIENT_SECRET_PERSONAL="..."
+```
+
+```bash
+# .env in the team repo -- no secret, safe to commit if you want
+CF_ACCESS_CLIENT_ID="$CF_ACCESS_CLIENT_ID_TEAM"
+CF_ACCESS_CLIENT_SECRET="$CF_ACCESS_CLIENT_SECRET_TEAM"
+```
+
+こうすればローテーションは、すべてのリポジトリではなく 1 つのファイルに触れるだけで済む。その代償はこうだ: この方法が機能するのは `.env` が**シェルによって source される**ときだけである。間接参照の実体がシェルの展開だからだ -- `.env` をリテラルな `key=value` のペアとしてパースするツール（`dotenv` ライブラリ、Docker の `env_file`）は、`$CF_ACCESS_CLIENT_ID_TEAM` という文字列をそのままプロセスへ渡してしまう。
+
+アカウントが 2 つのうちは、リポジトリごとに素の値を置くほうを取る。3 つを超えたら考え直す。
+
+:::tip[組み合わせを間違えても、安全側に倒れる]
+チームのトークンを個人アカウントの URL に送ってしまっても、それは第三者への漏洩ではない -- どちらのホストも Cloudflare のエッジであり、そのアプリケーションの Service Auth ポリシーに一致しないトークンは単に拒否されるだけだ。症状は CI での 403 であって、露出ではない。
+:::
+
+## サービストークンはベアラー認証情報である
+
+これは identity を完全に迂回する。ペアを持っている者は誰であれ中に入れ、セッションにメールアドレスは紐づかず、監査ログにも人物を名指しするものは何も残らない。それが非対話的なアクセスと引き換えに払っているトレードオフであり、[パーソナル API トークン](../recipes/personal-api-tokens.mdx)が払っているものと同じトレードオフだ。
+
+その範囲を限定しておくための習慣が 3 つある。
+
+- **スコープを絞る。** トークンを名指しするのは、CI が実際に必要とするアプリケーションの Service Auth ポリシーだけにする。すべてを開けてしまうトークンは、手間が増えただけのパスワードゲートだ。
+- **有効期限を付ける。** デフォルトの 1 年は妥当なローテーションの間隔だ。`forever` は存在するが、それは意図的な例外であるべきで、読まずに受け入れる値ではない。決して期限切れにならないトークンは、決してローテーションされないトークンだ。
+- **どこであれシークレットとして保管する。** GitHub Actions のシークレットと、gitignore された `.env` に置く -- コミットされたファイルにも、ワークフローの入力にも、URL のパラメーターにも、決して置かない。
+
+## 関連
+
+- [社内サイト向けの Cloudflare Access](../recipes/cloudflare-access.mdx) -- 人間の側の半分。アプリケーション、ポリシー、Worker スコープの destination、そして呼び出し元の identity を読む方法。
+- [Workers PR プレビュー](./workers-pr-previews.mdx) -- スモークテストが対象にする、PR ごとのプレビューエイリアス URL。
+- [プレビュー・ステージング環境向けパスワードゲート](../recipes/password-gate.mdx) -- サービストークンが置き換えるものと、それでもゲートのほうが優れた道具であるケース。
+- [パーソナル API トークン](../recipes/personal-api-tokens.mdx) -- 同じベアラー認証情報のトレードオフを、自分が所有する API に適用したもの。

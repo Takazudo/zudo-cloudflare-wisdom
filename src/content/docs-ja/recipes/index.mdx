@@ -24,3 +24,4 @@ Cloudflare Pages、Workers、ストレージサービスを使った本番プロ
 - [VAPID による Web Push](./web-push-vapid.mdx) -- web-push npm パッケージを使わず、VAPID と aes128gcm 暗号化で Worker から暗号化された Web Push 通知を送信する
 - [Workers 上のリモート MCP サーバー](./remote-mcp-workers.mdx) -- WebStandard な Streamable HTTP トランスポートによるステートレスなリモート MCP サーバー -- リクエストごとの isolate インスタンス化、POST 専用の 405 契約、JSON パース前に強制するボディキャップ、SDK のクライアント半分に対するバンドルサイズチェック
 - [固定アップストリームへのリバースプロキシ](./reverse-proxy.mdx) -- 両方のレグでのヘッダー衛生、クロスリクエストのホップ上限を持つ手動リダイレクト書き換え、cookie/CSP/HSTS に関する明示的なトラストモデルの選択、共有キャッシュの安全性、そして workerd の Content-Encoding トラップ
+- [社内サイト向けの Cloudflare Access](./cloudflare-access.mdx) -- Worker の手前に置く identity ベースの境界認可。アカウント単位のセットアップ、zone なしで workers.dev とプレビューまで覆う Worker スコープのアプリケーション、WebSocket の制約、そして呼び出し元の identity を読む方法
