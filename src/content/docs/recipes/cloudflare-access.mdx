@@ -40,7 +40,7 @@ Three one-time decisions before any policy exists:
 2. **A plan.** Check Cloudflare's Zero Trust plan page for the current Free-tier limits. Do not trust a remembered figure -- the widely-repeated "50 users" cap comes from a 2022 document and is not what the current plan page says, and Cloudflare's own account-limits page tiers several other features by plan without stating a user cap at all.
 3. **A login method.** Either a real identity provider (Google Workspace, Microsoft Entra, Okta) or **One-time PIN**, which needs no IdP configuration at all: the visitor enters an email address, selects **Send login code**, and pastes back the PIN that arrives by email. It expires ten minutes after the request.
 
-:::note[One-time PIN is no longer enabled by default, and its login page lies to blocked users on purpose]
+:::note[One-time PIN is no longer enabled by default, and its login page tells a blocked user exactly what it tells everyone else]
 New Zero Trust organizations default to the Cloudflare identity provider; OTP is no longer added automatically, so it has to be added explicitly under Integrations > Identity providers. And by design the login page always reports **A code has been emailed to you**, whether or not an email was actually sent -- an address that matches no policy gets the same message and no code. That is deliberate (it refuses to confirm which addresses are allowlisted), but it means "the code never arrived" is the symptom of *both* a mail problem and a policy miss.
 :::
 
@@ -88,7 +88,18 @@ Worker-level Access policies do not currently support WebSocket connections -- a
 
 ### Precedence, and Why Deleting a Policy May Change Nothing
 
-Rules resolve hostname-based first, then Worker-level, then account-level. The consequence worth internalizing: on an account running `all_workers`, removing a Worker's own policy does **not** make that Worker public -- it falls through to the account-wide rule underneath. Exempting one Worker takes an explicit `bypass` policy, not a deletion.
+The most specific rule wins: hostname- or path-based Access first, then Worker-level, then account-level `all_workers` as the fallback. The consequence worth internalizing -- and which Cloudflare states directly, that removing Worker-level Access can *reveal* account-level Access underneath -- is that on an account running `all_workers`, deleting a Worker's own policy does **not** make that Worker public. It falls through to the account-wide rule.
+
+Exempting one Worker takes an explicit `bypass`, not a deletion:
+
+```json
+{
+  "decision": "bypass",
+  "include": [{ "everyone": {} }]
+}
+```
+
+applied to a `worker` destination for the Worker in question.
 
 ## What the Visitor Actually Sees
 
