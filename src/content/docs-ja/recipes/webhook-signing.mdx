@@ -176,7 +176,7 @@ export async function verifyWebhook(request: Request, secret: string): Promise<b
 ## 関連: Workers での Web Crypto
 
 これは、認証レシピが検証側で使うのと同じツールキットの署名方向です。
-[Auth with Pages Functions](./auth-functions.mdx) は、同じ
+[Pages Functions での認証](./auth-functions.mdx) は、同じ
 「Web Crypto、`node:crypto` なし」というテーマのもとでトークンの扱いを取り上げて
 います。どちらも Node の crypto ライブラリではなく `crypto.subtle` に依拠しており、
 向きが逆になっているだけです。ここでは署名を生成し、あちらでは呼び出し元を検証
