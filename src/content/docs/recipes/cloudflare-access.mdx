@@ -160,15 +160,32 @@ For **hostname-based** applications, or anywhere explicit verification is wanted
 ```typescript
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
-const JWKS = createRemoteJWKSet(
-  new URL(`${env.TEAM_DOMAIN}/cdn-cgi/access/certs`),
-);
+// Module-level cache so one isolate reuses a single JWKS fetcher across
+// requests. It cannot be built at module scope directly: `env` only exists
+// inside the handler, so the URL is not known until the first request.
+const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 
-const { payload } = await jwtVerify(token, JWKS, {
-  issuer: env.TEAM_DOMAIN,
-  audience: env.POLICY_AUD, // the application's AUD tag
-});
+function getJwks(teamDomain: string) {
+  let jwks = jwksCache.get(teamDomain);
+  if (!jwks) {
+    jwks = createRemoteJWKSet(new URL(`${teamDomain}/cdn-cgi/access/certs`));
+    jwksCache.set(teamDomain, jwks);
+  }
+  return jwks;
+}
+
+export async function verifyAccessJwt(request: Request, env: Env) {
+  const token = request.headers.get("Cf-Access-Jwt-Assertion");
+  if (!token) throw new Error("Missing Cf-Access-Jwt-Assertion header");
+
+  return await jwtVerify(token, getJwks(env.TEAM_DOMAIN), {
+    issuer: env.TEAM_DOMAIN,
+    audience: env.POLICY_AUD, // the application's AUD tag
+  });
+}
 ```
+
+`TEAM_DOMAIN` here is the **full origin** -- `https://my-team.cloudflareaccess.com`, scheme included and no trailing slash. It is used twice for two different reasons: `new URL()` rejects a bare hostname outright, and the `iss` claim Access signs is the origin form, so a value that omits the scheme fails the `issuer` check even where the URL happens to build.
 
 The same RS256-plus-JWKS shape appears in [Auth with Pages Functions](./auth-functions.mdx) -- Access is one more third-party issuer, verified the same way.
 

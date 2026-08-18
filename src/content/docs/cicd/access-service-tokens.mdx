@@ -54,11 +54,14 @@ A per-page `setExtraHTTPHeaders` works too, but the context-level form is what y
 The same two headers cover a plain health check, with no browser at all:
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code}\n' \
+code=$(curl -sS -o /dev/null -w '%{http_code}' \
   -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
   -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}" \
-  "https://pr-42-my-app.example.workers.dev/"
+  "https://pr-42-my-app.example.workers.dev/")
+[ "$code" = "200" ] || { echo "Access check failed: HTTP $code" >&2; exit 1; }
 ```
+
+Compare the code explicitly. `curl` exits `0` on a 403 -- the response arrived, which is all `curl` promises -- so a health check that only prints `%{http_code}` reports the exact failure this page is about and still leaves the CI step green.
 
 ## Wiring It into GitHub Actions
 

@@ -160,15 +160,32 @@ Workers のページはその結果を「email、groups、device posture」と�
 ```typescript
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
-const JWKS = createRemoteJWKSet(
-  new URL(`${env.TEAM_DOMAIN}/cdn-cgi/access/certs`),
-);
+// Module-level cache so one isolate reuses a single JWKS fetcher across
+// requests. It cannot be built at module scope directly: `env` only exists
+// inside the handler, so the URL is not known until the first request.
+const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 
-const { payload } = await jwtVerify(token, JWKS, {
-  issuer: env.TEAM_DOMAIN,
-  audience: env.POLICY_AUD, // the application's AUD tag
-});
+function getJwks(teamDomain: string) {
+  let jwks = jwksCache.get(teamDomain);
+  if (!jwks) {
+    jwks = createRemoteJWKSet(new URL(`${teamDomain}/cdn-cgi/access/certs`));
+    jwksCache.set(teamDomain, jwks);
+  }
+  return jwks;
+}
+
+export async function verifyAccessJwt(request: Request, env: Env) {
+  const token = request.headers.get("Cf-Access-Jwt-Assertion");
+  if (!token) throw new Error("Missing Cf-Access-Jwt-Assertion header");
+
+  return await jwtVerify(token, getJwks(env.TEAM_DOMAIN), {
+    issuer: env.TEAM_DOMAIN,
+    audience: env.POLICY_AUD, // the application's AUD tag
+  });
+}
 ```
+
+ここでの `TEAM_DOMAIN` は**完全なオリジン** -- `https://my-team.cloudflareaccess.com` であり、スキームを含み、末尾のスラッシュは付けない。これが 2 回使われるのには別々の理由がある: `new URL()` は裸のホスト名をそもそも受け付けないこと、そして Access が署名する `iss` クレームがオリジンの形であるため、スキームを省いた値は URL の組み立てがたまたま通った場合でも `issuer` の検証に失敗することだ。
 
 これと同じ RS256 + JWKS の形は [Pages Functions での認証](./auth-functions.mdx)にも登場する -- Access もまた 1 つのサードパーティ発行者であり、同じやり方で検証される。
 

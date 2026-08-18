@@ -54,11 +54,14 @@ await page.goto("https://pr-42-my-app.example.workers.dev/");
 ブラウザをまったく使わない素のヘルスチェックも、同じ 2 つのヘッダーで足りる。
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code}\n' \
+code=$(curl -sS -o /dev/null -w '%{http_code}' \
   -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
   -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}" \
-  "https://pr-42-my-app.example.workers.dev/"
+  "https://pr-42-my-app.example.workers.dev/")
+[ "$code" = "200" ] || { echo "Access check failed: HTTP $code" >&2; exit 1; }
 ```
+
+ステータスコードは明示的に比較すること。`curl` は 403 でも終了コード `0` を返す -- レスポンスは届いており、`curl` が約束しているのはそこまでだからだ -- ので、`%{http_code}` を表示するだけのヘルスチェックは、このページが扱っているまさにその失敗を出力しながら、CI のステップをグリーンのままにしてしまう。
 
 ## GitHub Actions に組み込む
 
