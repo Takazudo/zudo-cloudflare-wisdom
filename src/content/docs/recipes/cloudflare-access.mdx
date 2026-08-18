@@ -37,21 +37,42 @@ Nothing about an API token decides whether Access is available. Access lives ins
 Three one-time decisions before any policy exists:
 
 1. **A Zero Trust organization.** The first visit to the Zero Trust dashboard asks for a **team name**, which becomes the team domain `<team>.cloudflareaccess.com`. That hostname is where every login lands and is the `iss` claim in the resulting JWT. Renaming it later is disruptive -- choose deliberately.
-2. **A plan.** Zero Trust has a free tier with a seat cap. Check the current number on Cloudflare's plan page rather than trusting any figure written down elsewhere, including here.
-3. **A login method.** Either a real identity provider (Google Workspace, Microsoft Entra, Okta) or **One-time PIN**, which needs no IdP configuration at all: the visitor types an email address and receives a six-digit code. One-time PIN is the shortest path from nothing to a working gate.
+2. **A plan.** Check Cloudflare's Zero Trust plan page for the current Free-tier limits. Do not trust a remembered figure -- the widely-repeated "50 users" cap comes from a 2022 document and is not what the current plan page says, and Cloudflare's own account-limits page tiers several other features by plan without stating a user cap at all.
+3. **A login method.** Either a real identity provider (Google Workspace, Microsoft Entra, Okta) or **One-time PIN**, which needs no IdP configuration at all: the visitor enters an email address, selects **Send login code**, and pastes back the PIN that arrives by email. It expires ten minutes after the request.
+
+:::note[One-time PIN is no longer enabled by default, and its login page lies to blocked users on purpose]
+New Zero Trust organizations default to the Cloudflare identity provider; OTP is no longer added automatically, so it has to be added explicitly under Integrations > Identity providers. And by design the login page always reports **A code has been emailed to you**, whether or not an email was actually sent -- an address that matches no policy gets the same message and no code. That is deliberate (it refuses to confirm which addresses are allowlisted), but it means "the code never arrived" is the symptom of *both* a mail problem and a policy miss.
+:::
 
 ## Attaching Access to a Worker Instead of a Hostname
 
 The traditional Access application is bound to a **hostname**, which historically raised an awkward question for Workers served on `*.workers.dev`: that is not a zone you own. Access applications can now target the Worker itself, which sidesteps the question entirely.
 
-| Coverage | `destinations[].type` |
-|---|---|
-| One Worker, production and previews | `worker` |
-| One Worker, previews only | `preview_worker` |
-| Every Worker on the account, production and previews | `all_workers` |
-| Every Worker on the account, previews only | `all_preview_workers` |
+| Coverage | `destinations[].type` | Takes `worker_id` |
+|---|---|---|
+| One Worker, production and previews | `worker` | Yes |
+| One Worker, previews only | `preview_worker` | Yes |
+| Every Worker on the account, production and previews | `all_workers` | No |
+| Every Worker on the account, previews only | `all_preview_workers` | No |
 
 Cloudflare's Workers documentation states that a Worker-scoped application protects every domain associated with that Worker -- its routes, Custom Domains, `workers.dev` hostname, and previews. No zone, no custom domain, and no DNS record required.
+
+```bash
+curl "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/access/apps" \
+  --request POST \
+  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  --json '{
+    "type": "self_hosted",
+    "name": "Access for my-worker",
+    "destinations": [{ "type": "worker", "worker_id": "c81a2d22c29840ed9d61681a3270dbff" }],
+    "policies": [{
+      "decision": "allow",
+      "include": [{ "email_domain": { "domain": "example.com" } }]
+    }]
+  }'
+```
+
+Two constraints the API schema states and the prose does not: at most **one** `all_workers` and one `all_preview_workers` destination may exist per account, and the `destinations` list also accepts non-Worker variants (`public` for a hostname or URI, `private` for a CIDR/port, `via_mcp_server_portal`). `public` is the *old* hostname-shaped destination -- it is not a Worker-scoped one, and mistaking it for the equivalent of `worker` is an easy way to build an application that covers nothing you expected.
 
 :::warning[The docs disagree with each other about hostname-based Access on `workers.dev`]
 Cloudflare's Zero Trust page for self-hosted applications still says domains must belong to an active zone in your account, and never mentions `workers.dev`. The Workers-side page contradicts this for the `workers.dev` case. No page reconciles the two. Using a `worker` or `preview_worker` destination avoids the disagreement completely, because a Worker-scoped application never asks which zone the hostname belongs to -- which is the practical reason to prefer it here, quite apart from the convenience.
@@ -62,7 +83,7 @@ The documentation says "previews" without distinguishing the per-version hash UR
 :::
 
 :::danger[WebSocket upgrades fail with 403 behind a Worker-scoped policy]
-A Worker protected by a `worker`-destination policy rejects WebSocket upgrade requests. Anything real-time -- a [Durable Objects](../workers/durable-objects.mdx) coordination endpoint, a live-update channel -- must use hostname-based Access instead. This is the single hard constraint that decides between the two mechanisms, so check it before designing around Worker destinations.
+Worker-level Access policies do not currently support WebSocket connections -- an upgrade request to a Worker protected by one fails with `403`. Cloudflare's own guidance is to protect anything using WebSockets with a **hostname-based** application instead, explicitly naming [Durable Objects](../workers/durable-objects.mdx), real-time applications, and RDP-over-WebSocket. This is the single hard constraint that decides between the two mechanisms, so check it before designing around Worker destinations.
 :::
 
 ### Precedence, and Why Deleting a Policy May Change Nothing
@@ -93,7 +114,7 @@ Two details that matter in practice:
 
 With **One-time PIN** in place of an IdP, the visitor types twice: their email address, then the six-digit code that arrives by email. Only addresses matching a policy get a code that works.
 
-Session duration is configured per application, so how often anyone re-authenticates is your choice rather than a fixed behavior.
+How often anyone re-authenticates is configurable, at three levels that are easy to conflate. **Application** session duration (Applications > Configure > Overview) ranges from immediate timeout to one month and defaults to 24 hours. A **policy** may override it for the people that policy matches, over the same range. **Global** session duration is separate again -- it governs IdP re-login account-wide, runs from 15 minutes to one month, and also defaults to 24 hours. A Cloudflare One Client session, where one exists, overrides all of them.
 
 ## Reading the Identity in the Worker
 
@@ -102,20 +123,26 @@ Once a request is through, the Worker can read who sent it -- no JWT parsing, no
 ```typescript
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    // ctx.access is undefined when the request was not authenticated by Access
-    // -- e.g. the Worker is reachable on a route the application does not cover.
-    // Treat that as a failure, not as an anonymous visitor.
+    // ctx.access is undefined when Access did not authenticate the request
+    // -- e.g. the Worker is reachable on a route the application does not
+    // cover. Treat that as a failure, not as an anonymous visitor.
     if (!ctx.access) {
       return new Response("Access required", { status: 403 });
     }
 
     const identity = await ctx.access.getIdentity();
-    return new Response(`Signed in as ${identity.email}`);
+    return new Response(`Signed in as ${identity?.email ?? "unknown"}`);
   },
 };
 ```
 
-This is the capability a shared password fundamentally cannot offer: per-visitor attribution. Features that were impossible behind a gate -- recording who triaged an item, showing the signed-in user, scoping a view by group -- become available without writing an auth system.
+The application's audience tag is on the same object, as `ctx.access.aud`.
+
+This is the capability a shared password fundamentally cannot offer: per-visitor attribution. Recording who triaged an item, or showing the signed-in user, becomes possible without writing an auth system.
+
+:::warning[Only `email` is safe to rely on by name -- `getIdentity()` has no published return type]
+The Workers page describes the result as "email, groups, device posture" and the changelog says "email, name, and groups", but neither documents a signature, and the identity table they link to lists `email`, `idp`, `geo`, `user_uuid`, `devicePosture`, and others with **no top-level `name` or `groups` field**. Read `identity?.email` and treat anything else as unverified until you have logged an actual response from your own deployment. (The changelog also links `getIdentity()` to a `#access` anchor on the Context runtime-API page that does not exist -- there is no reference page behind this API yet.)
+:::
 
 For **hostname-based** applications, or anywhere explicit verification is wanted, validate the `Cf-Access-Jwt-Assertion` header against the team's JWKS endpoint instead. Fetch the keys; never hardcode one:
 
@@ -134,9 +161,30 @@ const { payload } = await jwtVerify(token, JWKS, {
 
 The same RS256-plus-JWKS shape appears in [Auth with Pages Functions](./auth-functions.mdx) -- Access is one more third-party issuer, verified the same way.
 
+### Simulating an Identity in Local Dev
+
+`wrangler dev` has no Access in front of it, so `ctx.access` would be `undefined` for every local request and the guard above would reject everything. An `access.dev` block supplies a fake identity instead:
+
+```jsonc
+{
+  "access": {
+    "dev": {
+      "aud": "my-app", // required -- Wrangler will not start without it
+      "identity": { "email": "admin@example.com" } // optional
+    }
+  }
+}
+```
+
+Remove the block and `ctx.access` goes back to `undefined`, which is the way to test the unauthenticated branch.
+
+:::note[This key is undocumented in the Wrangler configuration reference]
+`access.dev` appears only on the Workers Access page and the announcement changelog -- the [Wrangler configuration reference](../workers/wrangler-config.mdx) does not list an `access` key at all. Cloudflare describes its purpose as simulating identities "without deploying", but **no page states that the block is stripped on upload**. Do not assume it is inert in production on the strength of its name; if that matters to you, keep it out of the deployed configuration rather than trusting it to be ignored.
+:::
+
 ## API Token Permissions Are Separate from the Deploy Token
 
-Deploying a Worker that sits behind Access needs **no** Access permission on the deploy token. Access configuration is a different API surface, and there is no deployable `access` key in Wrangler configuration -- the only `access` block that exists is a development-only simulation used by `wrangler dev`, never uploaded. Enabling Access does not break an existing deploy pipeline, and the deploy token should stay as narrow as it already is (see [Cloudflare Account Setup](../getting-started/cloudflare-setup.mdx)).
+Deploying a Worker that sits behind Access needs **no** Access permission on the deploy token. Access applications are created through `/accounts/{account_id}/access/apps`, an API surface the Worker upload never touches, and the deploy token Cloudflare's own dashboard generates contains no `Access:` permission at all. Enabling Access does not break an existing deploy pipeline, and the deploy token should stay as narrow as it already is (see [Cloudflare Account Setup](../getting-started/cloudflare-setup.mdx)).
 
 Managing Access *from code* -- Terraform, or direct API calls -- is what needs permissions. Create a separate token for it. All of them are **Account**-scoped:
 

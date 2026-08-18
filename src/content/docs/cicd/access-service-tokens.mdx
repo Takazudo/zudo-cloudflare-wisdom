@@ -12,23 +12,25 @@ The answer is not to weaken the policy for an IP range or to script an IdP login
 
 ## Creating the Token
 
-Service tokens are created entirely from the Zero Trust dashboard; no API token and no Terraform are involved. Cloudflare has reorganized that navigation more than once, so rather than a breadcrumb that goes stale: search the dashboard for **service token**, in the Access area under a heading like Service Auth.
+Service tokens are created entirely from the Zero Trust dashboard; no API token and no Terraform are involved. The current path is **Access controls > Service credentials > Service Tokens > Create Service Token**. Cloudflare regrouped this navigation -- older documentation says Access > Service Auth -- so if the breadcrumb does not match what you see, search the dashboard for **service token** rather than hunting the tree.
 
 Creation returns two values:
 
-- **Client ID** -- ends in `.access`, not secret, safe to log.
-- **Client Secret** -- **shown exactly once, at creation.** There is no way to read it back later; a lost secret means deleting the token and issuing a new one.
+- **Client ID** -- not secret, safe to log. Cloudflare's examples show it ending in `.access`, though no documentation states that suffix as a rule.
+- **Client Secret** -- **shown exactly once, at creation.** In Cloudflare's own words, lose it and you must generate a new service token; there is no way to read it back.
 
-Copy the secret straight into its destination (a GitHub Actions secret, your local `.env`) before leaving the page. Set a real expiry while you are there -- see the rotation note at the end.
+Copy the secret straight into its destination (a GitHub Actions secret, your local `.env`) before leaving the page.
+
+The default lifetime is one year (`8760h`). The API accepts a `duration` in Go-style units (`300ms`, `2h45m`) plus the special value `forever` for a non-expiring token. The dashboard's **Refresh** button extends by exactly one year -- anything else needs the Edit form or a `PUT` with an explicit `duration`.
 
 ## The Token Alone Grants Nothing
 
 This is where the confusing 403 comes from, and it is worth stating before any code: **creating a service token authorizes nothing.** The token is a credential with no meaning until a policy names it.
 
-Every Access application that CI must reach needs a policy whose **action is Service Auth** and whose include rule selects that token. Miss this and the headers are sent, accepted as well-formed, and refused -- which reads exactly like a wrong secret.
+Every Access application that CI must reach needs a policy whose **action is Service Auth** and whose include rule selects that token. Cloudflare states the consequence plainly: set the action to Service Auth, "otherwise, Access will prompt for an identity provider login" -- which is exactly the redirect the token was meant to avoid, so the symptom of forgetting looks like the token not working at all.
 
 :::warning[Service Auth is a policy action, not a policy type -- it coexists with the human policy]
-An application ends up with two policies: the ordinary allow policy that lets people in through the IdP, and a Service Auth policy that lets the token in. Both live on the same application at the same time. Adding the second does not weaken the first, and a service token cannot satisfy an allow policy no matter how it is written.
+An application ends up with two policies: the ordinary allow policy that lets people in through the IdP, and a Service Auth policy that lets the token in. Both live on the same application at the same time. Adding the second does not weaken the first, and the Service Token selector is only valid under the Service Auth action -- a token named in an `allow` policy does nothing.
 :::
 
 ## Using It from Playwright
@@ -72,8 +74,8 @@ Two repository secrets, passed as environment variables to whichever step touche
 
 If the application uses a `worker` destination (see [Cloudflare Access](../recipes/cloudflare-access.mdx#attaching-access-to-a-worker-instead-of-a-hostname)), one token covers production and every per-PR preview alias produced by the [Workers PR Previews](./workers-pr-previews.mdx) flow -- there is nothing per-PR to provision.
 
-:::note[Whether service-token auth behaves identically on Worker-scoped applications is unverified]
-Service tokens are documented against Access applications generally, and a Worker-scoped application is enforced by the same layer, so it should hold. The documentation does not say so explicitly for that destination type. Verify it with the `curl` above against a real preview alias **before** deleting a password gate you are replacing -- the failure mode of assuming wrongly is an unreachable preview on the day you need it.
+:::warning[Whether service-token auth behaves identically on Worker-scoped applications is unverified]
+No Cloudflare page states how service tokens behave on a `worker` / `preview_worker` / `all_workers` destination. The Workers Access page mentions service tokens only as something to configure in Zero Trust after creating the application -- an implication, not a confirmation. And there is direct evidence that Worker-scoped enforcement is **not** simply identical to hostname enforcement: the documented WebSocket 403 applies to Worker-level policies and not to hostname applications. Verify with the `curl` above against a real preview alias **before** deleting a password gate you are replacing.
 :::
 
 ## Two Cloudflare Accounts, One Set of Header Names
@@ -129,7 +131,7 @@ It bypasses identity entirely. Whoever holds the pair is in, with no email attac
 Three habits that keep it bounded:
 
 - **Scope it.** Name the token in the Service Auth policy of only the applications CI actually needs. A token that opens everything is a password gate with extra steps.
-- **Give it an expiry.** Cloudflare lets you set a lifetime at creation. A token that never expires is one that never gets rotated.
+- **Give it an expiry.** The default year is a reasonable rotation cadence; `forever` exists and should be a deliberate exception, not the value you accepted without reading. A token that never expires is one that never gets rotated.
 - **Store it as a secret, everywhere.** A GitHub Actions secret and a gitignored `.env` -- never a committed file, never a workflow input, never a URL parameter.
 
 ## Related
