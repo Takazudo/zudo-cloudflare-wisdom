@@ -282,7 +282,7 @@ npx wrangler deploy --dry-run
 
 - このエンドポイントをブラウザ以外の MCP クライアント（別の Worker、バックエンドジョブ、ローカルで stdio-to-HTTP ブリッジとして動かす `mcp-remote`）だけが呼ぶのであれば、**CORS ヘッダーを一切付けない**。ブラウザは CORS を強制するが、ブラウザ以外の HTTP クライアントはそれをチェックしない。だから `Access-Control-Allow-Origin` を省略することは、見落としではなく、ブラウザベースの呼び出し元に対する実質的な制限になる。
 - ブラウザベースの MCP クライアントが本当にこのエンドポイントを直接呼ぶ必要があるなら、`Access-Control-Allow-Origin` を小さく明示的な許可リストにする -- `*` は同じ理由で絶対に避ける。
-- `buildServer()` や `handleRequest` が走るより前に、`Authorization` に対してチェックするベアラートークンや API キーで呼び出し元を認証する。上で扱った [Personal API Tokens](./personal-api-tokens.mdx) と同じ形がここにもそのまま当てはまる -- 未認証の MCP エンドポイントは、URL に到達できる誰にでも `tools/list` と、`tools/call` が実際に行うことを渡してしまう。
+- `buildServer()` や `handleRequest` が走るより前に、`Authorization` に対してチェックするベアラートークンや API キーで呼び出し元を認証する。上で扱った [パーソナル API トークン](./personal-api-tokens.mdx) と同じ形がここにもそのまま当てはまる -- 未認証の MCP エンドポイントは、URL に到達できる誰にでも `tools/list` と、`tools/call` が実際に行うことを渡してしまう。
 - トランスポートのコンストラクタは DNS リバインディング対策として `allowedHosts` / `allowedOrigins` / `enableDnsRebindingProtection` も公開しているが、現行の SDK はこの 3 つすべてを「external middleware」を推奨する形で `@deprecated` としている -- 実務上は、トランスポートのコンストラクタオプションではなく、上のメソッドチェックや Content-Type チェックと並んで fetch ハンドラの中で行う、自前の `Host` / `Origin` チェックのことだ。
 
 ## 検証チェックリスト
@@ -374,4 +374,4 @@ graph TB
 
 ## 関連
 
-[Personal API Tokens](./personal-api-tokens.mdx) は、上で触れたベアラートークン認証の形を扱っている。セッションベースの MCP サーバー -- OAuth 認証されたクライアント、サーバー起点の通知、単一リクエストを超えて生き続ける状態 -- が必要なら、このステートレスなパターンの代わりに、Cloudflare の Agents SDK による Durable Object 裏付けの `McpAgent` に手を伸ばすこと。そのパターンが依拠している状態永続化のモデルについては [Durable Objects](../workers/durable-objects.mdx) を参照。この 2 つは同じことをする 2 通りの方法ではなく、異なるセッション要件のための異なる道具だ。
+[パーソナル API トークン](./personal-api-tokens.mdx) は、上で触れたベアラートークン認証の形を扱っている。セッションベースの MCP サーバー -- OAuth 認証されたクライアント、サーバー起点の通知、単一リクエストを超えて生き続ける状態 -- が必要なら、このステートレスなパターンの代わりに、Cloudflare の Agents SDK による Durable Object 裏付けの `McpAgent` に手を伸ばすこと。そのパターンが依拠している状態永続化のモデルについては [Durable Objects](../workers/durable-objects.mdx) を参照。この 2 つは同じことをする 2 通りの方法ではなく、異なるセッション要件のための異なる道具だ。

@@ -372,7 +372,7 @@ async function sweepExpired(db: D1Database, now: number): Promise<void> {
 }
 ```
 
-`updated_at < now - RETENTION_MS` は、保持期間を過ぎた古い `completed` の行と、一度も引き継がれなかった `pending` の行の両方を捕える -- 誰も見直さなかった予約は、TTL が失効したものとまったく同じくらい死んでいる。リクエストごとの小さく上限付きのバッチは、各スイープを安価で自己ペース型に保つ。バックログは、1 回のクエリで一気に片付けようとして CPU 時間の予算を吹き飛ばすのではなく、多数のリクエストにわたって自己解消していく。[Cron + D1 Queue](./cron-d1-queue.mdx) の上限付き `LIMIT` バッチと同じ形だ。
+`updated_at < now - RETENTION_MS` は、保持期間を過ぎた古い `completed` の行と、一度も引き継がれなかった `pending` の行の両方を捕える -- 誰も見直さなかった予約は、TTL が失効したものとまったく同じくらい死んでいる。リクエストごとの小さく上限付きのバッチは、各スイープを安価で自己ペース型に保つ。バックログは、1 回のクエリで一気に片付けようとして CPU 時間の予算を吹き飛ばすのではなく、多数のリクエストにわたって自己解消していく。[Cron 起動の D1 ワークキュー](./cron-d1-queue.mdx) の上限付き `LIMIT` バッチと同じ形だ。
 
 `RETENTION_MS` は、上記の [Idempotency-Key ヘッダーの契約](#idempotency-key-ヘッダーの契約) で約束した保持期間そのものだ -- これを変更するなら、その約束も更新すること。両者が食い違ってはならない: 広告している期間よりスイープが短いと、その期間の終わり近くで再試行するクライアントに対して保証が黙って破られる。広告している期間よりスイープが長いと、クライアントに当てにしないよう伝えた行を単に保持し続けるだけになる。
 
@@ -521,4 +521,4 @@ export async function handleIdempotentMutation(
 }
 ```
 
-このパターンは D1 の基礎を [D1（SQL データベース）](../storage/d1.mdx) と共有し、上限付きバッチと `ctx.waitUntil()` 駆動のハウスキーピングを [Cron + D1 Queue](./cron-d1-queue.mdx) と共有している。フィンガープリントが依拠する生バイト列のハッシュ計算の作法については [HMAC-SHA256 によるウェブフック署名](./webhook-signing.mdx) を参照。
+このパターンは D1 の基礎を [D1（SQL データベース）](../storage/d1.mdx) と共有し、上限付きバッチと `ctx.waitUntil()` 駆動のハウスキーピングを [Cron 起動の D1 ワークキュー](./cron-d1-queue.mdx) と共有している。フィンガープリントが依拠する生バイト列のハッシュ計算の作法については [HMAC-SHA256 によるウェブフック署名](./webhook-signing.mdx) を参照。
