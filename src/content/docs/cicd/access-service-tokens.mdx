@@ -1,0 +1,140 @@
+---
+title: Access Service Tokens for CI
+description: Getting Playwright smoke tests and health checks through a Cloudflare Access-protected URL with a service token -- the Service Auth policy that makes it work, and how to keep credentials straight across two Cloudflare accounts
+sidebar_position: 8
+---
+
+## Overview -- A Login Redirect Is a Wall to a Headless Client
+
+[Cloudflare Access](../recipes/cloudflare-access.mdx) is excellent in front of a preview deployment right up to the moment CI tries to open one. A policy that says "allow anyone at `@example.com` via Google" is unsatisfiable by a headless browser: Playwright follows the redirect to the identity provider, finds a login form built for a human, and stalls there until the step times out.
+
+The answer is not to weaken the policy for an IP range or to script an IdP login. Access ships a purpose-built non-interactive credential -- the **service token** -- and the whole mechanism is two request headers.
+
+## Creating the Token
+
+Service tokens are created entirely from the Zero Trust dashboard; no API token and no Terraform are involved. Cloudflare has reorganized that navigation more than once, so rather than a breadcrumb that goes stale: search the dashboard for **service token**, in the Access area under a heading like Service Auth.
+
+Creation returns two values:
+
+- **Client ID** -- ends in `.access`, not secret, safe to log.
+- **Client Secret** -- **shown exactly once, at creation.** There is no way to read it back later; a lost secret means deleting the token and issuing a new one.
+
+Copy the secret straight into its destination (a GitHub Actions secret, your local `.env`) before leaving the page. Set a real expiry while you are there -- see the rotation note at the end.
+
+## The Token Alone Grants Nothing
+
+This is where the confusing 403 comes from, and it is worth stating before any code: **creating a service token authorizes nothing.** The token is a credential with no meaning until a policy names it.
+
+Every Access application that CI must reach needs a policy whose **action is Service Auth** and whose include rule selects that token. Miss this and the headers are sent, accepted as well-formed, and refused -- which reads exactly like a wrong secret.
+
+:::warning[Service Auth is a policy action, not a policy type -- it coexists with the human policy]
+An application ends up with two policies: the ordinary allow policy that lets people in through the IdP, and a Service Auth policy that lets the token in. Both live on the same application at the same time. Adding the second does not weaken the first, and a service token cannot satisfy an allow policy no matter how it is written.
+:::
+
+## Using It from Playwright
+
+The two headers travel on every request in the browser context, not just the top-level navigation -- which is precisely why this works for a real browser and not only for `fetch`. Subresources (JavaScript, CSS, fonts, API calls the page makes) are each independently subject to Access, and each carries the headers:
+
+```typescript
+const context = await browser.newContext({
+  extraHTTPHeaders: {
+    "CF-Access-Client-Id": process.env.CF_ACCESS_CLIENT_ID!,
+    "CF-Access-Client-Secret": process.env.CF_ACCESS_CLIENT_SECRET!,
+  },
+});
+
+const page = await context.newPage();
+await page.goto("https://pr-42-my-app.example.workers.dev/");
+```
+
+A per-page `setExtraHTTPHeaders` works too, but the context-level form is what you want -- it applies to every page the context opens, so a test that follows a link into a second tab does not silently lose its credentials.
+
+The same two headers cover a plain health check, with no browser at all:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
+  -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}" \
+  "https://pr-42-my-app.example.workers.dev/"
+```
+
+## Wiring It into GitHub Actions
+
+Two repository secrets, passed as environment variables to whichever step touches the deployed URL:
+
+```yaml
+- name: Smoke-test the preview
+  env:
+    CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+    CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+  run: pnpm exec playwright test --grep @smoke
+```
+
+If the application uses a `worker` destination (see [Cloudflare Access](../recipes/cloudflare-access.mdx#attaching-access-to-a-worker-instead-of-a-hostname)), one token covers production and every per-PR preview alias produced by the [Workers PR Previews](./workers-pr-previews.mdx) flow -- there is nothing per-PR to provision.
+
+:::note[Whether service-token auth behaves identically on Worker-scoped applications is unverified]
+Service tokens are documented against Access applications generally, and a Worker-scoped application is enforced by the same layer, so it should hold. The documentation does not say so explicitly for that destination type. Verify it with the `curl` above against a real preview alias **before** deleting a password gate you are replacing -- the failure mode of assuming wrongly is an unreachable preview on the day you need it.
+:::
+
+## Two Cloudflare Accounts, One Set of Header Names
+
+The header names are fixed, so exactly one credential pair travels on a request. There is no "send both and let the right one win" -- something has to select which account's token to use.
+
+The natural selector already exists: **a repository maps one-to-one to a Cloudflare account.** So the credential belongs to the repository, and the recommendation is a per-repository `.env` holding **canonical** variable names:
+
+```bash
+# .env -- gitignored; commit .env.example with the names and no values
+CF_ACCESS_CLIENT_ID="....access"
+CF_ACCESS_CLIENT_SECRET="..."
+```
+
+Canonical names are the point. Every repository uses `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET`, so Playwright configuration, `curl` snippets, and any agent tooling stay account-agnostic -- the file decides which account, the code never does.
+
+Nothing loads `.env` automatically for a `curl` or Playwright invocation. The shell idiom:
+
+```bash
+set -a; source .env; set +a
+```
+
+### The Alternative, If Duplicated Secrets Bother You
+
+Keep both pairs in the shell profile under namespaced names, and let each repository's `.env` hold nothing but a pointer:
+
+```bash
+# ~/.zshrc -- the only place the actual secrets live
+export CF_ACCESS_CLIENT_ID_TEAM="....access"
+export CF_ACCESS_CLIENT_SECRET_TEAM="..."
+export CF_ACCESS_CLIENT_ID_PERSONAL="....access"
+export CF_ACCESS_CLIENT_SECRET_PERSONAL="..."
+```
+
+```bash
+# .env in the team repo -- no secret, safe to commit if you want
+CF_ACCESS_CLIENT_ID="$CF_ACCESS_CLIENT_ID_TEAM"
+CF_ACCESS_CLIENT_SECRET="$CF_ACCESS_CLIENT_SECRET_TEAM"
+```
+
+Rotation then touches one file instead of every repository. The cost: it only works when `.env` is **sourced by a shell**, because the indirection is shell expansion -- any tool that parses `.env` as literal `key=value` pairs (a `dotenv` library, Docker's `env_file`) hands your process the string `$CF_ACCESS_CLIENT_ID_TEAM` verbatim.
+
+At two accounts, take the plain per-repository values. Revisit past three.
+
+:::tip[Getting the pairing wrong fails safely]
+Sending the team token to a personal-account URL is not a leak to a third party -- both hosts are Cloudflare's edge, and a token that does not match a Service Auth policy on that application is simply refused. The symptom is a 403 in CI, not exposure.
+:::
+
+## A Service Token Is a Bearer Credential
+
+It bypasses identity entirely. Whoever holds the pair is in, with no email attached to the session and nothing in the audit log naming a person. That is the trade being made in exchange for non-interactive access, and it is the same trade a [personal API token](../recipes/personal-api-tokens.mdx) makes.
+
+Three habits that keep it bounded:
+
+- **Scope it.** Name the token in the Service Auth policy of only the applications CI actually needs. A token that opens everything is a password gate with extra steps.
+- **Give it an expiry.** Cloudflare lets you set a lifetime at creation. A token that never expires is one that never gets rotated.
+- **Store it as a secret, everywhere.** A GitHub Actions secret and a gitignored `.env` -- never a committed file, never a workflow input, never a URL parameter.
+
+## Related
+
+- [Cloudflare Access](../recipes/cloudflare-access.mdx) -- the human half: applications, policies, Worker-scoped destinations, and reading the caller's identity.
+- [Workers PR Previews](./workers-pr-previews.mdx) -- the per-PR preview alias URLs a smoke test targets.
+- [Password Gate for Preview and Staging Sites](../recipes/password-gate.mdx) -- what a service token replaces, and the case where the gate is still the better tool.
+- [Personal API Tokens](../recipes/personal-api-tokens.mdx) -- the same bearer-credential trade-offs, applied to an API you own.

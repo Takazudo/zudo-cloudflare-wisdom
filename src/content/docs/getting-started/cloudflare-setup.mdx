@@ -27,6 +27,10 @@ Create one token with all permissions rather than separate tokens per service. S
 
 For the complete corrected token reference -- including the custom-domain dual-zone-permission trap and Zone Resources scoping -- see the CI Token section in [Deploy From Zero](../workers/deploy-from-zero.mdx).
 
+:::note[Cloudflare Access needs nothing on this token]
+Putting a site behind [Cloudflare Access](../recipes/cloudflare-access.mdx) does not change the deploy token. Access configuration is a separate API surface with its own account-scoped `Access: *` permissions, and none of them belong here -- adding Access to a project never breaks an existing pipeline, and the deploy token stays as narrow as the list above.
+:::
+
 ## Shared Token for Low-Risk Repos
 
 Running many small, low-risk repos on one account -- example apps, demos, preview sites -- is a case for minting **one** account-scoped token sized to the union of every repo's permissions, instead of near-identical tokens per repo. Fewer secrets to rotate, one place to reason about scope.
