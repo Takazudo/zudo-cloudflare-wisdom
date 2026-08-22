@@ -1,0 +1,70 @@
+---
+title: Sandbox と Containers で信頼できるビルド証明を行う
+sidebar_position: 12
+---
+
+Cloudflare Sandbox と Containers は分離されたビルドに有用ですが、warm なローカル実行だけでは、fresh hosted container が deadline 内に完了する証拠にはなりません。
+
+Sandbox の状態は container が active な間だけ存在します。sleep、stop、relocation の後は、image から fresh filesystem を使って起動します。Container の cold-start 時間にも揺らぎがあります。このライフサイクルを前提に build proof を設計し、warm 済みの一時ファイルや process state に依存しないでください。
+
+Cloudflare の [Sandbox lifecycle documentation](https://developers.cloudflare.com/sandbox/api/lifecycle/) と [Containers architecture documentation](https://developers.cloudflare.com/containers/platform-details/architecture/) も参照してください。
+
+## 3 つの readiness layer を分離する
+
+次の layer を個別に確認します。
+
+1. Worker と binding の readiness: RPC target が存在し request を受理する
+2. Container compatibility: active image が期待する runtime、protocol、asset authority を報告する
+3. Workload proof: fresh isolated build が完了し、artifact が受理される
+
+Worker が healthy でも、Container image の compatibility は証明されません。たとえば次の exact compatibility tuple を使います。
+
+```text
+worker contract + image runtime + status protocol + immutable asset digests
+```
+
+stale または部分的に deploy された組み合わせは、tenant work を受理する前に拒否します。
+
+## 信頼できる単一の absolute deadline を使う
+
+build tree 全体を 1 つの absolute deadline で囲みます。phase transition で deadline を reset してはいけません。root-owned supervisor が timer と process cleanup を所有し、untrusted build process は private inherited file descriptor を通じて固定 phase transition を報告します。
+
+authored stdout、stderr、選択された exit code から failure を分類しないでください。authored workspace の外部に書かれた canonical status envelope を検証します。欠落または malformed の場合は、限定された platform-loss classification へ fail closed します。
+
+reason code は固定かつ scrub-safe にします。
+
+```text
+wall-time-check
+wall-time-build
+wall-time-stabilize
+wall-time-emit
+platform-loss
+```
+
+## limit を上げる前に構造的な work を測る
+
+live build が遅い場合は、まず phase を特定し、高コストな operation を数えます。compiler の重複、tree walk の反復、cold extraction、recursive ownership change、image に bake できる work を探します。
+
+たとえば immutable bundle の read 1 回、digest 1 回、copy 1 回、installed package tree の runtime traversal なし、といった operation count をテストで検証します。timing test も有用ですが、構造的 assertion は host variance の影響を受けにくいです。
+
+retry 後の成功は instability の evidence であり、limit が正しいことの証明ではありません。
+
+## immutable work を独立した authority とともに bake する
+
+可能なら release-owned かつ lockfile-pinned な work を image に移します。runtime では baked bytes を、asset 自身とは独立して保存された expected digest と比較します。
+
+次の場合は fail closed にします。
+
+- symlink と special file
+- unsafe または escape する path
+- 予期しない catalog key や ordering
+- destination collision
+- stale image、protocol、digest handshake
+
+policy stability の改善につながる場合は、tenant-dependent value を新しい executable bytes にせず inert data に保持します。
+
+## staging mutation を transaction として扱う
+
+diagnostic deployment の前に、正確な Worker version percentage、image identity、route、fail-open behavior を snapshot します。proof の後はすべての field を復元し、state を read back し、一時的な hostname と route が hidden であることを probe します。
+
+always-run recovery path を使います。workload success、evidence completeness、recovery success を別々に報告することで、build が失敗しても信頼できる diagnostics と clean な platform state を残せます。
