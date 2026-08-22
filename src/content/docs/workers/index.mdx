@@ -35,6 +35,6 @@ Use standalone Workers when:
 - [Deploy from Zero](./deploy-from-zero.mdx) -- provisioning a repo-based Worker from scratch and its non-obvious traps
 - [Local Dev: Binding Support Matrix](./local-dev-bindings.mdx) -- which bindings emulate locally in `wrangler dev`, and the credential-free e2e config pattern
 - [Runtime Gotchas](./runtime-gotchas.mdx) -- self-fetch hostnames, stored fetch responses, waitUntil/scheduled budgets, binding-wrapping libraries, the cloudflare:workers ambient env, and CORS vs WebSocket
-- [Reliable Build Proofs on Sandbox and Containers](./sandbox-container-build-proofs.mdx) -- three readiness layers, one absolute deadline, evidence tenant code cannot write, structural op counts before higher limits, baked image authority, and staging mutation as a transaction
 - [Pages to Workers Migration](./pages-to-workers-migration.mdx) -- moving a live site from Pages to Workers Static Assets with minimal downtime, and rolling back cleanly if it doesn't go well
 - [Workers Cache (ctx.cache)](./workers-cache.mdx) -- the edge-level cache.enabled / ctx.cache feature -- version floor, Cache-Control/Cache-Tag/Vary, ctx.cache.purge scoping, Cf-Cache-Status, the Next.js ISR question, and why verification only works against a deployed Worker
+- [Reliable Build Proofs on Sandbox and Containers](./sandbox-container-build-proofs.mdx) -- three readiness layers, one absolute deadline, evidence tenant code cannot write, structural op counts before higher limits, baked image authority, and staging mutation as a transaction

@@ -35,6 +35,6 @@ Cloudflare Workers はエッジで実行されるサーバーレス関数。ス�
 - [ゼロからのデプロイ](./deploy-from-zero.mdx) -- リポジトリベースの Worker をゼロからプロビジョニングする際の非自明な罠
 - [ローカル開発: バインディング対応表](./local-dev-bindings.mdx) -- `wrangler dev` でどのバインディングがローカルエミュレートされるか、クレデンシャル不要な e2e 用の設定パターン
 - [ランタイムの落とし穴](./runtime-gotchas.mdx) -- self-fetch のホスト名、ストアされた fetch レスポンス、waitUntil / scheduled の予算、バインディングをラップするライブラリ、cloudflare:workers のアンビエント env、CORS と WebSocket
-- [Sandbox と Containers で信頼できるビルド証明を行う](./sandbox-container-build-proofs.mdx) -- 準備完了の 3 つのレイヤー、ただ 1 つの絶対デッドライン、テナントのコードには書けない証跡、上限を上げる前の構造的な操作回数、イメージに焼き込んだ正解の在り処、トランザクションとしてのステージング変更
 - [Pages から Workers への移行](./pages-to-workers-migration.mdx) -- 最小限のダウンタイムで Pages から Workers Static Assets へライブサイトを移行し、うまくいかなかった場合にきれいにロールバックする
 - [Workers Cache（ctx.cache）](./workers-cache.mdx) -- エッジレベルの cache.enabled / ctx.cache 機能 -- バージョンの下限、Cache-Control/Cache-Tag/Vary、ctx.cache.purge のスコープ、Cf-Cache-Status、Next.js の ISR をめぐる論点、そして検証がデプロイ済み Worker に対してしか成立しない理由
+- [Sandbox と Containers で信頼できるビルド証明を行う](./sandbox-container-build-proofs.mdx) -- 準備完了の 3 つのレイヤー、ただ 1 つの絶対デッドライン、テナントのコードには書けない証跡、上限を上げる前の構造的な操作回数、イメージに焼き込んだ正解の在り処、トランザクションとしてのステージング変更
