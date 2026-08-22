@@ -44,10 +44,10 @@ export const BUILD_RUNTIME = {
 export class SandboxUnavailable extends Error {} // retryable -- NOT a build failure
 
 export async function runtimeHandshake(sandbox: Sandbox): Promise<void> {
-  const result = await sandbox.exec("/opt/builder/report-runtime.mjs", { timeout: 30_000 });
+  const result = await sandbox.exec("node /opt/builder/report-runtime.mjs", { timeout: 30_000 });
   if (result.exitCode !== 0) throw new SandboxUnavailable("handshake did not run");
 
-  const actual = JSON.parse(result.stdout) as typeof BUILD_RUNTIME;
+  const actual = JSON.parse(result.stdout) as { id: string; bakedAssetDigests: Record<string, string> };
   // One joined id catches the common case; the field-by-field compare below it
   // is what makes the failure legible in logs.
   if (actual.id !== BUILD_RUNTIME.id) throw new SandboxUnavailable(`runtime ${actual.id}`);
@@ -90,7 +90,6 @@ import { spawn } from "node:child_process";
 const DEADLINE_MS = 120_000;
 const GRACE_MS = 3_000;
 const startedAt = Date.now();
-
 const runner = spawn(
   "/usr/bin/setpriv",
   ["--reuid=builder", "--regid=builder", "--clear-groups", "node", "/opt/builder/runner.mjs"],
@@ -126,10 +125,10 @@ Build children get file descriptors 0-2 and nothing else. The trusted runner rep
 ```js
 // /opt/builder/runner.mjs -- trusted, holds fd 3.
 const emit = (line) => writeSync(3, line + "\n");
-emit(`phase build`);
+emit("phase build");
 
-// Tenant children get stdout/stderr for logs and nothing else. No fd 3 here
-// means no tenant process can forge a phase transition or a terminal line.
+// Tenant children get stdout/stderr and nothing else: with no fd 3, no tenant
+// process can forge a phase transition or a terminal line.
 const child = spawn(tenantCommand, tenantArgs, { stdio: ["ignore", "pipe", "pipe"] });
 emit(`group-open ${child.pid}`);
 ```
@@ -174,8 +173,7 @@ The supervisor then writes one canonical status envelope to a root-owned `0400` 
 The Worker re-parses that strictly, and the strictness is the point -- each check below rejects a specific way a compromised or merely buggy runner could produce a plausible-looking pass:
 
 ```ts
-// worker/verify.ts -- returns a verdict, never a boolean. "Unknown" is a
-// first-class outcome that blames the platform and retries.
+// worker/verify.ts -- returns a verdict, never a boolean; "unknown" is a first-class outcome.
 function verify(raw: string, obs: Observed): Verdict {
   const doc = JSON.parse(raw);
   // Canonical bytes: re-serializing must reproduce the file exactly, which
@@ -185,9 +183,10 @@ function verify(raw: string, obs: Observed): Verdict {
   const phases = Object.keys(doc.phaseMs);
   const after = phases.slice(phases.indexOf(doc.phase) + 1);
   if (after.some((p) => doc.phaseMs[p] !== 0)) return platformLoss("timing after reported phase");
-  if (sum(doc.phaseMs) !== doc.totalMs || doc.totalMs > DEADLINE_MS) return platformLoss("budget");
+  if (sumValues(doc.phaseMs) !== doc.totalMs || doc.totalMs > DEADLINE_MS) return platformLoss("budget");
   if (EXIT_FOR_STATUS[doc.status] !== obs.exitCode) return platformLoss("exit/status disagree");
-  if (!REASONS_FOR[doc.status].includes(doc.reason)) return platformLoss("reason/phase disagree");
+  // The reason must be legal for BOTH the status and the phase it names.
+  if (!REASONS_FOR[doc.status][doc.phase]?.includes(doc.reason)) return platformLoss("bad reason");
 
   if (obs.survivorPids > 0) return platformLoss("survivors after terminal line");
   if (obs.partialLine || obs.timerFired) return timedOut(`wall-time-${doc.phase}`);
@@ -211,7 +210,8 @@ test("each baked input is touched exactly once, and the package tree never is", 
   const ops: Array<{ kind: string; path: string }> = [];
   await runBuildStep({ onOperation: (kind, path) => ops.push({ kind, path }) });
 
-  expect(ops.filter((o) => o.kind === "read" && o.path.startsWith("/opt/builder/"))).toHaveLength(1);
+  const baked = ops.filter((o) => o.kind === "read" && o.path.startsWith("/opt/builder/"));
+  expect(baked.map((o) => o.path).sort()).toEqual(BAKED_INPUTS); // one read each, no repeats
   expect(ops.filter((o) => o.kind === "digest")).toHaveLength(1);
   expect(ops.filter((o) => o.kind === "copy")).toHaveLength(1);
   for (const op of ops) {
@@ -220,8 +220,8 @@ test("each baked input is touched exactly once, and the package tree never is", 
   }
 });
 
-// A count assertion proves the code did not walk the package tree on this run.
-// This proves it cannot: the path literal is not in the module at all.
+// The count assertion proves it did not walk the package tree on this run; this
+// proves it cannot -- the path literal is not in the module at all.
 test("the module has no vocabulary for the package tree", () => {
   expect(readFileSync("src/build-step.ts", "utf8")).not.toContain("node_modules");
 });
@@ -237,7 +237,7 @@ docker run --rm --network none builder:2026-08a node /opt/builder/selftest.mjs
 Raising a deadline is a change to what the system promises, so it needs the same evidence as any other loosened tolerance: a measurement on an idle machine, a named phase, and a linked issue. "It timed out once" is an observation, not a measurement. And a run that fails then passes on retry is evidence of instability -- record it as such; never ship it as a green release.
 :::
 
-One generic example of what phase attribution turns up: a toolchain warm-up step keyed on a marker file under `TMPDIR` behaves perfectly on a developer machine, where the marker survives, and pathologically in hosting, where the documented ephemeral disk means the marker is absent on every fresh container -- so *every* hosted build pays the warm-up. The fix was to make the warm-up a no-op inside the image, not to raise the budget by the amount it cost.
+One example of what phase attribution turns up: a toolchain warm-up step keyed on a marker file under `TMPDIR` behaves perfectly on a developer machine, where the marker survives, and pathologically in hosting, where the documented ephemeral disk means the marker is absent on every fresh container -- so *every* hosted build pays the warm-up. The fix was to make the warm-up a no-op inside the image, not to raise the budget by the amount it cost.
 
 ## Bake Immutable Work, and Keep Its Authority Elsewhere
 
@@ -283,10 +283,9 @@ function assertPlainFileInside(root: string, candidate: string): void {
   if (!lstatSync(full).isFile()) throw new IntegrityError("symlink or special file");
 }
 
-// Canonical catalog: a fixed key set in a fixed order, no duplicates, and
-// re-serializing must reproduce the file byte for byte.
+// Canonical catalog: fixed key set, fixed order, no duplicates -- re-serializing
+// must reproduce the file byte for byte.
 if (JSON.stringify(catalog) + "\n" !== catalogBytes) throw new IntegrityError("non-canonical");
-
 // Collisions lose the race instead of overwriting: create with "wx", fsync,
 // link into place, unlink the temp. A second writer fails; it does not win.
 ```
