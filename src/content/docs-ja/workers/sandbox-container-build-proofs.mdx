@@ -44,7 +44,11 @@ export const BUILD_RUNTIME = {
 export class SandboxUnavailable extends Error {} // retryable -- NOT a build failure
 
 export async function runtimeHandshake(sandbox: Sandbox): Promise<void> {
-  const result = await sandbox.exec("node /opt/builder/report-runtime.mjs", { timeout: 30_000 });
+  // exec() throws on timeout and on transport loss -- it does not come back
+  // with an exitCode -- so that path is classified here too, not left raw.
+  const result = await sandbox
+    .exec("node /opt/builder/report-runtime.mjs", { timeout: 30_000 })
+    .catch(() => { throw new SandboxUnavailable("handshake transport failed"); });
   if (result.exitCode !== 0) throw new SandboxUnavailable("handshake did not run");
 
   const actual = JSON.parse(result.stdout) as { id: string; bakedAssetDigests: Record<string, string> };
@@ -73,13 +77,12 @@ await runtimeHandshake(sandbox);
 
 プロセスツリー全体を、ちょうどひとつの絶対デッドラインで囲む。計測はセットアップの前に開始し、その所有者はコンテナ内で root として動くスーパーバイザーにする。フェーズが遷移してもデッドラインはリセットしない。`setTimeout(remaining)` はひとつだけで、2 つ目のタイマーはどこにも置かない。タイムアウトした実行に計上される時間は、きっかりデッドラインぶんだ -- 最後の `SIGKILL` までの猶予期間は後始末であって、予算ではない。
 
-コンテナのエントリポイント*そのもの*をスーパーバイザーにする。そうすればビルドが起動したどのプロセスも、タイマーを所有するプロセスより長生きできない:
+Sandbox SDK の下では、イメージの `ENTRYPOINT` は sandbox バイナリのままにしておく -- ベースイメージがそれを設定しており、Cloudflare の [Dockerfile のガイド](https://developers.cloudflare.com/sandbox/configuration/dockerfile/)は上書きするなと言っている。そのバイナリこそが `exec()` の相手をする HTTP サーバーだからだ。したがってスーパーバイザーは Worker が exec するただひとつのコマンドであり、ビルドが起動するものはすべてその子孫になる。タイマーを所有するプロセスより長生きできるものはない。（`ENTRYPOINT` を自分で握れる素の Containers では、スーパーバイザーをエントリポイントそのものにしてもよい。）
 
-```bash
-#!/bin/sh
-# /opt/builder/entrypoint.sh
-set -eu
-exec node /opt/builder/supervisor.mjs "$@"
+```ts
+// Worker side -- the supervisor is the single exec'd process; the runner and
+// every tenant child are its descendants. The outer timeout is discussed below.
+const run = await sandbox.exec("node /opt/builder/supervisor.mjs", { timeout: DEADLINE_MS + 30_000 });
 ```
 
 ```js
@@ -107,7 +110,9 @@ setTimeout(() => {
   signalBuildUserPids("SIGSTOP");
   signalBuildUserPids("SIGTERM");
   signalBuildUserPids("SIGCONT");
-  setTimeout(() => signalBuildUserPids("SIGKILL"), GRACE_MS).unref();
+  // Not unref'd: the supervisor must outlive the grace period, or a tenant
+  // that traps SIGTERM is never killed.
+  setTimeout(() => signalBuildUserPids("SIGKILL"), GRACE_MS);
   writeEnvelope({ status: "timeout", reason: `wall-time-${currentPhase}`, totalMs: DEADLINE_MS });
 }, DEADLINE_MS - (Date.now() - startedAt));
 ```
@@ -127,9 +132,13 @@ Cloudflare のドキュメントによれば、[コマンドのタイムアウ�
 const emit = (line) => writeSync(3, line + "\n");
 emit("phase build");
 
-// Tenant children get stdout/stderr and nothing else: with no fd 3, no tenant
+// Tenant children get stdout/stderr and nothing else. Listing stdio slots is
+// not enough on Linux -- an inherited fd 3 without CLOEXEC is passed on to
+// grandchildren -- so close it explicitly before exec: with no fd 3, no tenant
 // process can forge a phase transition or a terminal line.
-const child = spawn(tenantCommand, tenantArgs, { stdio: ["ignore", "pipe", "pipe"] });
+const child = spawn("/bin/sh", ["-c", 'exec 3>&-; exec "$@"', "sh", tenantCommand, ...tenantArgs], {
+  stdio: ["ignore", "pipe", "pipe"],
+});
 emit(`group-open ${child.pid}`);
 ```
 
@@ -151,7 +160,7 @@ done <status> <discardedLogBytes> <workspaceBytes>
 
 解釈できない行、順序の狂ったフェーズ遷移、重複した終端行、対応の取れていない `group-close` は、いずれもプロトコル全体を無効にする。
 
-スーパーバイザーはその上で、テナントのワークスペースの**外**にある root 所有の `0400` のファイルへ、正規形のステータスエンベロープをひとつだけ書き出す -- 排他作成（`wx`）、root への `chown`、アトミックなリネームで書き、フィールドの集合は固定、それ以外は何も入れない:
+スーパーバイザーはその上で、テナントのワークスペースの**外**にある root 所有の `0400` のファイルへ、正規形のステータスエンベロープをひとつだけ書き出す -- 排他作成（`wx`）、root への `chown`、アトミックなリネームで書き、フィールドの集合は固定、それ以外は何も入れない。バイト列そのものが構成上正規形になるよう `JSON.stringify(envelope) + "\n"` として書く（下のブロックは読むための注釈付きで、実ファイルはコンパクトな 1 行だ）:
 
 ```jsonc
 // /var/lib/builder/status.json -- 0400 root:root, outside the workspace.
@@ -177,8 +186,10 @@ Worker はそれを厳格に読み直す。この厳格さこそが要点で、�
 function verify(raw: string, obs: Observed): Verdict {
   const doc = JSON.parse(raw);
   // Canonical bytes: re-serializing must reproduce the file exactly, which
-  // pins key order and rejects any field that was added on the way out.
+  // pins key order and whitespace. It does not catch an added field -- an extra
+  // key survives the round trip -- so the fixed key set is checked separately.
   if (JSON.stringify(doc) + "\n" !== raw) return platformLoss("non-canonical envelope");
+  if (Object.keys(doc).join(",") !== ENVELOPE_KEYS) return platformLoss("unexpected field set");
 
   const phases = Object.keys(doc.phaseMs);
   const after = phases.slice(phases.indexOf(doc.phase) + 1);
@@ -230,7 +241,7 @@ test("the module has no vocabulary for the package tree", () => {
 次に、ソースツリーではなく実際のイメージに対して同じことを証明し直す。ネットワークは切る。イメージに焼き込んであるはずのものを、何かが黙って取り直せないようにするためだ:
 
 ```bash
-docker run --rm --network none builder:2026-08a node /opt/builder/selftest.mjs
+docker run --rm --network none --entrypoint node builder:2026-08a /opt/builder/selftest.mjs
 ```
 
 :::note[タイムアウトの引き上げは許容範囲の緩和だ]
@@ -245,7 +256,9 @@ docker run --rm --network none builder:2026-08a node /opt/builder/selftest.mjs
 
 ```dockerfile
 # Dockerfile -- bake stage. The FROM is digest-pinned so the same tag cannot
-# become a different base image between two rollouts.
+# become a different base image between two rollouts. The runtime image that
+# ships this layer extends the Sandbox base image and leaves its ENTRYPOINT
+# (the sandbox binary) in place.
 FROM docker.io/library/node:22-bookworm-slim@sha256:<hex of the base image>
 
 COPY package.json package-lock.json /opt/builder/

@@ -44,7 +44,11 @@ export const BUILD_RUNTIME = {
 export class SandboxUnavailable extends Error {} // retryable -- NOT a build failure
 
 export async function runtimeHandshake(sandbox: Sandbox): Promise<void> {
-  const result = await sandbox.exec("node /opt/builder/report-runtime.mjs", { timeout: 30_000 });
+  // exec() throws on timeout and on transport loss -- it does not come back
+  // with an exitCode -- so that path is classified here too, not left raw.
+  const result = await sandbox
+    .exec("node /opt/builder/report-runtime.mjs", { timeout: 30_000 })
+    .catch(() => { throw new SandboxUnavailable("handshake transport failed"); });
   if (result.exitCode !== 0) throw new SandboxUnavailable("handshake did not run");
 
   const actual = JSON.parse(result.stdout) as { id: string; bakedAssetDigests: Record<string, string> };
@@ -73,13 +77,12 @@ Classify a failed handshake as **sandbox unavailable, retryable** -- a distinct 
 
 Put exactly one absolute deadline around the whole process tree, started before setup, owned by a root-owned supervisor inside the container. Phase transitions never reset it; there is one `setTimeout(remaining)` and no second timer anywhere. A run that times out is charged exactly the deadline -- the grace period before the final `SIGKILL` is cleanup, not budget.
 
-The container entrypoint *is* the supervisor, so nothing the build spawns can outlive the process that owns the timer:
+Under the Sandbox SDK the image's `ENTRYPOINT` stays the sandbox binary -- the base image sets it, and Cloudflare's [Dockerfile guidance](https://developers.cloudflare.com/sandbox/configuration/dockerfile/) says not to override it, because that binary is the HTTP server `exec()` talks to. So the supervisor is the one command the Worker execs, and everything the build spawns is its descendant; nothing can outlive the process that owns the timer. (On raw Containers, where you own the `ENTRYPOINT`, the supervisor can be the entrypoint itself.)
 
-```bash
-#!/bin/sh
-# /opt/builder/entrypoint.sh
-set -eu
-exec node /opt/builder/supervisor.mjs "$@"
+```ts
+// Worker side -- the supervisor is the single exec'd process; the runner and
+// every tenant child are its descendants. The outer timeout is discussed below.
+const run = await sandbox.exec("node /opt/builder/supervisor.mjs", { timeout: DEADLINE_MS + 30_000 });
 ```
 
 ```js
@@ -107,7 +110,9 @@ setTimeout(() => {
   signalBuildUserPids("SIGSTOP");
   signalBuildUserPids("SIGTERM");
   signalBuildUserPids("SIGCONT");
-  setTimeout(() => signalBuildUserPids("SIGKILL"), GRACE_MS).unref();
+  // Not unref'd: the supervisor must outlive the grace period, or a tenant
+  // that traps SIGTERM is never killed.
+  setTimeout(() => signalBuildUserPids("SIGKILL"), GRACE_MS);
   writeEnvelope({ status: "timeout", reason: `wall-time-${currentPhase}`, totalMs: DEADLINE_MS });
 }, DEADLINE_MS - (Date.now() - startedAt));
 ```
@@ -127,9 +132,13 @@ Build children get file descriptors 0-2 and nothing else. The trusted runner rep
 const emit = (line) => writeSync(3, line + "\n");
 emit("phase build");
 
-// Tenant children get stdout/stderr and nothing else: with no fd 3, no tenant
+// Tenant children get stdout/stderr and nothing else. Listing stdio slots is
+// not enough on Linux -- an inherited fd 3 without CLOEXEC is passed on to
+// grandchildren -- so close it explicitly before exec: with no fd 3, no tenant
 // process can forge a phase transition or a terminal line.
-const child = spawn(tenantCommand, tenantArgs, { stdio: ["ignore", "pipe", "pipe"] });
+const child = spawn("/bin/sh", ["-c", 'exec 3>&-; exec "$@"', "sh", tenantCommand, ...tenantArgs], {
+  stdio: ["ignore", "pipe", "pipe"],
+});
 emit(`group-open ${child.pid}`);
 ```
 
@@ -151,7 +160,7 @@ done <status> <discardedLogBytes> <workspaceBytes>
 
 Any unparsable line, out-of-order phase transition, duplicate terminal line, or unbalanced `group-close` makes the whole protocol invalid.
 
-The supervisor then writes one canonical status envelope to a root-owned `0400` file **outside** the tenant workspace -- exclusive-create (`wx`), `chown` to root, atomic rename -- with a fixed field set and nothing else:
+The supervisor then writes one canonical status envelope to a root-owned `0400` file **outside** the tenant workspace -- exclusive-create (`wx`), `chown` to root, atomic rename -- with a fixed field set and nothing else, written as `JSON.stringify(envelope) + "\n"` so the bytes are canonical by construction (the block below is annotated for reading; the file itself is one compact line):
 
 ```jsonc
 // /var/lib/builder/status.json -- 0400 root:root, outside the workspace.
@@ -177,8 +186,10 @@ The Worker re-parses that strictly, and the strictness is the point -- each chec
 function verify(raw: string, obs: Observed): Verdict {
   const doc = JSON.parse(raw);
   // Canonical bytes: re-serializing must reproduce the file exactly, which
-  // pins key order and rejects any field that was added on the way out.
+  // pins key order and whitespace. It does not catch an added field -- an extra
+  // key survives the round trip -- so the fixed key set is checked separately.
   if (JSON.stringify(doc) + "\n" !== raw) return platformLoss("non-canonical envelope");
+  if (Object.keys(doc).join(",") !== ENVELOPE_KEYS) return platformLoss("unexpected field set");
 
   const phases = Object.keys(doc.phaseMs);
   const after = phases.slice(phases.indexOf(doc.phase) + 1);
@@ -230,7 +241,7 @@ test("the module has no vocabulary for the package tree", () => {
 Then re-prove it against the real image rather than the source tree, with the network off so nothing can quietly refetch what the image was supposed to have baked:
 
 ```bash
-docker run --rm --network none builder:2026-08a node /opt/builder/selftest.mjs
+docker run --rm --network none --entrypoint node builder:2026-08a /opt/builder/selftest.mjs
 ```
 
 :::note[A timeout raise is a tolerance loosening]
@@ -245,7 +256,9 @@ Anything release-owned and lockfile-pinned -- toolchain install, asset or catalo
 
 ```dockerfile
 # Dockerfile -- bake stage. The FROM is digest-pinned so the same tag cannot
-# become a different base image between two rollouts.
+# become a different base image between two rollouts. The runtime image that
+# ships this layer extends the Sandbox base image and leaves its ENTRYPOINT
+# (the sandbox binary) in place.
 FROM docker.io/library/node:22-bookworm-slim@sha256:<hex of the base image>
 
 COPY package.json package-lock.json /opt/builder/
