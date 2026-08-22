@@ -1,0 +1,70 @@
+---
+title: Reliable Build Proofs on Sandbox and Containers
+sidebar_position: 12
+---
+
+Cloudflare Sandbox and Containers are useful for isolated builds, but a warm local run is not evidence that a fresh hosted container will meet its deadline.
+
+Sandbox state exists only while its container is active. After sleep, stop, or relocation, the next start uses a fresh filesystem from the image. Container cold-start time can also vary. Design build proofs around that lifecycle instead of relying on warmed temporary files or process state.
+
+See Cloudflare's [Sandbox lifecycle documentation](https://developers.cloudflare.com/sandbox/api/lifecycle/) and [Containers architecture documentation](https://developers.cloudflare.com/containers/platform-details/architecture/).
+
+## Separate three readiness layers
+
+Check these layers independently:
+
+1. Worker and binding readiness: the RPC target exists and accepts the request.
+2. Container compatibility: the active image reports the expected runtime, protocol, and asset authorities.
+3. Workload proof: a fresh isolated build completes and produces an accepted artifact.
+
+A healthy Worker does not prove that its Container image is compatible. Use an exact compatibility tuple, for example:
+
+```text
+worker contract + image runtime + status protocol + immutable asset digests
+```
+
+Reject stale or partially deployed combinations before accepting tenant work.
+
+## Use one trusted absolute deadline
+
+Put one absolute deadline around the complete build tree. Phase transitions must not reset it. A root-owned supervisor should own the timer and process cleanup, while the untrusted build process reports fixed phase transitions over a private inherited file descriptor.
+
+Do not classify failures from authored stdout, stderr, or chosen exit codes. Validate a canonical status envelope written outside the authored workspace. If it is absent or malformed, fail closed to a bounded platform-loss classification.
+
+Keep reason codes fixed and scrub-safe, such as:
+
+```text
+wall-time-check
+wall-time-build
+wall-time-stabilize
+wall-time-emit
+platform-loss
+```
+
+## Measure structural work before raising limits
+
+When a live build is slow, first identify the phase and count expensive operations. Look for duplicated compilers, repeated tree walks, cold extraction, recursive ownership changes, and work that can be baked into the image.
+
+Assert operation counts in tests—for example, one immutable bundle read, one digest, one copy, and no runtime traversal of installed package trees. Timing tests remain useful, but structural assertions are less sensitive to host variance.
+
+A pass on retry is evidence of instability, not proof that the limit is correct.
+
+## Bake immutable work with independent authority
+
+Move release-owned, lockfile-pinned work into the image when possible. At runtime, compare the baked bytes with an expected digest whose authority is stored independently from the asset itself.
+
+Fail closed on:
+
+- symlinks and special files;
+- unsafe or escaping paths;
+- unexpected catalog keys or ordering;
+- destination collisions;
+- stale image, protocol, or digest handshakes.
+
+Keep tenant-dependent values in inert data rather than generating new executable bytes when that improves policy stability.
+
+## Treat staging mutation as a transaction
+
+Before a diagnostic deployment, snapshot the exact Worker version percentages, image identity, routes, and fail-open behavior. After the proof, restore every field, read the state back, and probe that temporary hostnames and routes are hidden.
+
+Use an always-run recovery path. Report workload success, evidence completeness, and recovery success separately so a failed build can still leave trustworthy diagnostics and a clean platform state.
