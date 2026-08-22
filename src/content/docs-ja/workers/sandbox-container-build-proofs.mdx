@@ -1,70 +1,348 @@
 ---
 title: Sandbox と Containers で信頼できるビルド証明を行う
+description: 温まったローカル環境での実行は、ホスティング環境で新しく起動したコンテナが時間内に終わる証明にはならない -- 準備完了の 3 つのレイヤー、ただ 1 つの絶対デッドライン、テナントのコードには書けない証跡、上限を上げる前の構造的な操作回数、イメージに焼き込んだ正解の在り処、トランザクションとしてのステージング変更
 sidebar_position: 12
 ---
 
-Cloudflare Sandbox と Containers は分離されたビルドに有用ですが、warm なローカル実行だけでは、fresh hosted container が deadline 内に完了する証拠にはなりません。
+Cloudflare Sandbox と Containers は、信頼できないビルドを隔離して実行する用途によく合う。そして、よく合う理由はそのまま、正しさを証明しにくい理由でもある -- 実行のたびにまっさらなイメージから始まるからだ。温まったノート PC で 40 秒で終わり、ホスティング環境での最初の 3 回でも同じように終わったビルドが教えてくれたのは、分布の*速い*側の端でしかない。実際に守らなければならない予算は遅い側の端であり、ここまでの実行はそこを一度もサンプリングしていない。
 
-Sandbox の状態は container が active な間だけ存在します。sleep、stop、relocation の後は、image から fresh filesystem を使って起動します。Container の cold-start 時間にも揺らぎがあります。このライフサイクルを前提に build proof を設計し、warm 済みの一時ファイルや process state に依存しないでください。
+その散らばりを生むライフサイクルは Cloudflare 自身がドキュメント化している。Sandbox については[状態はコンテナがアクティブな間しか存在しない](https://developers.cloudflare.com/sandbox/concepts/sandboxes/) -- 無操作の時間（デフォルトは 10 分、`sleepAfter` で調整できる）が過ぎるとコンテナは停止し、次のリクエストが届いた時点で、それまでの状態をすべて失ったまっさらなコンテナが起動する。`destroy()` は同じことを任意のタイミングで行う。Containers については[ディスクはすべて一時的](https://developers.cloudflare.com/containers/platform-details/architecture/)だ -- スリープしたインスタンスはイメージが定義するまっさらなディスクで再起動し、コンテナは自分の Durable Object とは別のロケーションで起動することがあり、インスタンスが一度停止して再起動すると、リクエストは以前とは別のロケーションにルーティングされることがある。コールドスタートは「多くの場合 1〜3 秒の範囲」だが、イメージのサイズとエントリポイントの処理量に応じて伸びる。
 
-Cloudflare の [Sandbox lifecycle documentation](https://developers.cloudflare.com/sandbox/api/lifecycle/) と [Containers architecture documentation](https://developers.cloudflare.com/containers/platform-details/architecture/) も参照してください。
+したがってビルドの証明は、目の前で観察できる温まったケースではなく、コールドで、ロケーションが移り、イメージから作り直された実行を前提に設計しなければならない。このページのコードは `@next` の 1.0 プレビューではなく**安定版の Sandbox SDK** を対象にしており、どのブロックも動いているシステムの写しではなく、それ単体で完結する説明用のスケッチだ。Sandbox と Containers は Durable Object に支えられているので、この話のインスタンス同一性の側面については [Durable Objects](./durable-objects.mdx) が対になるページになる。
 
-## 3 つの readiness layer を分離する
+:::warning[数回のサンプルではコールド側の裾は分からない]
+あるパイプラインは、これを高くついたやり方で測ることになった。予算がおよそ 2 分のホスティング環境でのビルドが、ローカルの Docker では 40 秒ほどで通り、まっさらなステージングでの数回のサンプルでも 60 秒前後で通った -- 手元にあるどの数字で見ても十分な余裕だった。その後、同じ予算で走らせた新規の隔離実行が予算を超えた。続けて取った新規のコールド実行の一群は、*同じイメージ*でありながら、最速と最遅の間が 10 倍以上に広がった。これはひとつのワークロードに対するひとつのパイプラインの数字であって、プラットフォームの特性ではないし、キャパシティ計画の根拠にできるものでもない -- 持ち帰れるのは形のほうだ。遅かった事象は単一のホットスポットではなく複合的で、効いた対処は上限の引き上げではなく、フェーズの切り分けを鋭くすることだった。
+:::
 
-次の layer を個別に確認します。
+## 準備完了を 3 つのレイヤーに分ける
 
-1. Worker と binding の readiness: RPC target が存在し request を受理する
-2. Container compatibility: active image が期待する runtime、protocol、asset authority を報告する
-3. Workload proof: fresh isolated build が完了し、artifact が受理される
+「動いているか？」は実は 3 つの別々の問いであり、いちばん安く答えられる問いに答えても、残りの 2 つに答えたことにはならない。
 
-Worker が healthy でも、Container image の compatibility は証明されません。たとえば次の exact compatibility tuple を使います。
+**(a) Worker、Durable Object、バインディングの準備完了。** RPC の呼び出し先が応答する。ヘルスチェックが通常カバーしているのはこのレイヤーだけで、Worker のコードがデプロイされた瞬間に満たされる。
 
-```text
-worker contract + image runtime + status protocol + immutable asset digests
+**(b) コンテナの起動とイメージの互換性。** コンテナが実際に起動しており -- 単に起動を要求されただけではなく -- *かつ*、テナントのバイト列が一切配置される前に sandbox 内で走らせたハンドシェイクコマンドが、自分自身について証明できることを報告する。インストール済みツールチェーンのバージョン、内部プロトコルのバージョン、そして後で読むことになる焼き込み済みアセットすべてのダイジェストだ。その値の組を、Worker がソース中に持っている定数と突き合わせる。
+
+**(c) ワークロードの証明。** 新規の隔離されたビルドが完了し、その成果物が受理される。本当に訊きたかった問いに答えるのは、このレイヤーだけだ。
+
+レイヤー (b) が必要なのは、ドキュメント化された 2 つの事実があるからだ。Cloudflare の[ロールアウトのドキュメント](https://developers.cloudflare.com/containers/platform-details/rollouts/)には「デプロイの成功が意味するのはロールアウトが開始されたことであって、すべてのコンテナインスタンスの置き換えが完了したことではない」と書かれており、さらに、イメージが変わったとき、ロールアウトが完了するまでは新しい Worker のコードが前のイメージのコンテナインスタンスに到達しうる、とも書かれている（`immediate` モードはこの混在期間を短くはするが、なくしはしない）。もうひとつ、Sandbox SDK 自身が持つ npm パッケージとコンテナイメージの[バージョン互換性チェック](https://developers.cloudflare.com/sandbox/configuration/dockerfile/)は、不一致のときに*警告するだけ*だ。警告は処理を拒否しない。拒否するのは自分で書いたハンドシェイクの役目になる。
+
+```ts
+// worker/runtime.ts -- frozen constants owned by the Worker's source, not by
+// anything the image can rewrite. `id` pins Worker, image, and internal
+// protocol versions together as one value.
+export const BUILD_RUNTIME = {
+  image: "builder-2026-08a",
+  toolchain: { node: "22.14.0", bundler: "6.2.1" },
+  protocols: { status: 3, catalog: 2 },
+  bakedAssetDigests: {
+    catalog: "sha256:<hex of the baked catalog bytes>",
+    bundle: "sha256:<hex of the baked bundle>",
+  },
+  id: "rt-2026-08a.3.2",
+} as const;
+
+export class SandboxUnavailable extends Error {} // retryable -- NOT a build failure
+
+export async function runtimeHandshake(sandbox: Sandbox): Promise<void> {
+  const result = await sandbox.exec("node /opt/builder/report-runtime.mjs", { timeout: 30_000 });
+  if (result.exitCode !== 0) throw new SandboxUnavailable("handshake did not run");
+
+  const actual = JSON.parse(result.stdout) as { id: string; bakedAssetDigests: Record<string, string> };
+  // One joined id catches the common case; the field-by-field compare below it
+  // is what makes the failure legible in logs.
+  if (actual.id !== BUILD_RUNTIME.id) throw new SandboxUnavailable(`runtime ${actual.id}`);
+  for (const [name, want] of Object.entries(BUILD_RUNTIME.bakedAssetDigests)) {
+    if (actual.bakedAssetDigests[name] !== want) throw new SandboxUnavailable(`digest ${name}`);
+  }
+}
 ```
 
-stale または部分的に deploy された組み合わせは、tenant work を受理する前に拒否します。
+同じピン留めは、より早く、より安く済む場所 -- Workflow の入口 -- でもう一度チェックする。デプロイされた環境変数が、その Worker がビルド時に取り込んだ定数と食い違っているなら、コンテナには何ひとつ届かせるべきではない:
 
-## 信頼できる単一の absolute deadline を使う
-
-build tree 全体を 1 つの absolute deadline で囲みます。phase transition で deadline を reset してはいけません。root-owned supervisor が timer と process cleanup を所有し、untrusted build process は private inherited file descriptor を通じて固定 phase transition を報告します。
-
-authored stdout、stderr、選択された exit code から failure を分類しないでください。authored workspace の外部に書かれた canonical status envelope を検証します。欠落または malformed の場合は、限定された platform-loss classification へ fail closed します。
-
-reason code は固定かつ scrub-safe にします。
-
-```text
-wall-time-check
-wall-time-build
-wall-time-stabilize
-wall-time-emit
-platform-loss
+```ts
+// workflow entry -- refuse before spending a container start.
+if (env.BUILD_RUNTIME_ID !== BUILD_RUNTIME.id) {
+  throw new SandboxUnavailable("worker/runtime version pin mismatch");
+}
+await runtimeHandshake(sandbox);
 ```
 
-## limit を上げる前に構造的な work を測る
+ハンドシェイクの失敗は、**sandbox 利用不可、リトライ可能**として分類する -- **ビルドの失敗**とは別の結果だ。この 2 つを一緒くたにすると、ダッシュボードを見る全員が「ビルドの失敗は不安定なだけのもの」と学習してしまう。学んでほしいことの正反対だ。
 
-live build が遅い場合は、まず phase を特定し、高コストな operation を数えます。compiler の重複、tree walk の反復、cold extraction、recursive ownership change、image に bake できる work を探します。
+## 信頼できる絶対デッドラインをひとつだけ置く
 
-たとえば immutable bundle の read 1 回、digest 1 回、copy 1 回、installed package tree の runtime traversal なし、といった operation count をテストで検証します。timing test も有用ですが、構造的 assertion は host variance の影響を受けにくいです。
+プロセスツリー全体を、ちょうどひとつの絶対デッドラインで囲む。計測はセットアップの前に開始し、その所有者はコンテナ内で root として動くスーパーバイザーにする。フェーズが遷移してもデッドラインはリセットしない。`setTimeout(remaining)` はひとつだけで、2 つ目のタイマーはどこにも置かない。タイムアウトした実行に計上される時間は、きっかりデッドラインぶんだ -- 最後の `SIGKILL` までの猶予期間は後始末であって、予算ではない。
 
-retry 後の成功は instability の evidence であり、limit が正しいことの証明ではありません。
+コンテナのエントリポイント*そのもの*をスーパーバイザーにする。そうすればビルドが起動したどのプロセスも、タイマーを所有するプロセスより長生きできない:
 
-## immutable work を独立した authority とともに bake する
+```bash
+#!/bin/sh
+# /opt/builder/entrypoint.sh
+set -eu
+exec node /opt/builder/supervisor.mjs "$@"
+```
 
-可能なら release-owned かつ lockfile-pinned な work を image に移します。runtime では baked bytes を、asset 自身とは独立して保存された expected digest と比較します。
+```js
+// /opt/builder/supervisor.mjs -- root-owned. Spawns the trusted runner as an
+// unprivileged build user in its own process group, and owns the only clock.
+import { spawn } from "node:child_process";
 
-次の場合は fail closed にします。
+const DEADLINE_MS = 120_000;
+const GRACE_MS = 3_000;
+const startedAt = Date.now();
+const runner = spawn(
+  "/usr/bin/setpriv",
+  ["--reuid=builder", "--regid=builder", "--clear-groups", "node", "/opt/builder/runner.mjs"],
+  {
+    detached: true, // its own process group -- signal the group, not one pid
+    stdio: ["ignore", "ignore", "ignore", "pipe"], // fd 3 only, see below
+  },
+);
 
-- symlink と special file
-- unsafe または escape する path
-- 予期しない catalog key や ordering
-- destination collision
-- stale image、protocol、digest handshake
+setTimeout(() => {
+  // SIGSTOP first so nothing can fork while we enumerate; a second /proc scan
+  // narrows the fork race. SIGCONT is required -- a stopped process cannot act
+  // on SIGTERM.
+  signalBuildUserPids("SIGSTOP");
+  signalBuildUserPids("SIGSTOP");
+  signalBuildUserPids("SIGTERM");
+  signalBuildUserPids("SIGCONT");
+  setTimeout(() => signalBuildUserPids("SIGKILL"), GRACE_MS).unref();
+  writeEnvelope({ status: "timeout", reason: `wall-time-${currentPhase}`, totalMs: DEADLINE_MS });
+}, DEADLINE_MS - (Date.now() - startedAt));
+```
 
-policy stability の改善につながる場合は、tenant-dependent value を新しい executable bytes にせず inert data に保持します。
+Worker 側にある外側の `sandbox.exec` のタイムアウトは、この内側のデッドラインより意図的に*長く*設定する。これは余裕を持たせているのではなく、誰が判断してよいかについてのルールだ。
 
-## staging mutation を transaction として扱う
+:::warning[SDK のコマンドタイムアウトはコンテナ内の何も止めない]
+Cloudflare のドキュメントによれば、[コマンドのタイムアウト](https://developers.cloudflare.com/sandbox/api/commands/#timeout-behavior)時に SDK は呼び出し側で例外を投げて接続を閉じるが、「その裏にあるプロセスはコンテナ内で動き続ける」。ドキュメントに書かれた後始末の経路は `deleteSession()` か `destroy()` で、`killProcess()` が効くのは `startProcess()` から返ってきたプロセス ID に対してだけだ。つまり通信路のほうが短い時計になっていると、あきらめた Worker と、あきらめていないコンテナが残り、どちらについてもフェーズの切り分けができない -- 判断を下す側が通信路になることは、決してあってはならない。
+:::
 
-diagnostic deployment の前に、正確な Worker version percentage、image identity、route、fail-open behavior を snapshot します。proof の後はすべての field を復元し、state を read back し、一時的な hostname と route が hidden であることを probe します。
+## テナントのコードには書けない証跡
 
-always-run recovery path を使います。workload success、evidence completeness、recovery success を別々に報告することで、build が失敗しても信頼できる diagnostics と clean な platform state を残せます。
+ビルドの子プロセスに渡すファイルディスクリプタは 0〜2 だけで、それ以外は渡さない。信頼できるランナーは、継承した **fd 3** のパイプへ `writeSync(3, line)` で書くことで、フェーズの遷移をスーパーバイザーへ報告する。スーパーバイザーは fd 3 をランナーにだけ渡し、ランナーはテナントの子プロセスを fd 3 なしで起動する -- これが仕組みのすべてなので、その両側をはっきり書いておく価値がある:
+
+```js
+// /opt/builder/runner.mjs -- trusted, holds fd 3.
+const emit = (line) => writeSync(3, line + "\n");
+emit("phase build");
+
+// Tenant children get stdout/stderr and nothing else: with no fd 3, no tenant
+// process can forge a phase transition or a terminal line.
+const child = spawn(tenantCommand, tenantArgs, { stdio: ["ignore", "pipe", "pipe"] });
+emit(`group-open ${child.pid}`);
+```
+
+このチャネルの文法は意図的に極小で、その終端行はタイムアウトを表現できない:
+
+```txt
+# fd 3 grammar. Newline-framed; total protocol bytes capped (a runner that
+# floods the channel is a protocol violation, not a slow build).
+phase <name>                 # name in: check | build | stabilize | emit
+group-open <pid>
+group-close <pid>
+done <status> <discardedLogBytes> <workspaceBytes>
+
+# Terminal line, matched anchored:
+^done (ok|integrity|error) ([0-9]{1,12}) ([0-9]{1,12})$
+#          ^-- "timeout" is absent by construction: the untrusted side has no
+#              vocabulary for declaring that it ran out of time.
+```
+
+解釈できない行、順序の狂ったフェーズ遷移、重複した終端行、対応の取れていない `group-close` は、いずれもプロトコル全体を無効にする。
+
+スーパーバイザーはその上で、テナントのワークスペースの**外**にある root 所有の `0400` のファイルへ、正規形のステータスエンベロープをひとつだけ書き出す -- 排他作成（`wx`）、root への `chown`、アトミックなリネームで書き、フィールドの集合は固定、それ以外は何も入れない:
+
+```jsonc
+// /var/lib/builder/status.json -- 0400 root:root, outside the workspace.
+// No ids, no paths, no hashes, no authored strings: scrub-safe by construction
+// rather than by a scrubber that has to keep up with new fields.
+{
+  "contract": "build-status",
+  "version": 3,
+  "phase": "build",
+  "status": "timeout",
+  "reason": "wall-time-build",
+  "phaseMs": { "check": 1200, "build": 118800, "stabilize": 0, "emit": 0 },
+  "totalMs": 120000,
+  "discardedLogBytes": 41230,
+  "workspaceBytes": 9184300
+}
+```
+
+Worker はそれを厳格に読み直す。この厳格さこそが要点で、以下の各チェックは、乗っ取られた、あるいは単にバグのあるランナーが「それらしい成功」を作り出す具体的な手口を、ひとつずつ潰している:
+
+```ts
+// worker/verify.ts -- returns a verdict, never a boolean; "unknown" is a first-class outcome.
+function verify(raw: string, obs: Observed): Verdict {
+  const doc = JSON.parse(raw);
+  // Canonical bytes: re-serializing must reproduce the file exactly, which
+  // pins key order and rejects any field that was added on the way out.
+  if (JSON.stringify(doc) + "\n" !== raw) return platformLoss("non-canonical envelope");
+
+  const phases = Object.keys(doc.phaseMs);
+  const after = phases.slice(phases.indexOf(doc.phase) + 1);
+  if (after.some((p) => doc.phaseMs[p] !== 0)) return platformLoss("timing after reported phase");
+  if (sumValues(doc.phaseMs) !== doc.totalMs || doc.totalMs > DEADLINE_MS) return platformLoss("budget");
+  if (EXIT_FOR_STATUS[doc.status] !== obs.exitCode) return platformLoss("exit/status disagree");
+  // The reason must be legal for BOTH the status and the phase it names.
+  if (!REASONS_FOR[doc.status][doc.phase]?.includes(doc.reason)) return platformLoss("bad reason");
+
+  if (obs.survivorPids > 0) return platformLoss("survivors after terminal line");
+  if (obs.partialLine || obs.timerFired) return timedOut(`wall-time-${doc.phase}`);
+  return { kind: doc.status, reason: doc.reason };
+}
+```
+
+この連鎖が表しているルールはひとつだ。**フェイルクローズとは、不明な結果をプラットフォームのせいにしてリトライすることであって、決してグリーンにすることではない。** 理由コードは固定で、フェーズに紐づけたままにする（`wall-time-check`、`wall-time-build`、`wall-time-stabilize`、`wall-time-emit`、それに `platform-loss`）。名前を付けられないフェーズは直せないからだ。
+
+## 上限を上げる前に構造的な処理量を数える
+
+ビルドが遅いとき、役に立つ問いは「どのフェーズが、何を、いくつ処理しているのか」だ。ビルドごとのステップに `onOperation(kind, path)` という継ぎ目を通し -- `read | digest | copy | write | list` -- その回数をアサートする。構造的なアサーションは、負荷のかかった CI ランナー上でも成立する。壁時計時間のアサーションはそうはいかない:
+
+```ts
+// src/build-step.test.ts
+import { readFileSync } from "node:fs";
+import { expect, test } from "vitest";
+import { runBuildStep } from "./build-step";
+
+test("each baked input is touched exactly once, and the package tree never is", async () => {
+  const ops: Array<{ kind: string; path: string }> = [];
+  await runBuildStep({ onOperation: (kind, path) => ops.push({ kind, path }) });
+
+  const baked = ops.filter((o) => o.kind === "read" && o.path.startsWith("/opt/builder/"));
+  expect(baked.map((o) => o.path).sort()).toEqual(BAKED_INPUTS); // one read each, no repeats
+  expect(ops.filter((o) => o.kind === "digest")).toHaveLength(1);
+  expect(ops.filter((o) => o.kind === "copy")).toHaveLength(1);
+  for (const op of ops) {
+    if (op.kind === "read" && op.path.startsWith("out/")) expect(op.path).toMatch(/\.html$/);
+    expect(op.path).not.toContain("node_modules");
+  }
+});
+
+// The count assertion proves it did not walk the package tree on this run; this
+// proves it cannot -- the path literal is not in the module at all.
+test("the module has no vocabulary for the package tree", () => {
+  expect(readFileSync("src/build-step.ts", "utf8")).not.toContain("node_modules");
+});
+```
+
+次に、ソースツリーではなく実際のイメージに対して同じことを証明し直す。ネットワークは切る。イメージに焼き込んであるはずのものを、何かが黙って取り直せないようにするためだ:
+
+```bash
+docker run --rm --network none builder:2026-08a node /opt/builder/selftest.mjs
+```
+
+:::note[タイムアウトの引き上げは許容範囲の緩和だ]
+デッドラインを引き上げるのは、システムが約束している内容を変えることだ。だから他のあらゆる許容範囲の緩和と同じだけの根拠がいる -- アイドル状態のマシンでの計測、名前の付いたフェーズ、そして紐づいた issue だ。「一度タイムアウトした」は観察であって計測ではない。そして、失敗した後にリトライで通った実行は不安定さの証拠だ -- そのように記録すること。決してグリーンなリリースとして出荷してはいけない。
+:::
+
+フェーズの切り分けが何を掘り当てるかの一例。`TMPDIR` 配下のマーカーファイルを目印にしたツールチェーンのウォームアップ処理は、マーカーが残り続ける開発マシンでは完璧に振る舞い、ホスティング環境では病的に振る舞う。ドキュメント化されたとおりディスクは一時的なので、まっさらなコンテナのたびにマーカーが存在しないからだ -- つまりホスティング環境の*すべての*ビルドがウォームアップの代金を払う。効いた対処は、イメージの中でウォームアップを何もしない処理にすることであって、かかった時間のぶんだけ予算を増やすことではなかった。
+
+## 不変な処理はイメージに焼き込み、その正解は別の場所に置く
+
+リリース側が所有し、ロックファイルでピン留めされているもの -- ツールチェーンのインストール、アセットやカタログの焼き込み -- はイメージに属する。一度だけ実行し、その後は読み取り専用・root 所有で凍結する。アーキテクチャのドキュメントにある「ディスクは一時的」というルールが、それ以外の選択肢を成立しなくしている。実行時にコンテナのディスクへ書いた成果は再起動をまたいで残らないので、「初回だけキャッシュする」は黙って「毎回やる」の意味になる。
+
+```dockerfile
+# Dockerfile -- bake stage. The FROM is digest-pinned so the same tag cannot
+# become a different base image between two rollouts.
+FROM docker.io/library/node:22-bookworm-slim@sha256:<hex of the base image>
+
+COPY package.json package-lock.json /opt/builder/
+RUN npm ci --omit=dev --prefix /opt/builder
+
+COPY tools/bake-catalog.mjs /opt/builder/
+RUN node /opt/builder/bake-catalog.mjs /opt/builder/assets \
+ && chown -R root:root /opt/builder \
+ && find /opt/builder -type d -exec chmod 0555 {} + \
+ && find /opt/builder -type f -exec chmod 0444 {} +
+```
+
+ここでいう「正解の在り処（authority）」とは、期待されるダイジェストが置かれている先が、手で編集しバージョン管理されたモジュールであり、それが**生成物ではなく**、しかも**記述する対象のアセットの隣にも置かれていない**、ということだ。カタログのハッシュがカタログの隣に置かれていたら、両方を差し替えるだけで新しいバイト列が承認されてしまう -- ダイジェストが防ぐはずだった攻撃そのものだ:
+
+```ts
+// src/asset-authority.ts -- hand-edited. Changing a baked asset requires a
+// reviewed edit here; there is no generator that would update it for you.
+export const ASSET_AUTHORITY = {
+  contract: "asset-catalog",
+  version: 2,
+  catalogHash: "sha256:<hex of the canonical catalog bytes>",
+  bundleHash: "sha256:<hex of the bundle>",
+  count: 128,
+} as const;
+```
+
+これとの照合は 3 か所で行う。焼き込み時（不一致なら書き込みを拒否する）、ランタイムのハンドシェイク時（焼き込まれたバイト列の sha256 と、Worker が渡してくる値の突き合わせ）、そしてビルドごとに、出力を書き換える前だ。次のすべてでフェイルクローズする -- ソースツリーや出力ツリーのどこかにあるシンボリックリンクや特殊ファイル、ルートの外へ抜け出すパス、正規形でないカタログのバイト列、そして書き込み先の衝突:
+
+```ts
+// Every check is "prove it is the boring case," never "detect the bad case."
+function assertPlainFileInside(root: string, candidate: string): void {
+  const full = resolve(root, candidate);
+  if (full !== root && !full.startsWith(root + "/")) throw new IntegrityError("escaping path");
+  // lstat, not stat: stat follows the symlink and validates the target instead.
+  if (!lstatSync(full).isFile()) throw new IntegrityError("symlink or special file");
+}
+
+// Canonical catalog: fixed key set, fixed order, no duplicates -- re-serializing
+// must reproduce the file byte for byte.
+if (JSON.stringify(catalog) + "\n" !== catalogBytes) throw new IntegrityError("non-canonical");
+// Collisions lose the race instead of overwriting: create with "wx", fsync,
+// link into place, unlink the temp. A second writer fails; it does not win.
+```
+
+出力ツリーのファイルは、どれかを書き換える*前*にすべて検証する。そうすれば途中での失敗が、中途半端に確定したツリーを残すことはない。テナント由来の値は不活性なデータのまま保つ -- 生成したスクリプトではなく `data-*` 属性にする -- ことで、ビルドごとの値が新しい実行可能なバイト列になることを防ぐ。そしてハンドシェイクの時点で古いイメージ、プロトコル、ダイジェストが出てきた場合は、ビルドの失敗ではなく**リトライ可能な sandbox 利用不可**として扱う。準備完了のセクションと同じ区別だが、いちばん効いてくるのはここだ。ロールアウト途中の混在期間が、最もありそうな原因になる。
+
+## ステージングへの変更をトランザクションとして扱う
+
+ステージングに対してビルドを証明するというのは、たいていステージングを書き換えることを意味する -- 一時的なファサード、ルート、バージョンなどだ。それを元に戻すための根拠は、何かに触れる*前*に取得しておく。Cloudflare の [Wrangler コマンドリファレンス](https://developers.cloudflare.com/workers/wrangler/commands/workers/)には、現在有効なデプロイのバージョン別トラフィック配分を得る `wrangler deployments status --json` と、バージョンの一覧を得る `wrangler versions list --json` が載っている。影響を受ける Worker ごとにこの両方を、イメージの同一性とルートと合わせて、機微な情報を除いた証跡として取得する。トークンは決して含めない。
+
+前提条件は厳しい。**ちょうど 1 つのバージョンが 100%** であることだ。トラフィックが分割されている、あるいは段階的ロールアウトが進行中である場合は、警告ではなく即時中止にする -- 戻し先となる単一のバージョンが存在しない以上、いま取得したロールバックの根拠は絵に描いた餅でしかない。
+
+```yml
+# .github/workflows/build-proof.yml
+- name: Capture rollback authority
+  run: |
+    npx wrangler deployments status --json > evidence/deployment.json
+    npx wrangler versions list --json      > evidence/versions.json
+    node tools/staging.mjs assert-single-version   # split rollout => exit 1
+
+- name: Apply temporary facade
+  run: node tools/staging.mjs apply
+
+- name: Run the build proof
+  run: node tools/staging.mjs proof
+
+- name: Restore staging
+  if: always()
+  run: |
+    node tools/staging.mjs restore          # idempotent: a repeat is harmless
+    node tools/staging.mjs verify-restored  # reads the live state back
+    # On failure, print the secret-free command an operator can run by hand.
+```
+
+このステップの中で重みの大半を担っているのは 2 点だ。`restore` は冪等なので、途中で終わった前回の試行の後に実行しても安全だ。`verify-restored` は restore コマンドの終了コードを信用せず、**現在の状態を読み戻す**。そして `always()` はベストエフォートでしかない -- ランナーごと失われれば丸ごとスキップされる -- ため、運用者が手で実行できる帯域外の復旧経路は、付け足しではなく設計の一部だ。これが組み込まれる先の、プレビューを散らかさないための一連のパターンについては [Workers PR プレビュー](../cicd/workers-pr-previews.mdx)を参照。
+
+リトライは多くても 1 回まで。しかも次の 3 つがすべて成り立つときだけだ。失敗した実行が*信頼できる*リトライ可能なビルダーの結果を報告していること、一時的なファサードが削除済みだと確認できていること、そして後片付けが完了していること。復旧させた状態は、2 回目の試行がアトミックに置き換えるまでそのまま残しておく。
+
+判定は 3 つの独立したフィールドとして報告する。これらは独立に失敗するからだ:
+
+```jsonc
+// evidence/verdict.json -- workload, evidence, and recovery are orthogonal.
+// A cancelled run produces none of them: the answer is unknown, not fine.
+{
+  // What the build did.
+  "workload": { "failureKind": "timeout" }, // none | timeout | integrity | other
+  // Whether we can believe the above: "passed" means zero validation issues.
+  "evidence": { "terminalState": "failed" },
+  // Whether staging is back the way we found it.
+  "recovery": { "attempted": true, "complete": true }
+}
+```
+
+このドキュメントの中身はすべて閉じた列挙型だ。内部の結果はスクラバーを通すのではなく、外に出ていく途中で列挙型と DTO に射影する。ツールの stdout / stderr は丸ごと捨てる -- それは誰かが書いた外部のテキストであり、書かれたテキストの先回りをし続けられるスクラバーは存在しないからだ。アップロードされる証跡まで生き残るのは列挙型のメンバーだけで、このページの前半に出てきたステータスエンベロープがパスではなくカウンターを持っているのも、同じ理由による。当然ながら、ここまでの話はどれもローカルでは再現しない -- ホスティング環境での実行のうち `wrangler dev` で見えるのはどの部分なのかは、それ自体がひとつの主題で、[ローカル開発: バインディング対応表](./local-dev-bindings.mdx)で扱っている。
+
+## 最適化の前に切り分けを
+
+このページのルールはどれも、別の服を着た同じひとつのルールだ -- 予算を変える前にフェーズに名前を付けること。切り分けの結果が複合的なとき、あるいは単に不明なとき、次に取るべき正しい一手は切り分けをもう一段良くすることだ。タイムアウトを引き上げることでも、当て推量のキャッシュを足すことでも、遅い経路が実行されなくなるように毎回作り直す処理を弱めることでもない。どれをやっても、次に遅かった実行は今回よりも説明しにくくなる。進歩の正反対だ。
+
+関連ページ: Sandbox と Containers の背後にあるインスタンス同一性については [Durable Objects](./durable-objects.mdx)、ローカルでエミュレートされるもの・されないものについては[ローカル開発: バインディング対応表](./local-dev-bindings.mdx)、プレビューとステージングの後片付けについては [Workers PR プレビュー](../cicd/workers-pr-previews.mdx)。
