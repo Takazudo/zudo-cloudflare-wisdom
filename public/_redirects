@@ -1,0 +1,6 @@
+# workers/cache-api.mdx was renamed to workers-cache.mdx -- the page covers
+# Workers Cache (ctx.cache), not the Cache API (caches.default).
+/docs/workers/cache-api/ /docs/workers/workers-cache/ 301
+/docs/workers/cache-api /docs/workers/workers-cache/ 301
+/ja/docs/workers/cache-api/ /ja/docs/workers/workers-cache/ 301
+/ja/docs/workers/cache-api /ja/docs/workers/workers-cache/ 301
