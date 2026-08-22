@@ -1,0 +1,361 @@
+---
+title: Reliable Build Proofs on Sandbox and Containers
+description: Why a warm local run is not proof that a fresh hosted container finishes in time -- three readiness layers, one absolute deadline, evidence tenant code cannot write, structural op counts before higher limits, baked image authority, and staging mutation as a transaction
+sidebar_position: 12
+---
+
+Cloudflare Sandbox and Containers are a good fit for running an untrusted build in isolation, and the reason they fit is the same reason they are hard to prove correct: every run starts from a clean image. A build that finishes in 40 seconds on a warm laptop, and again on the first three hosted runs, has told you the *fast* end of a distribution. The budget you actually have to defend is the slow end, and nothing you have run so far has sampled it.
+
+Cloudflare documents the lifecycle that produces that spread. For Sandbox, [state exists only while the container is active](https://developers.cloudflare.com/sandbox/concepts/sandboxes/): after an inactivity window (10 minutes by default, tunable with `sleepAfter`) the container stops, and when the next request arrives a fresh container starts with all previous state lost -- `destroy()` does the same thing on demand. For Containers, [all disk is ephemeral](https://developers.cloudflare.com/containers/platform-details/architecture/): a sleeping instance restarts with a fresh disk as defined by its image, a container may start in a different location than its Durable Object, and once an instance stops and restarts, requests may route to a different location than before. Cold starts are "often in the 1-3 second range" but scale with image size and entrypoint work.
+
+So a build proof has to be designed against cold, relocated, freshly-imaged execution, not against the warm case you can watch. The code on this page targets the **stable Sandbox SDK**, not the `@next` 1.0 preview, and every block is an illustrative self-contained sketch rather than a copy of a working system. Sandbox and Containers are Durable Object-backed, so [Durable Objects](./durable-objects.mdx) is the companion page for the instance-identity half of this.
+
+:::warning[A handful of samples does not describe a cold tail]
+One pipeline measured this the expensive way. A hosted build with a budget of about two minutes cleared local Docker in roughly 40 seconds, and cleared a few fresh staging samples around 60 -- comfortable margin, by every number anyone had. Later fresh isolated runs on that same budget went over it. A subsequent batch of fresh cold runs, on the *same image*, spread more than 10x between the fastest and the slowest. Those are one pipeline's numbers on one workload, not a platform characteristic and not something to plan capacity against -- the transferable part is the shape: the slow event was compound rather than one hotspot, and the fix was sharper phase attribution, not a higher ceiling.
+:::
+
+## Separate Three Readiness Layers
+
+"Is it up?" is three different questions, and answering the cheap one does not answer the other two.
+
+**(a) Worker, Durable Object, and binding readiness.** The RPC target answers. This is the only layer a health check usually covers, and it is satisfied the instant your Worker code deploys.
+
+**(b) Container startup and image compatibility.** The container has actually started -- not merely been requested -- *and* a handshake command run inside the sandbox, before any tenant bytes are staged, reports what it can prove about itself: installed toolchain versions, internal protocol versions, and digests of every baked asset it will later read. Compare that tuple against constants the Worker owns in source.
+
+**(c) Workload proof.** A fresh isolated build completes and its artifact is accepted. Only this layer answers the question you actually asked.
+
+Layer (b) exists because of two documented facts. Cloudflare's [rollouts documentation](https://developers.cloudflare.com/containers/platform-details/rollouts/) states that "Deploy success means the rollout started, not that every container instance has finished replacing," and that when the image changes, new Worker code can still reach container instances on the previous image until the rollout finishes (`immediate` mode shortens that mixed window but does not remove it). And the Sandbox SDK's own [version-compatibility check](https://developers.cloudflare.com/sandbox/configuration/dockerfile/) between the npm package and the container image only *warns* on mismatch. A warning does not refuse work; your handshake has to.
+
+```ts
+// worker/runtime.ts -- frozen constants owned by the Worker's source, not by
+// anything the image can rewrite. `id` pins Worker, image, and internal
+// protocol versions together as one value.
+export const BUILD_RUNTIME = {
+  image: "builder-2026-08a",
+  toolchain: { node: "22.14.0", bundler: "6.2.1" },
+  protocols: { status: 3, catalog: 2 },
+  bakedAssetDigests: {
+    catalog: "sha256:<hex of the baked catalog bytes>",
+    bundle: "sha256:<hex of the baked bundle>",
+  },
+  id: "rt-2026-08a.3.2",
+} as const;
+
+export class SandboxUnavailable extends Error {} // retryable -- NOT a build failure
+
+export async function runtimeHandshake(sandbox: Sandbox): Promise<void> {
+  // exec() throws on timeout and on transport loss -- it does not come back
+  // with an exitCode -- so that path is classified here too, not left raw.
+  const result = await sandbox
+    .exec("node /opt/builder/report-runtime.mjs", { timeout: 30_000 })
+    .catch(() => { throw new SandboxUnavailable("handshake transport failed"); });
+  if (result.exitCode !== 0) throw new SandboxUnavailable("handshake did not run");
+
+  const actual = JSON.parse(result.stdout) as { id: string; bakedAssetDigests: Record<string, string> };
+  // One joined id catches the common case; the field-by-field compare below it
+  // is what makes the failure legible in logs.
+  if (actual.id !== BUILD_RUNTIME.id) throw new SandboxUnavailable(`runtime ${actual.id}`);
+  for (const [name, want] of Object.entries(BUILD_RUNTIME.bakedAssetDigests)) {
+    if (actual.bakedAssetDigests[name] !== want) throw new SandboxUnavailable(`digest ${name}`);
+  }
+}
+```
+
+The same pin is checked once more, earlier and cheaper, at the Workflow's entry -- if the deployed environment variable disagrees with the constant the Worker was built from, nothing should reach a container at all:
+
+```ts
+// workflow entry -- refuse before spending a container start.
+if (env.BUILD_RUNTIME_ID !== BUILD_RUNTIME.id) {
+  throw new SandboxUnavailable("worker/runtime version pin mismatch");
+}
+await runtimeHandshake(sandbox);
+```
+
+Classify a failed handshake as **sandbox unavailable, retryable** -- a distinct outcome from **build failed**. Collapsing the two teaches everyone reading the dashboard that build failures are flaky, which is the opposite of what you want them to learn.
+
+## One Trusted Absolute Deadline
+
+Put exactly one absolute deadline around the whole process tree, started before setup, owned by a root-owned supervisor inside the container. Phase transitions never reset it; there is one `setTimeout(remaining)` and no second timer anywhere. A run that times out is charged exactly the deadline -- the grace period before the final `SIGKILL` is cleanup, not budget.
+
+Under the Sandbox SDK the image's `ENTRYPOINT` stays the sandbox binary -- the base image sets it, and Cloudflare's [Dockerfile guidance](https://developers.cloudflare.com/sandbox/configuration/dockerfile/) says not to override it, because that binary is the HTTP server `exec()` talks to. So the supervisor is the one command the Worker execs, and everything the build spawns is its descendant; nothing can outlive the process that owns the timer. (On raw Containers, where you own the `ENTRYPOINT`, the supervisor can be the entrypoint itself.)
+
+```ts
+// Worker side -- the supervisor is the single exec'd process; the runner and
+// every tenant child are its descendants. The outer timeout is discussed below.
+const run = await sandbox.exec("node /opt/builder/supervisor.mjs", { timeout: DEADLINE_MS + 30_000 });
+```
+
+```js
+// /opt/builder/supervisor.mjs -- root-owned. Spawns the trusted runner as an
+// unprivileged build user in its own process group, and owns the only clock.
+import { spawn } from "node:child_process";
+
+const DEADLINE_MS = 120_000;
+const GRACE_MS = 3_000;
+const startedAt = Date.now();
+const runner = spawn(
+  "/usr/bin/setpriv",
+  ["--reuid=builder", "--regid=builder", "--clear-groups", "node", "/opt/builder/runner.mjs"],
+  {
+    detached: true, // its own process group -- signal the group, not one pid
+    stdio: ["ignore", "ignore", "ignore", "pipe"], // fd 3 only, see below
+  },
+);
+
+setTimeout(() => {
+  // SIGSTOP first so nothing can fork while we enumerate; a second /proc scan
+  // narrows the fork race. SIGCONT is required -- a stopped process cannot act
+  // on SIGTERM.
+  signalBuildUserPids("SIGSTOP");
+  signalBuildUserPids("SIGSTOP");
+  signalBuildUserPids("SIGTERM");
+  signalBuildUserPids("SIGCONT");
+  // Not unref'd: the supervisor must outlive the grace period, or a tenant
+  // that traps SIGTERM is never killed.
+  setTimeout(() => signalBuildUserPids("SIGKILL"), GRACE_MS);
+  writeEnvelope({ status: "timeout", reason: `wall-time-${currentPhase}`, totalMs: DEADLINE_MS });
+}, DEADLINE_MS - (Date.now() - startedAt));
+```
+
+The Worker's outer `sandbox.exec` timeout is deliberately set *higher* than this inner deadline. That is not slack -- it is a rule about who is allowed to decide.
+
+:::warning[The SDK's command timeout does not stop anything inside the container]
+Cloudflare documents that on [command timeout](https://developers.cloudflare.com/sandbox/api/commands/#timeout-behavior) the SDK raises on the caller side and closes the connection, but "The underlying process continues running inside the container." The documented cleanup paths are `deleteSession()` or `destroy()`; `killProcess()` only applies to a process id you got back from `startProcess()`. So if the transport is the shorter clock, you get a Worker that has given up, a container that has not, and no phase attribution for either -- the transport must never be the thing that decides.
+:::
+
+## Evidence Tenant Code Cannot Write
+
+Build children get file descriptors 0-2 and nothing else. The trusted runner reports phase transitions to the supervisor over an inherited **fd 3** pipe with `writeSync(3, line)`. The supervisor passes fd 3 only to the runner, and the runner spawns tenant children without it -- which is the whole mechanism, so it is worth being explicit about both halves:
+
+```js
+// /opt/builder/runner.mjs -- trusted, holds fd 3.
+const emit = (line) => writeSync(3, line + "\n");
+emit("phase build");
+
+// Tenant children get stdout/stderr and nothing else. Listing stdio slots is
+// not enough on Linux -- an inherited fd 3 without CLOEXEC is passed on to
+// grandchildren -- so close it explicitly before exec: with no fd 3, no tenant
+// process can forge a phase transition or a terminal line.
+const child = spawn("/bin/sh", ["-c", 'exec 3>&-; exec "$@"', "sh", tenantCommand, ...tenantArgs], {
+  stdio: ["ignore", "pipe", "pipe"],
+});
+emit(`group-open ${child.pid}`);
+```
+
+The grammar on that channel is deliberately tiny, and its terminal line cannot express a timeout:
+
+```txt
+# fd 3 grammar. Newline-framed; total protocol bytes capped (a runner that
+# floods the channel is a protocol violation, not a slow build).
+phase <name>                 # name in: check | build | stabilize | emit
+group-open <pid>
+group-close <pid>
+done <status> <discardedLogBytes> <workspaceBytes>
+
+# Terminal line, matched anchored:
+^done (ok|integrity|error) ([0-9]{1,12}) ([0-9]{1,12})$
+#          ^-- "timeout" is absent by construction: the untrusted side has no
+#              vocabulary for declaring that it ran out of time.
+```
+
+Any unparsable line, out-of-order phase transition, duplicate terminal line, or unbalanced `group-close` makes the whole protocol invalid.
+
+The supervisor then writes one canonical status envelope to a root-owned `0400` file **outside** the tenant workspace -- exclusive-create (`wx`), `chown` to root, atomic rename -- with a fixed field set and nothing else, written as `JSON.stringify(envelope) + "\n"` so the bytes are canonical by construction (the block below is annotated for reading; the file itself is one compact line):
+
+```jsonc
+// /var/lib/builder/status.json -- 0400 root:root, outside the workspace.
+// No ids, no paths, no hashes, no authored strings: scrub-safe by construction
+// rather than by a scrubber that has to keep up with new fields.
+{
+  "contract": "build-status",
+  "version": 3,
+  "phase": "build",
+  "status": "timeout",
+  "reason": "wall-time-build",
+  "phaseMs": { "check": 1200, "build": 118800, "stabilize": 0, "emit": 0 },
+  "totalMs": 120000,
+  "discardedLogBytes": 41230,
+  "workspaceBytes": 9184300
+}
+```
+
+The Worker re-parses that strictly, and the strictness is the point -- each check below rejects a specific way a compromised or merely buggy runner could produce a plausible-looking pass:
+
+```ts
+// worker/verify.ts -- returns a verdict, never a boolean; "unknown" is a first-class outcome.
+function verify(raw: string, obs: Observed): Verdict {
+  const doc = JSON.parse(raw);
+  // Canonical bytes: re-serializing must reproduce the file exactly, which
+  // pins key order and whitespace. It does not catch an added field -- an extra
+  // key survives the round trip -- so the fixed key set is checked separately.
+  if (JSON.stringify(doc) + "\n" !== raw) return platformLoss("non-canonical envelope");
+  if (Object.keys(doc).join(",") !== ENVELOPE_KEYS) return platformLoss("unexpected field set");
+
+  const phases = Object.keys(doc.phaseMs);
+  const after = phases.slice(phases.indexOf(doc.phase) + 1);
+  if (after.some((p) => doc.phaseMs[p] !== 0)) return platformLoss("timing after reported phase");
+  if (sumValues(doc.phaseMs) !== doc.totalMs || doc.totalMs > DEADLINE_MS) return platformLoss("budget");
+  if (EXIT_FOR_STATUS[doc.status] !== obs.exitCode) return platformLoss("exit/status disagree");
+  // The reason must be legal for BOTH the status and the phase it names.
+  if (!REASONS_FOR[doc.status][doc.phase]?.includes(doc.reason)) return platformLoss("bad reason");
+
+  if (obs.survivorPids > 0) return platformLoss("survivors after terminal line");
+  if (obs.partialLine || obs.timerFired) return timedOut(`wall-time-${doc.phase}`);
+  return { kind: doc.status, reason: doc.reason };
+}
+```
+
+The cascade encodes one rule: **fail closed means unknown blames the platform and retries -- it never means green.** Reason codes stay fixed and phase-attributed (`wall-time-check`, `wall-time-build`, `wall-time-stabilize`, `wall-time-emit`, plus `platform-loss`), because you cannot fix a phase you cannot name.
+
+## Count the Structural Work Before Raising the Limit
+
+When a build is slow, the useful question is which phase, doing how many of what. Thread an `onOperation(kind, path)` seam through the per-build step -- `read | digest | copy | write | list` -- and assert the counts. Structural assertions hold on a loaded CI runner in a way wall-clock assertions never do:
+
+```ts
+// src/build-step.test.ts
+import { readFileSync } from "node:fs";
+import { expect, test } from "vitest";
+import { runBuildStep } from "./build-step";
+
+test("each baked input is touched exactly once, and the package tree never is", async () => {
+  const ops: Array<{ kind: string; path: string }> = [];
+  await runBuildStep({ onOperation: (kind, path) => ops.push({ kind, path }) });
+
+  const baked = ops.filter((o) => o.kind === "read" && o.path.startsWith("/opt/builder/"));
+  expect(baked.map((o) => o.path).sort()).toEqual(BAKED_INPUTS); // one read each, no repeats
+  expect(ops.filter((o) => o.kind === "digest")).toHaveLength(1);
+  expect(ops.filter((o) => o.kind === "copy")).toHaveLength(1);
+  for (const op of ops) {
+    if (op.kind === "read" && op.path.startsWith("out/")) expect(op.path).toMatch(/\.html$/);
+    expect(op.path).not.toContain("node_modules");
+  }
+});
+
+// The count assertion proves it did not walk the package tree on this run; this
+// proves it cannot -- the path literal is not in the module at all.
+test("the module has no vocabulary for the package tree", () => {
+  expect(readFileSync("src/build-step.ts", "utf8")).not.toContain("node_modules");
+});
+```
+
+Then re-prove it against the real image rather than the source tree, with the network off so nothing can quietly refetch what the image was supposed to have baked:
+
+```bash
+docker run --rm --network none --entrypoint node builder:2026-08a /opt/builder/selftest.mjs
+```
+
+:::note[A timeout raise is a tolerance loosening]
+Raising a deadline is a change to what the system promises, so it needs the same evidence as any other loosened tolerance: a measurement on an idle machine, a named phase, and a linked issue. "It timed out once" is an observation, not a measurement. And a run that fails then passes on retry is evidence of instability -- record it as such; never ship it as a green release.
+:::
+
+One example of what phase attribution turns up: a toolchain warm-up step keyed on a marker file under `TMPDIR` behaves perfectly on a developer machine, where the marker survives, and pathologically in hosting, where the documented ephemeral disk means the marker is absent on every fresh container -- so *every* hosted build pays the warm-up. The fix was to make the warm-up a no-op inside the image, not to raise the budget by the amount it cost.
+
+## Bake Immutable Work, and Keep Its Authority Elsewhere
+
+Anything release-owned and lockfile-pinned -- toolchain install, asset or catalog bake -- belongs in the image, done once, then frozen read-only and root-owned. The architecture doc's ephemeral-disk rule makes the alternative untenable: work written to container disk at runtime does not survive a restart, so "cache it on first use" silently means "do it every time."
+
+```dockerfile
+# Dockerfile -- bake stage. The FROM is digest-pinned so the same tag cannot
+# become a different base image between two rollouts. The runtime image that
+# ships this layer extends the Sandbox base image and leaves its ENTRYPOINT
+# (the sandbox binary) in place.
+FROM docker.io/library/node:22-bookworm-slim@sha256:<hex of the base image>
+
+COPY package.json package-lock.json /opt/builder/
+RUN npm ci --omit=dev --prefix /opt/builder
+
+COPY tools/bake-catalog.mjs /opt/builder/
+RUN node /opt/builder/bake-catalog.mjs /opt/builder/assets \
+ && chown -R root:root /opt/builder \
+ && find /opt/builder -type d -exec chmod 0555 {} + \
+ && find /opt/builder -type f -exec chmod 0444 {} +
+```
+
+"Authority" means the expected digests live in a hand-edited, source-controlled module that is **not generated** and **not adjacent to the asset it describes**. If the catalog's hash were stored beside the catalog, replacing both would authorize new bytes -- which is exactly the attack the digest was supposed to prevent:
+
+```ts
+// src/asset-authority.ts -- hand-edited. Changing a baked asset requires a
+// reviewed edit here; there is no generator that would update it for you.
+export const ASSET_AUTHORITY = {
+  contract: "asset-catalog",
+  version: 2,
+  catalogHash: "sha256:<hex of the canonical catalog bytes>",
+  bundleHash: "sha256:<hex of the bundle>",
+  count: 128,
+} as const;
+```
+
+Verify against it in three places: at bake time (refuse to write on mismatch), at the runtime handshake (sha256 of the baked bytes vs. what the Worker supplies), and per build before mutating any output. Fail closed on all of the following -- symlinks or special files anywhere in the source or output tree, paths that escape their root, non-canonical catalog bytes, and destination collisions:
+
+```ts
+// Every check is "prove it is the boring case," never "detect the bad case."
+function assertPlainFileInside(root: string, candidate: string): void {
+  const full = resolve(root, candidate);
+  if (full !== root && !full.startsWith(root + "/")) throw new IntegrityError("escaping path");
+  // lstat, not stat: stat follows the symlink and validates the target instead.
+  if (!lstatSync(full).isFile()) throw new IntegrityError("symlink or special file");
+}
+
+// Canonical catalog: fixed key set, fixed order, no duplicates -- re-serializing
+// must reproduce the file byte for byte.
+if (JSON.stringify(catalog) + "\n" !== catalogBytes) throw new IntegrityError("non-canonical");
+// Collisions lose the race instead of overwriting: create with "wx", fsync,
+// link into place, unlink the temp. A second writer fails; it does not win.
+```
+
+Validate every file in the output tree *before* mutating any of them, so a failure halfway through cannot leave a half-stabilized tree. Keep tenant-dependent values as inert data -- a `data-*` attribute rather than a generated script -- so a per-build value never becomes new executable bytes. And a stale image, protocol, or digest at handshake time is a **retryable sandbox-unavailable**, not a build failure; that is the same distinction as in the readiness section, and it matters most here, where a mid-rollout mixed window is the likeliest cause.
+
+## Treat Staging Mutation as a Transaction
+
+Proving a build against staging usually means mutating staging -- a temporary facade, a route, a version. Capture the authority to undo that *before* touching anything. Cloudflare's [Wrangler commands reference](https://developers.cloudflare.com/workers/wrangler/commands/workers/) documents `wrangler deployments status --json` for the active deployment's version traffic split and `wrangler versions list --json` for the version inventory; capture both per affected Worker, plus image identity and routes, as scrubbed evidence. Never tokens.
+
+The precondition is strict: **exactly one version at 100%**. A split or in-progress gradual rollout is a hard stop, not a warning -- there is no single version to restore to, so the rollback authority you just captured would be a fiction.
+
+```yml
+# .github/workflows/build-proof.yml
+- name: Capture rollback authority
+  run: |
+    npx wrangler deployments status --json > evidence/deployment.json
+    npx wrangler versions list --json      > evidence/versions.json
+    node tools/staging.mjs assert-single-version   # split rollout => exit 1
+
+- name: Apply temporary facade
+  run: node tools/staging.mjs apply
+
+- name: Run the build proof
+  run: node tools/staging.mjs proof
+
+- name: Restore staging
+  if: always()
+  run: |
+    node tools/staging.mjs restore          # idempotent: a repeat is harmless
+    node tools/staging.mjs verify-restored  # reads the live state back
+    # On failure, print the secret-free command an operator can run by hand.
+```
+
+Two details in that step carry most of the weight. `restore` is idempotent, so running it after a partial earlier attempt is safe. `verify-restored` **reads the live state back** rather than trusting the restore command's exit code. And because `always()` is best-effort -- a lost runner skips it entirely -- the out-of-band recovery path an operator can run manually is part of the design, not a postscript. See [Workers PR Previews](../cicd/workers-pr-previews.mdx) for the surrounding preview-hygiene patterns this plugs into.
+
+Retry at most once, and only when all three hold: the failed run reported a *trusted* retryable builder outcome, the temporary facade is confirmed deleted, and teardown completed. Keep the recovered state in place until the second attempt atomically replaces it.
+
+Report three verdicts as independent fields, because they fail independently:
+
+```jsonc
+// evidence/verdict.json -- workload, evidence, and recovery are orthogonal.
+// A cancelled run produces none of them: the answer is unknown, not fine.
+{
+  // What the build did.
+  "workload": { "failureKind": "timeout" }, // none | timeout | integrity | other
+  // Whether we can believe the above: "passed" means zero validation issues.
+  "evidence": { "terminalState": "failed" },
+  // Whether staging is back the way we found it.
+  "recovery": { "attempted": true, "complete": true }
+}
+```
+
+Everything in that document is a closed enum. Internal results get projected into enums and DTOs on the way out rather than passed through a scrubber, and tool stdout/stderr is discarded entirely -- it is authored external text, and no scrubber stays ahead of authored text forever. Only enum members survive into uploaded evidence, which is also why the status envelope earlier on this page carries counters instead of paths. None of this reproduces locally, of course -- which parts of a hosted run you can even see under `wrangler dev` is its own subject, covered in [Local Dev: Binding Support Matrix](./local-dev-bindings.mdx).
+
+## Attribution Before Optimization
+
+Every rule on this page is the same rule wearing different clothes: name the phase before you change the budget. When attribution is compound, or simply unknown, the correct next move is to improve attribution again -- not to raise the timeout, not to add a speculative cache, and not to weaken fresh derivation so the slow path stops being exercised. Each of those makes the next slow run harder to explain than this one was, which is the opposite of progress.
+
+Related pages: [Durable Objects](./durable-objects.mdx) for the instance identity behind Sandbox and Containers, [Local Dev: Binding Support Matrix](./local-dev-bindings.mdx) for what does and does not emulate locally, and [Workers PR Previews](../cicd/workers-pr-previews.mdx) for preview and staging hygiene.
