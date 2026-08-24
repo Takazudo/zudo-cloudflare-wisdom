@@ -31,12 +31,12 @@ interface Env {
   FILES: R2Bucket;
 }
 
-// アップロード
+// Upload
 await env.FILES.put("uploads/photo.jpg", imageData, {
   httpMetadata: { contentType: "image/jpeg" },
 });
 
-// ダウンロード
+// Download
 const object = await env.FILES.get("uploads/photo.jpg");
 if (object) {
   return new Response(object.body, {
@@ -46,15 +46,34 @@ if (object) {
   });
 }
 
-// 削除
+// Delete
 await env.FILES.delete("uploads/photo.jpg");
 
-// オブジェクトの一覧
+// List objects
 const list = await env.FILES.list({ prefix: "uploads/" });
 for (const object of list.objects) {
   console.log(object.key, object.size);
 }
 ```
+
+## マルチパートアップロード
+
+約 100 MB を超えるファイルには、マルチパートアップロードを使用する：
+
+```typescript
+const upload = await env.FILES.createMultipartUpload("large-file.zip");
+const part1 = await upload.uploadPart(1, chunk1);
+const part2 = await upload.uploadPart(2, chunk2);
+await upload.complete([part1, part2]);
+```
+
+## パブリックアクセス
+
+R2 バケットはデフォルトで非公開だ。ファイルを公開配信するには：
+
+1. **カスタムドメイン**：Cloudflare ダッシュボードでバケットにドメインを接続する
+2. **Worker プロキシ**：R2 から読み取り、ファイルを配信する Worker を作成する
+3. **Pages Function**：ファイル配信エンドポイントとして Pages Function を使用する
 
 ## ブラウザからの直接アップロード（署名付き URL）
 

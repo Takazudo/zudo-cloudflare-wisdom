@@ -19,15 +19,15 @@ Cloudflare は異なるアクセスパターンに最適化された4つのス�
 
 ```mermaid
 graph TD
-  A[どんなデータ？] --> B{構造化/リレーショナル？}
-  B -->|はい| C[D1 - SQL データベース]
-  B -->|いいえ| D{大きなファイル/ブロブ？}
-  D -->|はい| E[R2 - オブジェクトストレージ]
-  D -->|いいえ| H{ベクトル埋め込みによる類似検索？}
-  H -->|はい| I[Vectorize - ベクトルデータベース]
-  H -->|いいえ| F{読み取り多、結果整合性で OK？}
-  F -->|はい| G[KV - キーバリューストア]
-  F -->|いいえ| C
+  A[What kind of data?] --> B{Structured/relational?}
+  B -->|Yes| C[D1 - SQL database]
+  B -->|No| D{Large files/blobs?}
+  D -->|Yes| E[R2 - Object storage]
+  D -->|No| H{Vector embeddings for similarity search?}
+  H -->|Yes| I[Vectorize - Vector database]
+  H -->|No| F{Read-heavy, ok with eventual consistency?}
+  F -->|Yes| G[KV - Key-value store]
+  F -->|No| C
 ```
 
 ## このセクションの内容
