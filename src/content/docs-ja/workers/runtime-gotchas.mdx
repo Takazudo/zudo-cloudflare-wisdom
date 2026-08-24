@@ -140,6 +140,8 @@ export default {
 };
 ```
 
+同期処理・`waitUntil()`・Queues のどれを選ぶかを、CPU の形をしたひとつの具体的なタスク -- アップロード時の画像プレースホルダ生成 -- について実際に判断した例は、[Worker 側の画像前処理と BlurHash プレースホルダ](../recipes/worker-image-preprocessing-blurhash.mdx#同期処理か-queues-か-waituntil-か-レスポンスが何を約束するかで選ぶ) を参照。
+
 ### scheduled(): 固定された壁時計の上限、可変な CPU の上限
 
 Cron Trigger の呼び出しは、**壁時計（経過時間）の上限が 15 分に固定**されている -- cron がどれだけ頻繁に発火するかは関係ない。一方で**CPU 時間の予算は固定されていない** -- Paid プランでは、トリガーが 1 時間より頻繁に発火する場合は 30 秒、1 時間おき以上の間隔なら 15 分になる（Free プランは間隔にかかわらず 10ms）。

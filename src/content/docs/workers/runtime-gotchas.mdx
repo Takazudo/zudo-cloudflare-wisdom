@@ -140,6 +140,8 @@ export default {
 };
 ```
 
+For a worked decision between synchronous processing, `waitUntil()`, and Queues on one concrete CPU-shaped task -- generating an image placeholder at upload time -- see [Worker-Side Image Preprocessing and BlurHash Placeholders](../recipes/worker-image-preprocessing-blurhash.mdx#synchronous-queues-or-waituntil-pick-by-what-the-response-promises).
+
 ### scheduled(): a Fixed Wall-Clock Cap, a Variable CPU Cap
 
 A Cron Trigger invocation's **wall-clock duration cap is fixed at 15 minutes**, no matter how often the cron fires. Its **CPU-time budget is not fixed** -- on the Paid plan it's 30 seconds if the trigger fires more often than hourly, and 15 minutes if it fires hourly or less often (the Free plan is 10ms regardless of interval).
