@@ -28,13 +28,13 @@ database_id = "abc123-def456-ghi789"
 ### マイグレーションの実行
 
 ```bash
-# マイグレーションの作成
+# Create a migration
 npx wrangler d1 migrations create my-database "create-users-table"
 
-# ローカルでマイグレーションを適用
+# Apply migrations locally
 npx wrangler d1 migrations apply my-database --local
 
-# 本番環境に適用
+# Apply to production
 npx wrangler d1 migrations apply my-database --remote
 ```
 
@@ -45,17 +45,17 @@ interface Env {
   DB: D1Database;
 }
 
-// クエリ
+// Query
 const { results } = await env.DB.prepare(
   "SELECT * FROM users WHERE id = ?"
 ).bind(userId).all();
 
-// 挿入
+// Insert
 await env.DB.prepare(
   "INSERT INTO users (name, email) VALUES (?, ?)"
 ).bind(name, email).run();
 
-// バッチ操作
+// Batch operations
 const batch = [
   env.DB.prepare("INSERT INTO logs (msg) VALUES (?)").bind("log1"),
   env.DB.prepare("INSERT INTO logs (msg) VALUES (?)").bind("log2"),

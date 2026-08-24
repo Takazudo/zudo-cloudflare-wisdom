@@ -31,21 +31,21 @@ interface Env {
   MY_KV: KVNamespace;
 }
 
-// 読み取り
+// Read
 const value = await env.MY_KV.get("key");
 const json = await env.MY_KV.get("key", { type: "json" });
 
-// 書き込み
+// Write
 await env.MY_KV.put("key", "value");
 await env.MY_KV.put("key", JSON.stringify(data));
 
-// 有効期限付き書き込み（TTL は秒）
+// Write with expiration (TTL in seconds)
 await env.MY_KV.put("key", "value", { expirationTtl: 3600 });
 
-// 削除
+// Delete
 await env.MY_KV.delete("key");
 
-// キーの一覧
+// List keys
 const list = await env.MY_KV.list({ prefix: "logs:" });
 ```
 
@@ -93,7 +93,7 @@ KV は短命な TTL 付きの bot、セッション、キャッシュ状態に�
 :::
 
 ```typescript
-const CONVERSATION_TTL = 86400; // 24 時間
+const CONVERSATION_TTL = 86400; // 24 hours
 
 interface ConversationHistory {
   messages: Array<{ role: string; content: string }>;
@@ -125,7 +125,7 @@ TTL 有効期限付き KV カウンターによるユーザーごとのレート
 
 ```typescript
 const RATE_LIMIT = 30;
-const RATE_WINDOW = 86400; // 24 時間
+const RATE_WINDOW = 86400; // 24 hours
 
 async function checkRateLimit(
   env: Env,
