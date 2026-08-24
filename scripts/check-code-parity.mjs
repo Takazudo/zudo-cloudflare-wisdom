@@ -267,15 +267,15 @@ export async function checkCodeParity({ enRoot, jaRoot } = {}) {
       output.push(`READ ERROR: JA ${relativePath}: ${error.message}`);
       continue;
     }
-    inspectedPairs += 1;
-    enBlockTotal += enPage.blocks.length;
-    jaBlockTotal += jaPage.blocks.length;
     if (jaPage.failed) {
       failed = true;
       if (jaPage.diagnostics.length > 0) output.push(...jaPage.diagnostics);
       else output.push(`PARSER ERROR: JA ${relativePath}: ast is null without an error diagnostic`);
       continue;
     }
+    inspectedPairs += 1;
+    enBlockTotal += enPage.blocks.length;
+    jaBlockTotal += jaPage.blocks.length;
     if (
       enPage.blocks.length !== jaPage.blocks.length ||
       enPage.blocks.some((block, index) => !tupleEqual(block, jaPage.blocks[index]))

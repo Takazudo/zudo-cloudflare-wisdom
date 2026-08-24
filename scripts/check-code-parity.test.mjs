@@ -215,6 +215,18 @@ test("missing roots and malformed MDX are hard failures with structured location
       assert.doesNotMatch(result.output, /Code parity: PASS/);
     },
   );
+
+  await withCorpus(
+    { en: { "bad.mdx": "# Heading\n" }, ja: { "bad.mdx": "# 見出し\n\n<Component>\n" } },
+    async ({ enRoot, jaRoot }) => {
+      const result = await checkCodeParity({ enRoot, jaRoot });
+      assert.equal(result.exitCode, 1);
+      assert.match(result.output, /PARSER ERROR: JA bad\.mdx: \[markdown\] .+ \(line \d+, column \d+\)/);
+      assert.match(result.output, /SCAN ERROR: zero mirror pairs inspected/);
+      assert.match(result.output, /Summary: inspected 0 mirror pairs; 0 EN fenced blocks; 0 JA fenced blocks/);
+      assert.doesNotMatch(result.output, /Summary: inspected 1 mirror pairs/);
+    },
+  );
 });
 
 test("unified diagnostics label paths, counts, ordinal, tuple fields, and source lines", async () => {
