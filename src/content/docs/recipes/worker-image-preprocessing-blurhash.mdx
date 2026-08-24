@@ -185,7 +185,7 @@ export async function tryGeneratePhotoBlurhash(env: Env, originalBytes: ArrayBuf
 Three details in that function carry weight:
 
 - **`scale-down`, not `contain` or `cover`.** It never enlarges and never crops, so a 6×5 test fixture comes back as 6×5 and a 4000×3000 photo comes back as 32×24 -- aspect ratio preserved, exactly the input a placeholder wants.
-- **A bounded read of the output stream.** `readBounded` accumulates chunks and cancels the reader the moment the running total passes 64 KiB. A 32×32 PNG is a few hundred bytes to a few KiB; the cap exists so that a misbehaving transform can never make the Worker buffer something large.
+- **A bounded read of the output stream.** `readBounded` accumulates chunks and cancels the reader the moment the running total passes 64 KiB -- the same shape as [`readBodyWithCap`](./remote-mcp-workers.mdx#the-body-cap-enforced-before-any-json-parsing) in the MCP recipe, applied to a binding's output instead of a request body. A 32×32 PNG is a few hundred bytes to a few KiB; the cap exists so that a misbehaving transform can never make the Worker buffer something large.
 - **A fixed 4×4 component count.** BlurHash lets the encoder pick 1–9 components per axis; fixing it at 4×4 gives a constant 36-character string, a constant decode cost, and a validator that can check the size flag -- `U`, the base83 digit for `(4-1) + (4-1) * 9 = 30` -- as the first character.
 
 `anim: false` and the `errorCode` field are two small additions on top of the production code, re-verified in the local Workers runtime for this page: the first pins a static, single-frame output (the decoder's APNG rejection below stays as defence in depth), the second is explained in the best-effort section.
@@ -259,7 +259,7 @@ The transformed PNG comes from Cloudflare's own service, so the threat model is 
 Three layers, in order:
 
 1. **IHDR contract.** Width and height ≤ 32, width × height ≤ 1,024, bit depth 8, a colour type that maps to a channel count, no interlacing, no unknown compression or filter method.
-2. **Inflate preflight with a byte budget.** PNG pixel data is zlib-compressed, and a tiny IDAT can expand without bound. Inflate it once through `fflate`'s streaming `Unzlib` with a callback that throws the moment the running total exceeds `height * (1 + width * channels)` -- the exact byte count a well-formed image must produce. The same chunk walk rejects `iCCP` (embedded profiles), APNG chunks, and any unknown *critical* chunk.
+2. **Inflate preflight with a byte budget.** PNG pixel data is zlib-compressed, and a tiny IDAT can expand without bound. Inflate it once through `fflate`'s streaming `Unzlib` with a callback that throws once the running total exceeds `height * (1 + width * channels)` -- the exact byte count a well-formed image must produce. `Unzlib` inflates each `push()` in full before calling back, so the IDAT is pushed in 512-byte slices: deflate's ~1032:1 ceiling then caps what any one slice can expand to at about 512 KiB, instead of the ~66 MB a single push of a 64 KiB stream could reach before the check ran. The same chunk walk rejects `iCCP` (embedded profiles), APNG chunks, and any unknown *critical* chunk.
 3. **Decode and normalise.** Only now call the real decoder (with CRC checking on), cross-check its reported width, height, depth, and channels against the IHDR contract, and expand grey, grey+alpha, RGB, and RGBA into one RGBA buffer -- honouring `tRNS` transparency so a transparent PNG does not silently become opaque.
 
 One thing the normalisation cannot fix: **BlurHash has no alpha channel.** The encoder reads RGB and ignores alpha, so a transparent pixel contributes whatever RGB sits underneath it -- often black. If transparent uploads matter, composite onto a known background first (the binding's `background` output option, or a compositing step on the RGBA buffer) and use the same background in the backfill, or the two paths will disagree.
@@ -318,9 +318,15 @@ function chunkType(bytes: Uint8Array, offset: number): string {
   return String.fromCharCode(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
 }
 
+// fflate's Unzlib inflates a whole push() before it calls back, so the budget
+// is only checked per push. Deflate expands at most ~1032:1, which bounds one
+// slice to ~512 KiB of inflated data no matter what the IDAT contains.
+const INFLATE_PUSH_BYTES = 512;
+
 /**
  * Inflate once with a strict output budget before handing data to fast-png.
- * This prevents a small, malicious IDAT stream from expanding without bound.
+ * Pushing in small slices keeps a malicious IDAT from expanding far past the
+ * budget before the check runs.
  */
 function verifyPngDataBudget(bytes: Uint8Array, contract: PngContract): void {
   const expectedBytes = contract.height * (1 + contract.width * contract.channels);
@@ -354,7 +360,9 @@ function verifyPngDataBudget(bytes: Uint8Array, contract: PngContract): void {
     if (type === "IDAT") {
       if (idatEnded) throw new Error("non-consecutive PNG IDAT chunks");
       sawIdat = true;
-      inflater.push(bytes.subarray(dataOffset, dataOffset + length), false);
+      for (let start = dataOffset; start < dataOffset + length; start += INFLATE_PUSH_BYTES) {
+        inflater.push(bytes.subarray(start, Math.min(start + INFLATE_PUSH_BYTES, dataOffset + length)), false);
+      }
     } else if (sawIdat) {
       idatEnded = true;
     }
@@ -366,8 +374,10 @@ function verifyPngDataBudget(bytes: Uint8Array, contract: PngContract): void {
       break;
     }
 
-    // Reject unknown critical chunks (uppercase first letter). Ancillary chunks
-    // are bounded by their encoded size and fast-png either reads or skips them.
+    // Reject unknown critical chunks (uppercase first letter); this also rejects a
+    // suggested PLTE, which the transform never emits. Remaining ancillary chunks
+    // are bounded by their encoded size and fast-png reads or skips them -- iCCP,
+    // the one it would inflate, was rejected above.
     if (type !== "IHDR" && type !== "IDAT" && type.charCodeAt(0) <= 0x5a) {
       throw new Error("unsupported critical PNG chunk");
     }
@@ -588,6 +598,8 @@ If you do defer, insert the row with `blurhash = NULL` **first** and let the bac
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const bytes = await request.arrayBuffer();
+    // validateAndStore is preprocessAndStorePhoto without the hash step; the
+    // delete-on-insert-failure cleanup from the previous section still applies.
     const stored = await validateAndStore(env, bytes, { prefix: "photos" });
     if (!stored.ok) return failureResponse(stored);
     const id = await insertPhoto(env, { ...rowFrom(stored), blurhash: null });
@@ -633,8 +645,8 @@ Write these down in the repo (a README or runbook), because each one is invisibl
 
 `wrangler dev` emulates the Images binding without credentials, which is what makes the Workers-runtime tests below possible. But the local implementation covers only a subset of the transform options -- observed as `width`, `height`, `rotate`, and `format` -- and does not reproduce Cloudflare's network-side decoding and cropping behaviour. In practice:
 
-- Exact output dimensions and content type **can** be asserted locally.
-- `fit` semantics, `gravity: "auto"`, and anything that depends on the real decoder **cannot** -- verify those once against a deployed preview.
+- The output content type, and that a raster no larger than 32×32 comes back, **can** be asserted locally.
+- `fit` semantics -- including the exact output dimensions, since `scale-down` is what decides them -- `gravity: "auto"`, and anything that depends on the real decoder **cannot**; verify those once against a deployed preview.
 - The pipeline is safe either way: `inspectPngContract` rejects any raster over 32×32, so a local transform that ignored `fit` and returned something unexpected would produce a `decode`-stage `NULL`, not an unbounded decode.
 
 Treat the local binding as "the shape of the API is right" and the deployed check as "the pixels are right". The [binding support matrix](../workers/local-dev-bindings.mdx#the-binding-support-matrix) lists it alongside the other bindings.
@@ -653,9 +665,9 @@ import { encode as encodePng } from "fast-png";
 
 const BASE83_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz#$%*+,-.:;=?@[]^_{|}~";
 const BASE83 = new Set(BASE83_ALPHABET);
-const COMPONENTS = 4;
-const SIZE_FLAG = (COMPONENTS - 1) + (COMPONENTS - 1) * 9;
-const HASH_LENGTH = 4 + 2 * COMPONENTS * COMPONENTS;
+const BLURHASH_COMPONENTS = 4;
+const SIZE_FLAG = (BLURHASH_COMPONENTS - 1) + (BLURHASH_COMPONENTS - 1) * 9;
+const HASH_LENGTH = 4 + 2 * BLURHASH_COMPONENTS * BLURHASH_COMPONENTS;
 
 export const PLACEHOLDER_MAX_SOURCE_AXIS = 100_000;
 export const PLACEHOLDER_MAX_DECODE_AXIS = 16;
@@ -711,7 +723,8 @@ export function createImagePlaceholder(
     if (pixels.byteLength !== dimensions.width * dimensions.height * 4) return null;
     const png = encodePng({ ...dimensions, data: pixels, depth: 8, channels: 4 });
     const dataUri = `data:image/png;base64,${base64(png)}`;
-    if (new TextEncoder().encode(dataUri).byteLength > PLACEHOLDER_MAX_DATA_URI_BYTES) return null;
+    // A base64 data URI is pure ASCII, so length is the byte count.
+    if (dataUri.length > PLACEHOLDER_MAX_DATA_URI_BYTES) return null;
     return { dataUri, ...dimensions };
   } catch {
     return null;
@@ -719,7 +732,7 @@ export function createImagePlaceholder(
 }
 ```
 
-`isCanonicalPhotoBlurhash` runs on every render because the column is just `TEXT`: a hand-edited row, a buggy backfill, or a future format change must degrade to "no placeholder", never to a broken `background-image`. The component makes the fallback explicit -- no hash, no wrapper, just the image:
+Helpers such as `base64`, `buildKey`, `deleteObjects`, `readImageDimensions`, and `insertPhoto` are project glue and are left out of the snippets. `isCanonicalPhotoBlurhash` runs on every render because the column is just `TEXT`: a hand-edited row, a buggy backfill, or a future format change must degrade to "no placeholder", never to a broken `background-image`. The component makes the fallback explicit -- no hash, no wrapper, just the image:
 
 ```tsx
 /** SSR-only wrapper: without JS, the real image remains fully visible. */
@@ -828,28 +841,30 @@ export class ImagePlaceholderController {
     return image.closest<HTMLElement>(WRAPPER_SELECTOR);
   }
 
-  #reveal(image: HTMLImageElement): void {
-    const wrapper = this.#wrapper(image);
-    if (!wrapper) return;
+  #resetState(wrapper: HTMLElement): void {
     wrapper.removeAttribute("data-placeholder-pending");
     wrapper.removeAttribute("data-placeholder-loaded");
     wrapper.removeAttribute("data-placeholder-error");
+  }
+
+  #reveal(image: HTMLImageElement): void {
+    const wrapper = this.#wrapper(image);
+    if (!wrapper) return;
+    this.#resetState(wrapper);
     wrapper.setAttribute(image.naturalWidth > 0 ? "data-placeholder-loaded" : "data-placeholder-error", "true");
   }
 
   #prepare(image: HTMLImageElement): void {
     const wrapper = this.#wrapper(image);
     if (!wrapper) return;
-    wrapper.removeAttribute("data-placeholder-pending");
-    wrapper.removeAttribute("data-placeholder-loaded");
-    wrapper.removeAttribute("data-placeholder-error");
+    this.#resetState(wrapper);
+    // `complete` cannot flip mid-scan: load/error are delivered as separate tasks,
+    // and the capture-phase listeners registered before the scan catch those.
     if (image.complete) {
       this.#reveal(image);
       return;
     }
     wrapper.setAttribute("data-placeholder-pending", "true");
-    // Close the completion race between the `complete` read and the pending mark.
-    if (image.complete) this.#reveal(image);
   }
 
   readonly #onSettle = (event: Event): void => {
@@ -876,7 +891,7 @@ Each branch of that class pins down a state the browser suite tests explicitly:
 | State | Handling |
 |---|---|
 | Image already cached or complete when JS runs | `image.complete` is true → reveal immediately, never mark pending |
-| Image settles *during* the initial scan | Capture-phase `load` / `error` listeners are registered **before** `reconcile()` runs, and `#prepare` re-checks `complete` after setting pending |
+| Image settles right after the initial scan | Capture-phase `load` / `error` listeners are registered **before** `reconcile()` runs, so an event queued while the synchronous scan was walking the document still reveals the image |
 | Load error (404, blocked, corrupt) | `error` reveals just like `load`; `naturalWidth === 0` distinguishes the two for styling, but the image is unhidden either way |
 | Lazy image (`loading="lazy"`) far below the fold | Pending until the browser actually fetches it; the placeholder is the right thing to show meanwhile |
 | Cards appended by infinite scroll | `MutationObserver` prepares every added subtree |
@@ -931,7 +946,7 @@ A failed row stays `NULL` and is reported without image bytes or credentials; re
 ## Validate Generated Hashes Against the Real Base83 Alphabet -- the Comma Pitfall
 
 :::danger[The base83 alphabet contains a comma, and a hand-written character class will forget it]
-BlurHash's base83 digits are `0-9`, `A-Z`, `a-z`, and the 21 punctuation characters `#$%*+,-.:;=?@[]^_{|}~`. In the production backfill behind this page, a validator written as a regex character class omitted `,` -- easy to do, since a comma inside `[...]` reads like a separator -- and rejected 21 perfectly valid generated hashes. The conditional write meant those rows were *safely* left `NULL` rather than corrupted, and a rerun after the fix filled them; but 64 of the final 294 hashes contain a comma, so a validator with this bug silently discards roughly one in five images' placeholders.
+BlurHash's base83 digits are `0-9`, `A-Z`, `a-z`, and the 21 punctuation characters `#$%*+,-.:;=?@[]^_{|}~`. In the production backfill behind this page, a validator written as a regex character class omitted `,` -- easy to do, since a comma inside `[...]` reads like a separator -- and rejected 21 perfectly valid generated hashes before the bug was caught. The conditional write meant those rows were *safely* left `NULL` rather than corrupted, and a rerun after the fix filled them. Across the finished run, 64 of the 294 hashes contain a comma -- so a validator with this bug silently discards roughly one in five images' placeholders.
 :::
 
 Three rules follow:

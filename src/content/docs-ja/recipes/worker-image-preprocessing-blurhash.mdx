@@ -185,7 +185,7 @@ export async function tryGeneratePhotoBlurhash(env: Env, originalBytes: ArrayBuf
 この関数の中で重みを持つ細部が 3 つある：
 
 - **`contain` や `cover` ではなく `scale-down`。** 決して拡大せず、決してクロップしないので、6×5 のテストフィクスチャは 6×5 のまま返り、4000×3000 の写真は 32×24 で返る——アスペクト比が保たれ、プレースホルダが欲しい入力そのものになる。
-- **出力ストリームの上限付き読み取り。** `readBounded` はチャンクを積み上げ、累計が 64 KiB を超えた瞬間にリーダーをキャンセルする。32×32 の PNG は数百バイトから数 KiB だ。この上限は、振る舞いのおかしい変換が Worker に大きなものをバッファさせることを決して許さないために存在する。
+- **出力ストリームの上限付き読み取り。** `readBounded` はチャンクを積み上げ、累計が 64 KiB を超えた瞬間にリーダーをキャンセルする——MCP レシピの [`readBodyWithCap`](./remote-mcp-workers.mdx#ボディキャップ-json-パースより前に強制する) と同じ形を、リクエストボディではなくバインディングの出力に適用したものだ。32×32 の PNG は数百バイトから数 KiB だ。この上限は、振る舞いのおかしい変換が Worker に大きなものをバッファさせることを決して許さないために存在する。
 - **固定 4×4 のコンポーネント数。** BlurHash はエンコーダに軸ごと 1–9 のコンポーネント数を選ばせるが、4×4 に固定すると 36 文字の定長文字列、一定のデコードコスト、そしてサイズフラグ——`(4-1) + (4-1) * 9 = 30` の base83 桁である `U`——を先頭文字として確認できるバリデータが手に入る。
 
 `anim: false` と `errorCode` フィールドは、本番コードの上に足した小さな追加 2 つで、このページのためにローカルの Workers ランタイムで再検証している。前者は静的な単一フレーム出力を固定し（後述のデコーダによる APNG の拒否は多層防御として残る）、後者はベストエフォートの節で説明する。
@@ -259,7 +259,7 @@ function ensureMinimumAxes(
 3 つの層を、この順で：
 
 1. **IHDR 契約。** 幅と高さは 32 以下、幅 × 高さは 1,024 以下、ビット深度 8、チャンネル数に対応づけられるカラータイプ、インターレースなし、未知の圧縮方式やフィルタ方式なし。
-2. **バイト予算付きのインフレート事前確認。** PNG のピクセルデータは zlib 圧縮されており、小さな IDAT が際限なく膨張しうる。`fflate` のストリーミング `Unzlib` で一度インフレートし、累計が `height * (1 + width * channels)`——整形式の画像が生成しなければならない正確なバイト数——を超えた瞬間に例外を投げるコールバックを付ける。同じチャンク走査で `iCCP`（埋め込みプロファイル）、APNG のチャンク、そして未知の*クリティカル*チャンクを弾く。
+2. **バイト予算付きのインフレート事前確認。** PNG のピクセルデータは zlib 圧縮されており、小さな IDAT が際限なく膨張しうる。`fflate` のストリーミング `Unzlib` で一度インフレートし、累計が `height * (1 + width * channels)`——整形式の画像が生成しなければならない正確なバイト数——を超えたら例外を投げるコールバックを付ける。`Unzlib` は各 `push()` を丸ごとインフレートしてからコールバックを呼ぶので、IDAT は 512 バイトずつ切って渡す。deflate の膨張率の上限は約 1032:1 なので、1 スライスが膨らめる量は約 512 KiB に収まる——64 KiB のストリームを一度に渡すと、チェックが走る前に約 66 MB まで膨らみうる。同じチャンク走査で `iCCP`（埋め込みプロファイル）、APNG のチャンク、そして未知の*クリティカル*チャンクを弾く。
 3. **デコードと正規化。** ここで初めて本物のデコーダを（CRC チェックを有効にして）呼び、報告された幅・高さ・深度・チャンネル数を IHDR 契約と突き合わせ、グレー、グレー+アルファ、RGB、RGBA をひとつの RGBA バッファに展開する——`tRNS` の透明度を尊重して、透明な PNG が黙って不透明にならないようにする。
 
 正規化では直せないものが 1 つある：**BlurHash にはアルファチャンネルがない。** エンコーダは RGB を読み、アルファを無視するので、透明なピクセルはその下にある RGB——多くの場合は黒——をそのまま寄与させる。透明なアップロードが重要なら、まず既知の背景に合成し（バインディングの `background` 出力オプション、または RGBA バッファに対する合成ステップ）、バックフィルでも同じ背景を使う。さもないと 2 つの経路が食い違う。
@@ -318,9 +318,15 @@ function chunkType(bytes: Uint8Array, offset: number): string {
   return String.fromCharCode(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
 }
 
+// fflate's Unzlib inflates a whole push() before it calls back, so the budget
+// is only checked per push. Deflate expands at most ~1032:1, which bounds one
+// slice to ~512 KiB of inflated data no matter what the IDAT contains.
+const INFLATE_PUSH_BYTES = 512;
+
 /**
  * Inflate once with a strict output budget before handing data to fast-png.
- * This prevents a small, malicious IDAT stream from expanding without bound.
+ * Pushing in small slices keeps a malicious IDAT from expanding far past the
+ * budget before the check runs.
  */
 function verifyPngDataBudget(bytes: Uint8Array, contract: PngContract): void {
   const expectedBytes = contract.height * (1 + contract.width * contract.channels);
@@ -354,7 +360,9 @@ function verifyPngDataBudget(bytes: Uint8Array, contract: PngContract): void {
     if (type === "IDAT") {
       if (idatEnded) throw new Error("non-consecutive PNG IDAT chunks");
       sawIdat = true;
-      inflater.push(bytes.subarray(dataOffset, dataOffset + length), false);
+      for (let start = dataOffset; start < dataOffset + length; start += INFLATE_PUSH_BYTES) {
+        inflater.push(bytes.subarray(start, Math.min(start + INFLATE_PUSH_BYTES, dataOffset + length)), false);
+      }
     } else if (sawIdat) {
       idatEnded = true;
     }
@@ -366,8 +374,10 @@ function verifyPngDataBudget(bytes: Uint8Array, contract: PngContract): void {
       break;
     }
 
-    // Reject unknown critical chunks (uppercase first letter). Ancillary chunks
-    // are bounded by their encoded size and fast-png either reads or skips them.
+    // Reject unknown critical chunks (uppercase first letter); this also rejects a
+    // suggested PLTE, which the transform never emits. Remaining ancillary chunks
+    // are bounded by their encoded size and fast-png reads or skips them -- iCCP,
+    // the one it would inflate, was rejected above.
     if (type !== "IHDR" && type !== "IDAT" && type.charCodeAt(0) <= 0x5a) {
       throw new Error("unsupported critical PNG chunk");
     }
@@ -588,6 +598,8 @@ ALTER TABLE photos ADD COLUMN blurhash TEXT;
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const bytes = await request.arrayBuffer();
+    // validateAndStore is preprocessAndStorePhoto without the hash step; the
+    // delete-on-insert-failure cleanup from the previous section still applies.
     const stored = await validateAndStore(env, bytes, { prefix: "photos" });
     if (!stored.ok) return failureResponse(stored);
     const id = await insertPhoto(env, { ...rowFrom(stored), blurhash: null });
@@ -633,8 +645,8 @@ export default {
 
 `wrangler dev` はクレデンシャルなしで Images バインディングをエミュレートし、それが後述の Workers ランタイムのテストを可能にしている。しかしローカル実装がカバーするのは変換オプションのサブセットだけで——観測できたのは `width`、`height`、`rotate`、`format`——Cloudflare のネットワーク側のデコードやクロップの挙動は再現しない。実際には：
 
-- 出力の正確な寸法とコンテンツタイプはローカルで**アサートできる**。
-- `fit` の意味論、`gravity: "auto"`、その他本物のデコーダに依存するものは**できない**——デプロイしたプレビューに対して一度検証する。
+- 出力のコンテンツタイプと、32×32 以下のラスターが返ってくることは、ローカルで**アサートできる**。
+- `fit` の意味論——出力の正確な寸法も含む。それを決めるのは `scale-down` だからだ——、`gravity: "auto"`、その他本物のデコーダに依存するものは**できない**——デプロイしたプレビューに対して一度検証する。
 - パイプラインはどちらでも安全だ。`inspectPngContract` が 32×32 を超えるどんなラスターも弾くので、`fit` を無視して予期しないものを返すローカルの変換があっても、結果は `decode` 段階の `NULL` であって、無制限のデコードにはならない。
 
 ローカルのバインディングは「API の形が正しい」、デプロイ先のチェックは「ピクセルが正しい」として扱う。[バインディング対応表](../workers/local-dev-bindings.mdx#バインディング対応表) が他のバインディングと並べてこれを載せている。
@@ -653,9 +665,9 @@ import { encode as encodePng } from "fast-png";
 
 const BASE83_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz#$%*+,-.:;=?@[]^_{|}~";
 const BASE83 = new Set(BASE83_ALPHABET);
-const COMPONENTS = 4;
-const SIZE_FLAG = (COMPONENTS - 1) + (COMPONENTS - 1) * 9;
-const HASH_LENGTH = 4 + 2 * COMPONENTS * COMPONENTS;
+const BLURHASH_COMPONENTS = 4;
+const SIZE_FLAG = (BLURHASH_COMPONENTS - 1) + (BLURHASH_COMPONENTS - 1) * 9;
+const HASH_LENGTH = 4 + 2 * BLURHASH_COMPONENTS * BLURHASH_COMPONENTS;
 
 export const PLACEHOLDER_MAX_SOURCE_AXIS = 100_000;
 export const PLACEHOLDER_MAX_DECODE_AXIS = 16;
@@ -711,7 +723,8 @@ export function createImagePlaceholder(
     if (pixels.byteLength !== dimensions.width * dimensions.height * 4) return null;
     const png = encodePng({ ...dimensions, data: pixels, depth: 8, channels: 4 });
     const dataUri = `data:image/png;base64,${base64(png)}`;
-    if (new TextEncoder().encode(dataUri).byteLength > PLACEHOLDER_MAX_DATA_URI_BYTES) return null;
+    // A base64 data URI is pure ASCII, so length is the byte count.
+    if (dataUri.length > PLACEHOLDER_MAX_DATA_URI_BYTES) return null;
     return { dataUri, ...dimensions };
   } catch {
     return null;
@@ -719,7 +732,7 @@ export function createImagePlaceholder(
 }
 ```
 
-`isCanonicalPhotoBlurhash` は描画のたびに走る。カラムはただの `TEXT` だからだ。手で編集された行、バグのあるバックフィル、将来のフォーマット変更は「プレースホルダなし」へ縮退しなければならず、壊れた `background-image` になってはならない。コンポーネントはフォールバックを明示する——ハッシュがなければ、ラッパーもなく、画像だけ：
+`base64`、`buildKey`、`deleteObjects`、`readImageDimensions`、`insertPhoto` といったヘルパーはプロジェクト側の接着コードなので、スニペットからは省いている。`isCanonicalPhotoBlurhash` は描画のたびに走る。カラムはただの `TEXT` だからだ。手で編集された行、バグのあるバックフィル、将来のフォーマット変更は「プレースホルダなし」へ縮退しなければならず、壊れた `background-image` になってはならない。コンポーネントはフォールバックを明示する——ハッシュがなければ、ラッパーもなく、画像だけ：
 
 ```tsx
 /** SSR-only wrapper: without JS, the real image remains fully visible. */
@@ -828,28 +841,30 @@ export class ImagePlaceholderController {
     return image.closest<HTMLElement>(WRAPPER_SELECTOR);
   }
 
-  #reveal(image: HTMLImageElement): void {
-    const wrapper = this.#wrapper(image);
-    if (!wrapper) return;
+  #resetState(wrapper: HTMLElement): void {
     wrapper.removeAttribute("data-placeholder-pending");
     wrapper.removeAttribute("data-placeholder-loaded");
     wrapper.removeAttribute("data-placeholder-error");
+  }
+
+  #reveal(image: HTMLImageElement): void {
+    const wrapper = this.#wrapper(image);
+    if (!wrapper) return;
+    this.#resetState(wrapper);
     wrapper.setAttribute(image.naturalWidth > 0 ? "data-placeholder-loaded" : "data-placeholder-error", "true");
   }
 
   #prepare(image: HTMLImageElement): void {
     const wrapper = this.#wrapper(image);
     if (!wrapper) return;
-    wrapper.removeAttribute("data-placeholder-pending");
-    wrapper.removeAttribute("data-placeholder-loaded");
-    wrapper.removeAttribute("data-placeholder-error");
+    this.#resetState(wrapper);
+    // `complete` cannot flip mid-scan: load/error are delivered as separate tasks,
+    // and the capture-phase listeners registered before the scan catch those.
     if (image.complete) {
       this.#reveal(image);
       return;
     }
     wrapper.setAttribute("data-placeholder-pending", "true");
-    // Close the completion race between the `complete` read and the pending mark.
-    if (image.complete) this.#reveal(image);
   }
 
   readonly #onSettle = (event: Event): void => {
@@ -876,7 +891,7 @@ export class ImagePlaceholderController {
 | 状態 | 扱い |
 |---|---|
 | JS が動く時点ですでにキャッシュ済み・完了済みの画像 | `image.complete` が true → 即座に表示し、pending にはしない |
-| 初回スキャンの*最中に*決着する画像 | キャプチャフェーズの `load` / `error` リスナーは `reconcile()` が走る**前に**登録され、`#prepare` は pending を付けた後に `complete` を再確認する |
+| 初回スキャンの直後に決着する画像 | キャプチャフェーズの `load` / `error` リスナーは `reconcile()` が走る**前に**登録されるので、同期的なスキャンがドキュメントを走査している間にキューされたイベントでも画像は表示される |
 | 読み込みエラー（404、ブロック、破損） | `error` も `load` と同じく表示する。`naturalWidth === 0` がスタイル用に両者を区別するが、いずれにせよ画像は隠されない |
 | フォールドのはるか下にある遅延画像（`loading="lazy"`） | ブラウザが実際に取得するまで pending のまま。その間はプレースホルダを出しておくのが正しい |
 | 無限スクロールで追加されたカード | `MutationObserver` が追加されたサブツリーをすべて準備する |
@@ -931,7 +946,7 @@ node scripts/backfill-blurhash.mjs --remote --d1 img-gallery --bucket img-galler
 ## 生成したハッシュは本物の base83 アルファベットで検証する -- カンマの落とし穴
 
 :::danger[base83 のアルファベットにはカンマが含まれ、手書きの文字クラスはそれを忘れる]
-BlurHash の base83 の桁は `0-9`、`A-Z`、`a-z`、そして 21 個の記号 `#$%*+,-.:;=?@[]^_{|}~` だ。このページの背後にある本番のバックフィルでは、正規表現の文字クラスとして書かれたバリデータが `,` を落としていて——`[...]` の中のカンマは区切りに見えるので、やりがちだ——完全に正当な生成済みハッシュを 21 件弾いた。条件付き書き込みのおかげでそれらの行は壊れるのではなく*安全に* `NULL` のまま残され、修正後の再実行で埋まった。しかし最終的な 294 件のハッシュのうち 64 件にはカンマが含まれているので、このバグを持つバリデータはおよそ 5 枚に 1 枚の画像のプレースホルダを黙って捨てることになる。
+BlurHash の base83 の桁は `0-9`、`A-Z`、`a-z`、そして 21 個の記号 `#$%*+,-.:;=?@[]^_{|}~` だ。このページの背後にある本番のバックフィルでは、正規表現の文字クラスとして書かれたバリデータが `,` を落としていて——`[...]` の中のカンマは区切りに見えるので、やりがちだ——バグが見つかるまでに完全に正当な生成済みハッシュを 21 件弾いた。条件付き書き込みのおかげでそれらの行は壊れるのではなく*安全に* `NULL` のまま残され、修正後の再実行で埋まった。完了した実行全体では 294 件のハッシュのうち 64 件にカンマが含まれている——つまり、このバグを持つバリデータはおよそ 5 枚に 1 枚の画像のプレースホルダを黙って捨てることになる。
 :::
 
 ここから 3 つのルールが導かれる：
