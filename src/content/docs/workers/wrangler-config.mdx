@@ -76,6 +76,17 @@ binding = "FILES"
 bucket_name = "my-files"
 ```
 
+### Images
+
+The Cloudflare Images binding is a single table, not an array -- one Worker gets one `env.IMAGES`, an RPC to Cloudflare's transformation service (awaiting it is I/O, not CPU time):
+
+```toml
+[images]
+binding = "IMAGES"
+```
+
+Like every other binding it is **not inherited** by named environments (see [the silent bug below](#named-environments-service-bindings-the-1-silent-bug-bindings-and-vars-are-not-inherited)), so a preview environment has to declare it again as `[env.preview.images]`. `wrangler dev` emulates it without credentials but only for a subset of transform options -- see the [binding support matrix](./local-dev-bindings.mdx#the-binding-support-matrix) and, for a full upload-time pipeline built on it, [Worker-Side Image Preprocessing and BlurHash Placeholders](../recipes/worker-image-preprocessing-blurhash.mdx).
+
 ### Environment Variables
 
 ```toml
