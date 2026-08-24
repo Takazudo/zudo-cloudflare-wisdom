@@ -25,7 +25,9 @@ export default defineConfig({
 
 ```bash
 pnpm build
+# Astro outputs to dist/
 
+# Nest under base path for CF Pages
 mkdir -p deploy/pj/my-site
 cp -r dist/* deploy/pj/my-site/
 echo '/ /pj/my-site/ 302' > deploy/_redirects
@@ -59,6 +61,18 @@ Astro サイトに API エンドポイントを追加するには：
 2. 必要なバインディングを含む `wrangler.toml` を作成
 3. Functions は `pages deploy` で自動検出・デプロイされる
 
+```
+project-root/
+├── src/              # Astro source
+├── functions/        # Pages Functions
+│   └── pj/
+│       └── my-site/
+│           └── api/
+│               └── search.ts
+├── wrangler.toml     # Bindings config
+└── astro.config.ts
+```
+
 :::warning[関数パスはベースパスと一致させる]
 Astro サイトが `base: "/pj/my-site"` を使用する場合、関数ファイルは正しい URL で配信されるよう `functions/pj/my-site/` 配下に置く必要がある。
 :::
@@ -70,7 +84,7 @@ Astro サイトが `base: "/pj/my-site"` を使用する場合、関数ファイ
 ```yaml
 - uses: actions/checkout@v5
   with:
-    fetch-depth: 0
+    fetch-depth: 0  # Full history for git-based dates
 ```
 
 これがないと、すべてのページの作成日が CI 実行日になってしまう。
