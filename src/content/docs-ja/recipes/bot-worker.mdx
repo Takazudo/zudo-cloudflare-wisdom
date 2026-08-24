@@ -178,8 +178,8 @@ function timingSafeEqualHex(a: string, b: string): boolean {
 TTL ベースの有効期限を使ったユーザーごとのレート制限：
 
 ```typescript
-const RATE_LIMIT = 30; // ウィンドウあたりのリクエスト数
-const RATE_WINDOW = 86400; // 24 時間
+const RATE_LIMIT = 30; // requests per window
+const RATE_WINDOW = 86400; // 24 hours
 
 async function checkRateLimit(
   env: Env,
@@ -209,7 +209,7 @@ KV は結果整合性。高い同時実行数では、数件の余分なリク�
 Webhook 返信には有用だが、永続的なチャット履歴や監査ログではない。
 
 ```typescript
-const THREAD_STATE_TTL = 86400; // 24 時間
+const THREAD_STATE_TTL = 86400; // 24 hours
 
 interface BotThreadState {
   messages: Array<{ role: string; content: string }>;
@@ -296,12 +296,12 @@ async function callAI(
 ```
 packages/my-bot/
 ├── src/
-│   ├── index.ts           # Worker エントリーポイント
-│   ├── webhook.ts         # 署名検証
-│   ├── ai.ts              # AI API 統合 + ツールループ
-│   ├── tools.ts           # ツール定義と実行
-│   ├── types.ts           # TypeScript インターフェース
-│   └── utils.ts           # ヘルパー（エンコード、タイミングセーフ比較）
+│   ├── index.ts           # Worker entry point
+│   ├── webhook.ts         # Signature verification
+│   ├── ai.ts              # AI API integration + tool loop
+│   ├── tools.ts           # Tool definitions and execution
+│   ├── types.ts           # TypeScript interfaces
+│   └── utils.ts           # Helpers (encoding, timing-safe compare)
 ├── wrangler.toml
 ├── package.json
 └── tsconfig.json

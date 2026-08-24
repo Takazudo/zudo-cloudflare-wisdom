@@ -30,7 +30,7 @@ graph LR
 import MiniSearch from 'minisearch';
 import fs from 'fs';
 
-const documents = loadDocuments(); // ドキュメント読み込みロジック
+const documents = loadDocuments(); // Your document loading logic
 
 const miniSearch = new MiniSearch({
   fields: ['title', 'description', 'content'],
@@ -41,7 +41,7 @@ miniSearch.addAll(documents);
 
 fs.writeFileSync(
   'functions/pj/my-site/api/search-data.json',
-  JSON.stringify(documents) // 生ドキュメントを保存、MiniSearch はランタイムでインデックス化
+  JSON.stringify(documents) // Store raw docs, MiniSearch indexes at runtime
 );
 ```
 
@@ -80,7 +80,7 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
     });
   }
 
-  // キーワードを非同期でログ
+  // Log keyword asynchronously
   const logKey = `search:${Date.now()}:${crypto.randomUUID()}`;
   context.waitUntil(
     context.env.KEYWORD_LOGS.put(logKey, JSON.stringify({
