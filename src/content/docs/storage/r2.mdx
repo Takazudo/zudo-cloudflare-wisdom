@@ -83,7 +83,7 @@ R2 exposes an S3-compatible API at `https://{R2_ACCOUNT_ID}.r2.cloudflarestorage
 
 ### Use aws4fetch, not the AWS SDK
 
-Use [`aws4fetch`](https://github.com/mhart/aws4fetch) (~5 KB minified), **not** `@aws-sdk/client-s3` + `@aws-sdk/s3-request-presigner`. The AWS SDK v3 ships heavy smithy / `AbortSignal` plumbing that blows the Worker **1 MB code-size limit** for what is, here, a single signing call.
+Use [`aws4fetch`](https://github.com/mhart/aws4fetch) (~5 KB minified), **not** `@aws-sdk/client-s3` + `@aws-sdk/s3-request-presigner`. The AWS SDK v3 ships heavy smithy / `AbortSignal` plumbing -- hundreds of KB of Worker bundle for what is, here, a single signing call. It blew the old **1 MB** Worker size limit outright; the current limits are **3 MB compressed on the Free plan and 10 MB on Paid** at the time of writing, which makes it a waste rather than a hard failure, but not a reason to ship it.
 
 ```bash
 npm install aws4fetch
