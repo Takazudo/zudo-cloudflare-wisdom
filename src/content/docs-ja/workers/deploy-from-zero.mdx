@@ -203,7 +203,7 @@ function codes(error) {
   const out = [];
   for (let e = error; e; e = e.cause) {
     if (e.code) out.push(e.code);
-    if (Array.isArray(e.errors)) out.push(...e.errors.flatMap(codes)); // <- 必須
+    if (Array.isArray(e.errors)) out.push(...e.errors.flatMap(codes)); // <- required
   }
   return out;
 }
