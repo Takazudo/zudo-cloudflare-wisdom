@@ -9,18 +9,19 @@ set -euo pipefail
 #   3. Template drift check (needs node_modules — create-zudo-doc devDep)
 #   4. Pin parity check (pure-Node, reads package.json only)
 #   5. Wrangler pin check (needs node_modules — reads the zfb platform binary)
-#   6. Type checking (zfb check)
-#   7. Build (zfb build)
-#   8. HTML validation (html-validate dist/**/*.html)
-#   9. Link check (check-links)
+#   6. Code parity check (parser-backed, reads mirrored docs)
+#   7. Type checking (zfb check)
+#   8. Build (zfb build)
+#   9. HTML validation (html-validate dist/**/*.html)
+#  10. Link check (check-links)
 #
 # Env overrides for non-interactive use:
-#   B4PUSH_SKIP_HTML_VALIDATE=1  — skip HTML validation (step 8)
-#   B4PUSH_SKIP_LINK_CHECK=1     — skip link check (step 9)
+#   B4PUSH_SKIP_HTML_VALIDATE=1  — skip HTML validation (step 9)
+#   B4PUSH_SKIP_LINK_CHECK=1     — skip link check (step 10)
 
 START_TIME=$(date +%s)
 FAILURES=()
-TOTAL_STEPS=9
+TOTAL_STEPS=10
 CURRENT_STEP=0
 
 step() {
@@ -90,7 +91,15 @@ else
   fail "Wrangler pin check"
 fi
 
-# ── Step 6: Type checking ─────────────────────────────
+# ── Step 6: Code parity check ─────────────────────────
+step "Code parity check (check:code-parity)"
+if (cd "$ROOT_DIR" && pnpm check:code-parity); then
+  pass "Code parity check passed"
+else
+  fail "Code parity check"
+fi
+
+# ── Step 7: Type checking ─────────────────────────────
 step "Type checking (zfb check)"
 if (cd "$ROOT_DIR" && pnpm check); then
   pass "Type checking passed"
@@ -98,7 +107,7 @@ else
   fail "Type checking"
 fi
 
-# ── Step 7: Build ─────────────────────────────────────
+# ── Step 8: Build ─────────────────────────────────────
 step "Build (zfb build)"
 if (cd "$ROOT_DIR" && pnpm build); then
   pass "Build passed"
@@ -106,7 +115,7 @@ else
   fail "Build"
 fi
 
-# ── Step 8: HTML validation ───────────────────────────
+# ── Step 9: HTML validation ───────────────────────────
 step "HTML validation (html-validate)"
 if [[ "${B4PUSH_SKIP_HTML_VALIDATE:-}" == "1" ]]; then
   skip "HTML validation (B4PUSH_SKIP_HTML_VALIDATE=1)"
@@ -118,7 +127,7 @@ else
   fi
 fi
 
-# ── Step 9: Link check ───────────────────────────────
+# ── Step 10: Link check ──────────────────────────────
 step "Link check (check:links)"
 if [[ "${B4PUSH_SKIP_LINK_CHECK:-}" == "1" ]]; then
   skip "Link check (B4PUSH_SKIP_LINK_CHECK=1)"

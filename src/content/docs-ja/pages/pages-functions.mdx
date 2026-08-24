@@ -35,7 +35,7 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
   const url = new URL(context.request.url);
   const query = url.searchParams.get("q");
 
-  // KV バインディングへのアクセス
+  // Access KV binding
   const logs = context.env.KEYWORD_LOGS;
 
   return new Response(JSON.stringify({ results: [] }), {
@@ -60,9 +60,9 @@ TypeScript コードの `Env` インターフェースはバインディング�
 
 ```typescript
 interface Env {
-  KEYWORD_LOGS: KVNamespace;   // wrangler.toml のバインディング名と一致
-  DB: D1Database;              // D1 バインディング
-  FILES: R2Bucket;             // R2 バインディング
+  KEYWORD_LOGS: KVNamespace;   // matches binding name in wrangler.toml
+  DB: D1Database;              // D1 binding
+  FILES: R2Bucket;             // R2 binding
 }
 ```
 
@@ -71,10 +71,10 @@ interface Env {
 関数は `node_modules` からインポートできます。ただし、バンドラーの挙動は通常の Node.js とは異なります：
 
 ```typescript
-// 動作する -- npm パッケージのインポート
+// Works -- importing npm packages
 import MiniSearch from 'minisearch';
 
-// 動作する -- JSON のインポート（型安全のため @ts-expect-error を使用）
+// Works -- importing JSON (with @ts-expect-error for type safety)
 // @ts-expect-error JSON import bundled by esbuild
 import searchData from './search-data.json';
 ```
@@ -83,7 +83,7 @@ import searchData from './search-data.json';
 npm パッケージを必要とする関数の場合、デプロイ前にインストールしておく必要があります。CI での例：
 
 ```bash
-pnpm add -w minisearch  # 依存関係を追加
+pnpm add -w minisearch  # Add the dependency
 pnpm dlx wrangler@4 pages deploy deploy --project-name=my-site
 ```
 
