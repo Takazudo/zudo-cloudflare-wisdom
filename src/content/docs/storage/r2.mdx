@@ -188,6 +188,8 @@ await env.DB.prepare(
 
 This protects the same invariant as the delete ordering below, applied to creation instead: **a D1 row must never claim a blob that doesn't exist.** Writing the blob first means a failure between the two steps leaves an orphaned object — recoverable, see reclamation below — instead of a dangling pointer that 404s in front of a user.
 
+When the row also carries metadata derived from the bytes — dimensions, a BlurHash placeholder — compute it **before** the `put()`, so a derivation failure never leaves an orphan behind, and delete the object best-effort if the row insert fails. [Worker-Side Image Preprocessing and BlurHash Placeholders](../recipes/worker-image-preprocessing-blurhash.mdx) walks through that full ingestion ordering, including the retry semantics.
+
 ### Immutable UUID keys
 
 Derive keys from `crypto.randomUUID()`, or a content hash (see [Key safety](#key-safety)) — never from a user-supplied name, a display title, or anything that might change later.
@@ -324,4 +326,4 @@ This costs one extra table and one extra write per create/delete, in exchange fo
 
 - **No automatic public URLs**: Unlike S3 with public buckets, R2 requires a Worker or custom domain to serve files publicly
 - **Object key limit**: Keys can be up to 1024 bytes
-- **Metadata**: Use `customMetadata` for your own key-value pairs, `httpMetadata` for HTTP headers
+- **Metadata**: Use `customMetadata` for your own key-value pairs, `httpMetadata` for HTTP headers. For a value a list page needs *before* it fetches the object (a placeholder hash, dimensions), a D1 column is the read path and `customMetadata` is at most a secondary copy — see [D1 column or R2 customMetadata](../recipes/worker-image-preprocessing-blurhash.mdx#d1-column-or-r2-custommetadata-follow-the-read-path)

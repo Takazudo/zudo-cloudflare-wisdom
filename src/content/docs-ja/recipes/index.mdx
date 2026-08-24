@@ -25,3 +25,4 @@ Cloudflare Pages、Workers、ストレージサービスを使った本番プロ
 - [Workers 上のリモート MCP サーバー](./remote-mcp-workers.mdx) -- WebStandard な Streamable HTTP トランスポートによるステートレスなリモート MCP サーバー -- リクエストごとの isolate インスタンス化、POST 専用の 405 契約、JSON パース前に強制するボディキャップ、SDK のクライアント半分に対するバンドルサイズチェック
 - [固定アップストリームへのリバースプロキシ](./reverse-proxy.mdx) -- 両方のレグでのヘッダー衛生、クロスリクエストのホップ上限を持つ手動リダイレクト書き換え、cookie/CSP/HSTS に関する明示的なトラストモデルの選択、共有キャッシュの安全性、そして workerd の Content-Encoding トラップ
 - [社内サイト向けの Cloudflare Access](./cloudflare-access.mdx) -- Worker の手前に置く identity ベースの境界認可。アカウント単位のセットアップ、zone なしで workers.dev とプレビューまで覆う Worker スコープのアプリケーション、WebSocket の制約、そして呼び出し元の identity を読む方法
+- [Worker 側の画像前処理と BlurHash プレースホルダ](./worker-image-preprocessing-blurhash.mdx) -- 上限付きの画像取り込みパイプライン。ヘッダーからの検証、JavaScript でピクセルを触る前に Images バインディングで縮小、固定 4×4 の BlurHash を nullable なメタデータとしてベストエフォートで永続化、クリーンアップ付きの blob-first / row-last、ローカルとデプロイ先の Images の差、base83 のカンマの落とし穴、そして画像をデフォルトでは決して隠さないブラウザ契約
