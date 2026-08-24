@@ -142,9 +142,9 @@ _worker.js.map
 こうなると、ブラウザで `/` を開いてもアセットに一致せず、`not_found_handling` で応答され、404 ページが返る — **Worker は一度も動かない**。同じ URL を `curl` で叩くと Worker にフォールスルーして正常に描画される：
 
 ```
-curl そのまま                          -> 200  <title>My Site</title>
+curl bare                            -> 200  <title>My Site</title>
 curl -H 'sec-fetch-mode: navigate'   -> 404  <title>Not found</title>
-ヘッドレスブラウザ                      -> 404
+headless browser                     -> 404
 ```
 
 サイトは人間の訪問者全員に対して壊れており、HTTP レベルのチェックはすべて緑になる。
@@ -160,8 +160,8 @@ curl -H 'sec-fetch-mode: navigate'   -> 404  <title>Not found</title>
 directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "404-page"
-# `/` はサーバーレンダリングで静的ファイルが無く、API ルートも Worker のもの。
-# それ以外（例: /assets/*）は引き続き Worker を経由しない。
+# `/` is server-rendered and has no static file; the API routes are the
+# Worker's too. Everything else (e.g. /assets/*) still bypasses the Worker.
 run_worker_first = ["/", "/api/*"]
 ```
 
@@ -170,17 +170,17 @@ run_worker_first = ["/", "/api/*"]
 検証は、実際にそのヘッダーを伴うリクエストで行うこと。`wrangler dev` はこの挙動を忠実に再現する：
 
 ```bash
-curl -H 'sec-fetch-mode: navigate' http://127.0.0.1:8787/        # 200 を期待
-curl -H 'sec-fetch-mode: navigate' http://127.0.0.1:8787/nope    # 本物の 404 を期待
-curl http://127.0.0.1:8787/assets/styles-abc123.css              # 引き続き直接配信
+curl -H 'sec-fetch-mode: navigate' http://127.0.0.1:8787/        # expect 200
+curl -H 'sec-fetch-mode: navigate' http://127.0.0.1:8787/nope    # expect the real 404
+curl http://127.0.0.1:8787/assets/styles-abc123.css              # still served directly
 ```
 
 :::warning[`fetch()` はこのヘッダーを送れないので、Node のスモークテストでは捕まえられない]
 `Sec-` で始まる名前は Fetch 仕様の**禁止ヘッダー名**であり、undici — したがって Node のグローバル `fetch()` — はこれを黙って落とす。リクエストは通常のものとして送出され、フォールスルーした 200 が返る：
 
 ```
-node fetch + sec-fetch-mode  -> 200   （ヘッダーが落とされる）
-curl       + sec-fetch-mode  -> 404   （ヘッダーが送られる）
+node fetch + sec-fetch-mode  -> 200   (header dropped)
+curl       + sec-fetch-mode  -> 404   (header sent)
 ```
 
 つまり fetch ベースのデプロイ後チェックは、ユーザーが決して生成しないリクエスト形状を試しており、まさにこのバグを緑のまま通過させる。ヘッダーをそのまま書き出す `node:https`（あるいは `undici.request`、実ブラウザ）を使うこと。
