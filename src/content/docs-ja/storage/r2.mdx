@@ -64,7 +64,7 @@ R2 は `https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com` で S3 互換 API を�
 
 ### AWS SDK ではなく aws4fetch を使う
 
-[`aws4fetch`](https://github.com/mhart/aws4fetch)（minify 後 ~5 KB）を使い、`@aws-sdk/client-s3` + `@aws-sdk/s3-request-presigner` は **使わない**。AWS SDK v3 は重い smithy / `AbortSignal` の仕組みを同梱しており、ここでは単一の署名呼び出しのためだけに Worker の **1 MB コードサイズ制限** を突破してしまう。
+[`aws4fetch`](https://github.com/mhart/aws4fetch)（minify 後 ~5 KB）を使い、`@aws-sdk/client-s3` + `@aws-sdk/s3-request-presigner` は **使わない**。AWS SDK v3 は重い smithy / `AbortSignal` の仕組みを同梱しており、ここでは単一の署名呼び出しのためだけに数百 KB の Worker バンドルを抱え込む。かつての **1 MB** の Worker サイズ上限は丸ごと突破していた。現在の上限は執筆時点で **Free プランが圧縮後 3 MB、Paid が 10 MB** なので、致命的な失敗ではなく無駄になったが、それでも同梱する理由にはならない。
 
 ```bash
 npm install aws4fetch
