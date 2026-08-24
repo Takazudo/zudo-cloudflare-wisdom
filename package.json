@@ -17,6 +17,8 @@
     "preview": "zfb preview",
     "check": "zfb check",
     "check:html": "pnpm dlx html-validate \"dist/**/*.html\"",
+    "check:code-parity": "node scripts/check-code-parity.mjs",
+    "test:code-parity": "node --test scripts/check-code-parity.test.mjs",
     "check:pin-parity": "node scripts/check-pin-parity.mjs",
     "check:wrangler-pin": "node scripts/check-wrangler-pin.mjs",
     "check:category-meta": "node scripts/check-category-meta.mjs",
