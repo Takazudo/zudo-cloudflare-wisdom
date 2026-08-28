@@ -1074,3 +1074,4 @@ Run it after `build` when the Worker entry is a build artefact (`main = "./dist/
 - [Idempotency-Key Ledger on D1](./idempotency-ledger.mdx) -- the claim-before-mutate pattern that makes a client retry idempotent, which a fresh UUID key alone does not give you.
 - [Cron + D1 Queue](./cron-d1-queue.mdx) -- the work-queue shape to reach for when preprocessing outgrows a single request.
 - [Wrangler Config](../workers/wrangler-config.mdx) -- per-environment bindings, and why `[env.preview.images]` has to be repeated.
+- [Layered Image Composition with the Images Binding](./worker-image-composition.mdx) -- the other half of the same binding: `draw()`, Porter-Duff modes, transparent bleed, and the single-use transformer rule behind error `9525`.

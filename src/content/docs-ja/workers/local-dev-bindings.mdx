@@ -21,13 +21,13 @@ sidebar_position: 8
 | Plain vars | Yes | No |
 | Secrets | Yes | No |
 | Cache API (`caches.default`, not a binding) | Yes | No |
-| Images (`[images]` binding) | Partial -- `width`, `height`, `rotate`, and `format` only; `fit` / `gravity` and real decoding need a deployment | No |
+| Images (`[images]` binding) | Partial -- `width`, `height`, `rotate`, and `format` only; `fit` / `gravity`, all [composition options](../recipes/worker-image-composition.mdx), and real decoding need a deployment or `--remote` | No |
 | AI (`remote: true`) | No -- proxies to the real API | Yes -- and its absence fails the *entire* dev server boot |
 | Vectorize (default config) | No -- prints `not supported`, no emulation | N/A -- binding is simply absent from `env` |
 | Vectorize (`remote: true`) | No local emulation -- proxies to the real index | Yes -- same remote-proxy path as AI |
 | Workers Cache (`cache.enabled` block, edge caching) | No -- deploy-time feature, zero local simulation | N/A -- only observable on a deployed Worker |
 
-Cache API までのブロック -- D1、R2、KV、Queues、Rate Limiting、Assets、プレーンな vars、secrets、そして Cache API 自体 -- はすべてローカルでエミュレートされ、Cloudflare のクラウド側からは何も必要としない。それより下の行はそれぞれ足りないものが違う：Images はクレデンシャルなしでローカル動作するが、変換オプションのサブセットしかエミュレートしないため、本物のクロップや fit の挙動に依存するものはデプロイ先で検証する必要がある（[Images のサブセット](../recipes/worker-image-preprocessing-blurhash.mdx#出荷前に記録しておくべきランタイム制約-ローカルの-images-バインディングはサブセットなので-fit-とクロップはデプロイ先で検証する) を参照）。AI は常に有効な `CLOUDFLARE_API_TOKEN` を必要とする。Vectorize は `remote: true` を選んだ場合だけそれを必要とし、そうでなければ単に存在しない。そして Workers Cache は、設定にかかわらずローカルでは一切動かない。
+Cache API までのブロック -- D1、R2、KV、Queues、Rate Limiting、Assets、プレーンな vars、secrets、そして Cache API 自体 -- はすべてローカルでエミュレートされ、Cloudflare のクラウド側からは何も必要としない。それより下の行はそれぞれ足りないものが違う：Images はクレデンシャルなしでローカル動作するが、変換オプションのサブセットしかエミュレートしないため、本物のクロップや fit の挙動に依存するものはデプロイ先で検証する必要がある（[Images のサブセット](../recipes/worker-image-preprocessing-blurhash.mdx#出荷前に記録しておくべきランタイム制約-ローカルの-images-バインディングはサブセットなので-fit-とクロップはデプロイ先で検証する) を参照。レイヤー合成にいたってはローカルにまったく存在しない —— [Images バインディングによるレイヤー合成](../recipes/worker-image-composition.mdx) を参照）。AI は常に有効な `CLOUDFLARE_API_TOKEN` を必要とする。Vectorize は `remote: true` を選んだ場合だけそれを必要とし、そうでなければ単に存在しない。そして Workers Cache は、設定にかかわらずローカルでは一切動かない。
 
 :::warning[`ai: { remote: true }` は AI バインディングだけでなく dev サーバー全体を落とす]
 `ai` バインディングの `remote: true` モードは、起動時にリモートプロキシセッションを強制する。`CLOUDFLARE_API_TOKEN` が設定されていないと、そのプロキシセッションの確立に失敗する -- そして `wrangler dev` は、`env.AI` に一切触れないリクエストに対してさえ、起動そのものを拒否する。
