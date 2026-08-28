@@ -1074,3 +1074,4 @@ Worker のエントリがビルド成果物（`main = "./dist/_worker.js"`）で
 - [D1 による Idempotency-Key 台帳](./idempotency-ledger.mdx) -- クライアントのリトライを冪等にする claim-before-mutate パターン。新しい UUID キーだけでは手に入らないもの。
 - [Cron + D1 キュー](./cron-d1-queue.mdx) -- 前処理が 1 リクエストに収まらなくなったときに手を伸ばすワークキューの形。
 - [Wrangler Config](../workers/wrangler-config.mdx) -- 環境ごとのバインディングと、`[env.preview.images]` を繰り返さなければならない理由。
+- [Images バインディングによるレイヤー合成](./worker-image-composition.mdx) -- 同じバインディングのもう半分: `draw()`、Porter-Duff のモード、透明ブリード、そしてエラー `9525` の背後にある「transformer は一度しか使えない」というルール。

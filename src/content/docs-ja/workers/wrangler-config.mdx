@@ -85,7 +85,7 @@ Cloudflare Images バインディングは配列ではなく単一のテーブ�
 binding = "IMAGES"
 ```
 
-他のすべてのバインディングと同じく、名前付き環境には**継承されない**（後述の [静かなバグ](#名前付き環境とサービスバインディング-最大の落とし穴-バインディングと-vars-は継承されない) を参照）ので、プレビュー環境では `[env.preview.images]` として改めて宣言する必要がある。`wrangler dev` はクレデンシャルなしでこれをエミュレートするが、変換オプションのサブセットに限られる——[バインディング対応表](./local-dev-bindings.mdx#バインディング対応表) と、このバインディングの上に組んだアップロード時パイプラインの全体像は [Worker 側の画像前処理と BlurHash プレースホルダ](../recipes/worker-image-preprocessing-blurhash.mdx) を参照。
+他のすべてのバインディングと同じく、名前付き環境には**継承されない**（後述の [静かなバグ](#名前付き環境とサービスバインディング-最大の落とし穴-バインディングと-vars-は継承されない) を参照）ので、プレビュー環境では `[env.preview.images]` として改めて宣言する必要がある。`wrangler dev` はクレデンシャルなしでこれをエミュレートするが、変換オプションのサブセットに限られる——[バインディング対応表](./local-dev-bindings.mdx#バインディング対応表) と、このバインディングの上に組んだアップロード時パイプラインの全体像は [Worker 側の画像前処理と BlurHash プレースホルダ](../recipes/worker-image-preprocessing-blurhash.mdx) を参照。 同じバインディングの合成側 —— `draw()`、Porter-Duff のモード、透明ブリード、そして transformer を一度しか使えないというルール —— については [Images バインディングによるレイヤー合成](../recipes/worker-image-composition.mdx) を参照。
 
 ### 環境変数
 
