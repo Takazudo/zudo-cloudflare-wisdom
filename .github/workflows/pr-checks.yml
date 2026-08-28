@@ -160,6 +160,11 @@ jobs:
       - name: Check code parity corpus (pnpm check:code-parity)
         run: pnpm check:code-parity
 
+      # The link checker silently matched zero links once the build started
+      # emitting unquoted attributes -- these tests are the regression guard.
+      - name: Run link checker regression tests (pnpm test:links)
+        run: pnpm test:links
+
       # Backstop for the local b4push gate: catch a zfb bump that left the
       # wrangler pin stale (would silently break local `zfb dev`/`preview`).
       # Needs node_modules, so it rides the typecheck job rather than the

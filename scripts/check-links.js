@@ -91,20 +91,50 @@ export async function collectFiles(dir, extensions) {
 
 // --- HTML Link Extraction ---
 
-export function extractHtmlLinks(html) {
+// The production build is minified and emits **unquoted** attribute values
+// (`href=/docs/foo` / `id=bindings-images`), so an extractor that only matches
+// quoted values silently finds zero links. Accept all three HTML forms.
+const HREF_REGEX = /<a\s[^>]*?href=(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/gi;
+
+/** Decode the handful of entities that can legally appear inside an attribute. */
+function decodeAttr(value) {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'");
+}
+
+function isExternalOrNonNavigable(href) {
+  return (
+    /^https?:\/\//i.test(href) ||
+    /^\/\//.test(href) ||
+    /^mailto:/i.test(href) ||
+    /^javascript:/i.test(href) ||
+    /^data:/i.test(href) ||
+    /^tel:/i.test(href)
+  );
+}
+
+/**
+ * Extract every in-site `<a href>` from built HTML.
+ *
+ * `includeFragmentOnly` keeps same-page `#anchor` links, which the path-oriented
+ * callers skip but the anchor checker needs.
+ */
+export function extractHtmlLinks(html, { includeFragmentOnly = false } = {}) {
   const links = [];
-  const regex = /<a\s[^>]*?href=(?:"([^"]*)"|'([^']*)')[^>]*>/gi;
+  HREF_REGEX.lastIndex = 0;
   let match;
   let lastIndex = 0;
   let currentLine = 1;
-  while ((match = regex.exec(html)) !== null) {
-    const href = match[1] || match[2];
-    if (/^https?:\/\//i.test(href)) continue;
-    if (/^#/.test(href)) continue;
-    if (/^mailto:/i.test(href)) continue;
-    if (/^javascript:/i.test(href)) continue;
-    if (/^data:/i.test(href)) continue;
-    if (/^tel:/i.test(href)) continue;
+  while ((match = HREF_REGEX.exec(html)) !== null) {
+    const raw = match[1] ?? match[2] ?? match[3];
+    if (raw === undefined) continue;
+    const href = decodeAttr(raw);
+    if (isExternalOrNonNavigable(href)) continue;
+    if (!includeFragmentOnly && /^#/.test(href)) continue;
 
     for (let i = lastIndex; i < match.index; i++) {
       if (html[i] === '\n') currentLine++;
@@ -113,6 +143,27 @@ export function extractHtmlLinks(html) {
     links.push({ href, line: currentLine });
   }
   return links;
+}
+
+/**
+ * Collect every fragment target a page offers: element ids plus legacy
+ * `<a name>` anchors. Handles quoted and unquoted attribute values.
+ */
+export function extractHtmlIds(html) {
+  const ids = new Set();
+  const patterns = [
+    /\sid=(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/gi,
+    /<a\s(?:[^>]*?\s)?name=(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/gi,
+  ];
+  for (const regex of patterns) {
+    regex.lastIndex = 0;
+    let match;
+    while ((match = regex.exec(html)) !== null) {
+      const raw = match[1] ?? match[2] ?? match[3];
+      if (raw) ids.add(decodeAttr(raw));
+    }
+  }
+  return ids;
 }
 
 // --- Link Resolution ---
@@ -167,6 +218,111 @@ export async function resolveLinkDetail(href, distDir, basePath = "/", fileDir =
 export async function resolveLink(href, distDir, basePath = "/", fileDir = "") {
   const type = await resolveLinkDetail(href, distDir, basePath, fileDir);
   return type !== "missing";
+}
+
+/**
+ * Resolve a link to the HTML file that serves it, or null when it resolves to
+ * a non-HTML asset or does not exist. Mirrors resolveLinkDetail's path logic;
+ * the anchor checker needs the file itself, not just whether it exists.
+ */
+export async function resolveLinkFile(href, distDir, basePath = "/", fileDir = "") {
+  const clean = href.split("#")[0].split("?")[0];
+
+  // A bare fragment has no path to resolve; the caller substitutes the
+  // containing file as the target.
+  if (!clean) return null;
+
+  let absolute = clean;
+  if (!clean.startsWith("/")) {
+    const dirInDist = fileDir ? relative(distDir, fileDir) : "";
+    absolute = "/" + join(dirInDist, clean);
+  }
+
+  let stripped = absolute;
+  if (basePath !== "/" && stripped.startsWith(basePath)) {
+    stripped = "/" + stripped.slice(basePath.length);
+  }
+
+  const relPath = stripped.startsWith("/") ? stripped.slice(1) : stripped;
+  if (!relPath) {
+    const root = join(distDir, "index.html");
+    return (await fileExists(root)) ? root : null;
+  }
+
+  if (extname(relPath)) {
+    if (extname(relPath).toLowerCase() !== ".html") return null;
+    const exact = join(distDir, relPath);
+    return (await fileExists(exact)) ? exact : null;
+  }
+
+  const asIndex = join(distDir, relPath, "index.html");
+  if (await fileExists(asIndex)) return asIndex;
+  const asHtml = join(distDir, relPath + ".html");
+  if (await fileExists(asHtml)) return asHtml;
+  return null;
+}
+
+/**
+ * Verify that every `#fragment` in a built page actually exists on its target.
+ *
+ * The build only *warns* on an unresolvable anchor, and heading ids are scoped
+ * under their parent h2 by zfb (`### Images` under `## Bindings` becomes
+ * `bindings-images`), so a hand-written `#images` looks plausible and ships
+ * broken. Path breakage is caught elsewhere; this checks fragments only, and
+ * skips any link whose *path* does not resolve so the two never double-report.
+ */
+export async function checkHtmlAnchors(distDir, rootDir, basePath = "/", excludePatterns = []) {
+  const broken = [];
+  const htmlFiles = await collectFiles(distDir, [".html"]);
+  const idCache = new Map();
+
+  async function idsFor(file) {
+    if (!idCache.has(file)) {
+      idCache.set(file, extractHtmlIds(await readFile(file, "utf-8")));
+    }
+    return idCache.get(file);
+  }
+
+  for (const file of htmlFiles) {
+    const content = await readFile(file, "utf-8");
+    idCache.set(file, extractHtmlIds(content));
+    const links = extractHtmlLinks(content, { includeFragmentOnly: true });
+    const fileDir = dirname(file);
+
+    for (const { href, line } of links) {
+      if (excludePatterns.some((p) => p.test(href))) continue;
+
+      const hashIndex = href.indexOf("#");
+      if (hashIndex === -1) continue;
+      const rawHash = href.slice(hashIndex + 1);
+      if (!rawHash) continue; // bare "#" is a no-op link, not a broken anchor
+      if (rawHash === "top") continue; // "#top" is a browser built-in
+
+      // Fragments are percent-encoded in href but raw in the id attribute.
+      let hash;
+      try {
+        hash = decodeURIComponent(rawHash);
+      } catch {
+        hash = rawHash;
+      }
+
+      const pathPart = href.slice(0, hashIndex);
+      const target = pathPart
+        ? await resolveLinkFile(pathPart, distDir, basePath, fileDir)
+        : file;
+
+      // Path is broken (reported by checkHtmlLinks) or points at a non-HTML
+      // asset — either way there is no id set to check against.
+      if (!target) continue;
+
+      const ids = await idsFor(target);
+      if (!ids.has(hash) && !ids.has(rawHash)) {
+        broken.push({ file: relative(rootDir, file), line, href });
+      }
+    }
+  }
+
+  return broken;
 }
 
 // --- MDX Source Scan ---
@@ -320,7 +476,12 @@ export async function checkMdxLinks(contentDirs, rootDir, distDir = null, basePa
 
 // --- Report ---
 
-export function formatReport(brokenLinks, mdxWarnings, trailingSlashWarnings = []) {
+export function formatReport(
+  brokenLinks,
+  mdxWarnings,
+  trailingSlashWarnings = [],
+  anchorWarnings = [],
+) {
   const lines = [];
 
   if (brokenLinks.length > 0) {
@@ -347,7 +508,19 @@ export function formatReport(brokenLinks, mdxWarnings, trailingSlashWarnings = [
     lines.push("");
   }
 
-  const total = brokenLinks.length + mdxWarnings.length + trailingSlashWarnings.length;
+  if (anchorWarnings.length > 0) {
+    lines.push("=== Broken Anchors (#fragment has no matching id) ===");
+    for (const { file, line, href } of anchorWarnings) {
+      lines.push(`  ${file}:${line}  ${href}`);
+    }
+    lines.push("");
+  }
+
+  const total =
+    brokenLinks.length +
+    mdxWarnings.length +
+    trailingSlashWarnings.length +
+    anchorWarnings.length;
   if (total > 0) {
     const parts = [];
     if (brokenLinks.length > 0) {
@@ -365,9 +538,14 @@ export function formatReport(brokenLinks, mdxWarnings, trailingSlashWarnings = [
         `${trailingSlashWarnings.length} trailing slash warning${trailingSlashWarnings.length === 1 ? "" : "s"}`,
       );
     }
+    if (anchorWarnings.length > 0) {
+      parts.push(
+        `${anchorWarnings.length} broken anchor${anchorWarnings.length === 1 ? "" : "s"}`,
+      );
+    }
     lines.push(`✗ Found ${parts.join(" and ")}`);
   } else {
-    lines.push("✓ No broken links or absolute path issues found");
+    lines.push("✓ No broken links, anchors or absolute path issues found");
   }
 
   return lines.join("\n");
@@ -422,16 +600,14 @@ async function main() {
   const { docsDir, localeDirs } = await parseContentDirs(settingsPath);
   const contentDirs = [join(rootDir, docsDir), ...localeDirs.map((d) => join(rootDir, d))];
 
-  const checks = [
+  const [brokenLinks, mdxWarnings, anchorWarnings, trailingSlashWarnings] = await Promise.all([
     checkHtmlLinks(distDir, rootDir, basePath, excludePatterns),
     checkMdxLinks(contentDirs, rootDir, distDir, basePath),
-  ];
-
-  if (trailingSlash) {
-    checks.push(checkTrailingSlashLinks(distDir, rootDir, basePath, excludePatterns));
-  }
-
-  let [brokenLinks, mdxWarnings, trailingSlashWarnings = []] = await Promise.all(checks);
+    checkHtmlAnchors(distDir, rootDir, basePath, excludePatterns),
+    trailingSlash
+      ? checkTrailingSlashLinks(distDir, rootDir, basePath, excludePatterns)
+      : Promise.resolve([]),
+  ]);
 
   // --- Flag parsing ---
   //
@@ -442,6 +618,7 @@ async function main() {
   //   --strict-broken    fail when broken links > 0 (after allowlist)
   //   --strict-absolute  fail when absolute warnings > 0 (after allowlist)
   //   --strict-trailing  fail when trailing-slash warnings > 0 (after allowlist)
+  //   --strict-anchors   fail when broken #fragments > 0 (after allowlist)
   //   --allowlist=PATH   skip entries listed in PATH (one
   //                      `<file>:<line>:<href>` per line, `#` comments)
   const argv = process.argv.slice(2);
@@ -449,6 +626,7 @@ async function main() {
   const strictBroken = strict || argv.includes("--strict-broken");
   const strictAbsolute = strict || argv.includes("--strict-absolute");
   const strictTrailing = strict || argv.includes("--strict-trailing");
+  const strictAnchors = strict || argv.includes("--strict-anchors");
   const allowlistArg = argv.find((a) => a.startsWith("--allowlist="));
   const allowlistPath = allowlistArg ? allowlistArg.split("=").slice(1).join("=") : null;
   const resolvedAllowlist = allowlistPath
@@ -463,14 +641,16 @@ async function main() {
   const realBroken = filterOut(brokenLinks);
   const realAbsolute = filterOut(mdxWarnings);
   const realTrailing = filterOut(trailingSlashWarnings);
+  const realAnchors = filterOut(anchorWarnings);
 
-  console.log(formatReport(brokenLinks, mdxWarnings, trailingSlashWarnings));
+  console.log(formatReport(brokenLinks, mdxWarnings, trailingSlashWarnings, anchorWarnings));
 
   if (allowlist.size > 0) {
     const skipped =
       (brokenLinks.length - realBroken.length) +
       (mdxWarnings.length - realAbsolute.length) +
-      (trailingSlashWarnings.length - realTrailing.length);
+      (trailingSlashWarnings.length - realTrailing.length) +
+      (anchorWarnings.length - realAnchors.length);
     if (skipped > 0) {
       console.log(
         `\nAllowlist: ${skipped} known exception${skipped === 1 ? "" : "s"} excluded from strict-mode counts (${resolvedAllowlist}).`,
@@ -479,7 +659,10 @@ async function main() {
   }
 
   const hasIssues =
-    brokenLinks.length > 0 || mdxWarnings.length > 0 || trailingSlashWarnings.length > 0;
+    brokenLinks.length > 0 ||
+    mdxWarnings.length > 0 ||
+    trailingSlashWarnings.length > 0 ||
+    anchorWarnings.length > 0;
 
   // Per-category strict failure (real counts). Combined into one exit
   // code so b4push only needs one invocation. Print which category
@@ -497,14 +680,18 @@ async function main() {
     console.log(`\n❌ STRICT FAIL: ${realTrailing.length} trailing-slash warning${realTrailing.length === 1 ? "" : "s"} (after allowlist).`);
     failed = true;
   }
+  if (strictAnchors && realAnchors.length > 0) {
+    console.log(`\n❌ STRICT FAIL: ${realAnchors.length} broken anchor${realAnchors.length === 1 ? "" : "s"} (after allowlist).`);
+    failed = true;
+  }
   if (failed) {
     process.exit(1);
   }
 
-  if (hasIssues && !strictBroken && !strictAbsolute && !strictTrailing) {
+  if (hasIssues && !strictBroken && !strictAbsolute && !strictTrailing && !strictAnchors) {
     console.log("\nNote: Issues found but running in non-strict mode (exit 0).");
     console.log(
-      "Use --strict-broken / --strict-absolute / --strict-trailing (or --strict for all) to fail on issues.",
+      "Use --strict-broken / --strict-absolute / --strict-trailing / --strict-anchors (or --strict for all) to fail on issues.",
     );
   }
 }
