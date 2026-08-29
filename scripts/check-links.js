@@ -427,7 +427,7 @@ export async function parseContentDirs(configPath) {
 
 export function extractHtmlLinks(html) {
   const links = [];
-  const regex = /<a\s[^>]*?href=(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))[^>]*>/gi;
+  const regex = /<a\s[^>]*?href=(?:"([^"]*)"|'([^']*)'|([^\s\\"'=<>`]+))[^>]*>/gi;
   let match;
   let lastIndex = 0;
   let line = 1;
@@ -713,7 +713,7 @@ export async function checkHtmlLinksAndTrailing(
           if (ids === undefined) {
             const targetHtml = await readFile(detail.targetFile, "utf-8");
             ids = new Set();
-            const idRegex = /\bid\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/gi;
+            const idRegex = /\bid\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s\\"'=<>`]+))/gi;
             let idMatch;
             while ((idMatch = idRegex.exec(targetHtml)) !== null) {
               ids.add(decodeHtmlAttribute(idMatch[1] ?? idMatch[2] ?? idMatch[3]));
