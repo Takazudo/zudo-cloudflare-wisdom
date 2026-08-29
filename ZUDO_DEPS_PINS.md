@@ -12,4 +12,4 @@ Updated by /dev-bump-zudo-deps on every sync — keep `pinned:` accurate.
 - track: releases
 - pinned: 7ca73f197021961603c22042748c23d9ce9d6c50 (v5.13.1)
 - updated: 2026-08-29
-- notes: The two doc route stubs are patched for doc history and global.css carries host branding; preserve the intentional divergences in .template-drift-allowlist and the package scripts' explicit `cloudflare-wisdom` skill-name arguments, while non-allowlisted scaffold files must match upstream exactly.
+- notes: The two doc route stubs are patched for doc history, check-links.js preserves unquoted-attribute support for minified zfb HTML, and global.css carries host branding; preserve the intentional divergences in .template-drift-allowlist and the package scripts' explicit `cloudflare-wisdom` skill-name arguments, while non-allowlisted scaffold files must match upstream exactly.

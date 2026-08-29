@@ -25,14 +25,15 @@ async function withFiles(files, callback) {
 
 const hrefs = (links) => links.map((link) => link.href);
 
-test("extractHtmlLinks reads quoted attribute values", () => {
-  const html = "<a href='/docs/foo'>a</a><a href=\"/docs/bar\">b</a>";
-  assert.deepEqual(hrefs(extractHtmlLinks(html)), ["/docs/foo", "/docs/bar"]);
+test("extractHtmlLinks reads quoted and minified unquoted attribute values", () => {
+  const html = "<a href=/docs/foo>a</a><a href='/docs/bar'>b</a><a href=\"/docs/baz\">c</a>";
+  assert.deepEqual(hrefs(extractHtmlLinks(html)), ["/docs/foo", "/docs/bar", "/docs/baz"]);
 });
 
 test("extractHtmlLinks skips external and non-navigable schemes", () => {
   const html = [
     '<a href="https://example.com">x</a>',
+    "<a href=//cdn.example.com/x>x</a>",
     '<a href="mailto:a@b.c">x</a>',
     '<a href="tel:+123">x</a>',
     '<a href="/docs/keep">x</a>',
@@ -49,14 +50,14 @@ test("checkHtmlLinksAndTrailing reports broken paths and invalid fragments", asy
   await withFiles(
     {
       "docs/a/index.html": [
-        '<a href="/docs/b#bindings-images">good</a>',
-        '<a href="/docs/b#images">bad-anchor</a>',
-        '<a href="#here">good-local</a>',
-        '<a href="#nowhere">bad-local</a>',
-        '<a href="/docs/gone#anything">bad-path</a>',
-        '<h2 id="here">here</h2>',
+        "<a href=/docs/b#bindings-images>good</a>",
+        "<a href=/docs/b#images>bad-anchor</a>",
+        "<a href=#here>good-local</a>",
+        "<a href=#nowhere>bad-local</a>",
+        "<a href=/docs/gone#anything>bad-path</a>",
+        "<h2 id=here>here</h2>",
       ].join(""),
-      "docs/b/index.html": '<h3 id="bindings-images">Images</h3>',
+      "docs/b/index.html": "<h3 id=bindings-images>Images</h3>",
     },
     async (root) => {
       const result = await checkHtmlLinksAndTrailing(root, root, "/", []);
@@ -71,8 +72,8 @@ test("checkHtmlLinksAndTrailing matches percent-encoded non-ASCII fragments", as
   const missing = encodeURIComponent("ない");
   await withFiles(
     {
-      "ja/a/index.html": `<a href="/ja/b#${ja}">good</a><a href="/ja/b#${missing}">bad</a>`,
-      "ja/b/index.html": '<h3 id="バインディング-images">Images</h3>',
+      "ja/a/index.html": `<a href=/ja/b#${ja}>good</a><a href=/ja/b#${missing}>bad</a>`,
+      "ja/b/index.html": "<h3 id=バインディング-images>Images</h3>",
     },
     async (root) => {
       const result = await checkHtmlLinksAndTrailing(root, root, "/", []);
