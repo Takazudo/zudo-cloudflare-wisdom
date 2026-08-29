@@ -30,6 +30,11 @@ test("extractHtmlLinks reads quoted and minified unquoted attribute values", () 
   assert.deepEqual(hrefs(extractHtmlLinks(html)), ["/docs/foo", "/docs/bar", "/docs/baz"]);
 });
 
+test("extractHtmlLinks ignores links inside serialized demo markup", () => {
+  const html = String.raw`<div data-props='{"html":"<a href=\"#\">example</a>"}'></div><a href=/docs/real>real</a>`;
+  assert.deepEqual(hrefs(extractHtmlLinks(html)), ["/docs/real"]);
+});
+
 test("extractHtmlLinks skips external and non-navigable schemes", () => {
   const html = [
     '<a href="https://example.com">x</a>',
@@ -79,6 +84,19 @@ test("checkHtmlLinksAndTrailing matches percent-encoded non-ASCII fragments", as
       const result = await checkHtmlLinksAndTrailing(root, root, "/", []);
       assert.equal(result.anchors.length, 1);
       assert.ok(result.anchors[0].href.endsWith(missing));
+    },
+  );
+});
+
+test("checkHtmlLinksAndTrailing ignores ids inside serialized demo markup", async () => {
+  await withFiles(
+    {
+      "docs/a/index.html": "<a href=/docs/b#%5C>broken</a>",
+      "docs/b/index.html": String.raw`<div data-props='{"html":"<h2 id=\"demo\">example</h2>"}'></div>`,
+    },
+    async (root) => {
+      const result = await checkHtmlLinksAndTrailing(root, root, "/", []);
+      assert.deepEqual(hrefs(result.anchors), ["/docs/b#%5C"]);
     },
   );
 });
