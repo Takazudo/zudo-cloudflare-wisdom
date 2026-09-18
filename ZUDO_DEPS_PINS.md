@@ -10,6 +10,6 @@ Updated by /dev-bump-zudo-deps on every sync — keep `pinned:` accurate.
 - files: pages/docs/[[...slug]].tsx, pages/index.tsx, pages/[locale]/docs/[[...slug]].tsx, public/favicon-16x16.png, public/favicon-32x32.png, public/favicon.ico, public/favicon.svg, scripts/check-links.js, scripts/setup-doc-skill.sh, src/styles/global.css, tsconfig.json
 - source: packages/create-zudo-doc/templates/base/ -> repo root; packages/create-zudo-doc/templates/features/i18n/files/ -> repo root
 - track: releases
-- pinned: 4b7c97f6daed21a0efc4665ff315dc66927b786d (v5.22.0)
-- updated: 2026-09-13
+- pinned: 86012b98df0b47c942990ddbe91b1629a3657de9 (v5.25.0)
+- updated: 2026-09-18
 - notes: The two doc route stubs are patched for doc history and global.css carries host branding; preserve the intentional divergences in .template-drift-allowlist and the package scripts' explicit `cloudflare-wisdom` skill-name arguments, while non-allowlisted scaffold files (including check-links.js, whose upstream parser now supports unquoted attributes) must match upstream exactly.
