@@ -21,32 +21,8 @@
 @source "src/components/**/*.{tsx,ts,jsx,js}";
 @source "pages/**/*.{tsx,ts,jsx,js}";
 
-/* ── Host brand overrides ───────────────────────────────────────────────
-   Only tokens/rules that differ from @takazudo/zudo-doc/theme.css defaults. */
+/* ── Your token overrides ──────────────────────────────────────────────
+   Override any default @theme token from @takazudo/zudo-doc/theme.css here. */
 @theme {
-  /* Body text: Noto Sans + Noto Sans JP for CJK. theme.css defaults
-     --font-sans to `system-ui, sans-serif`; this site loads Noto Sans JP via
-     the config `head` webfont links and points the sans stack at it, so JA and
-     Latin body text render in Noto Sans instead of the system font. */
-  --font-noto:
-    'Noto Sans', 'Noto Sans JP', ui-sans-serif, system-ui, -apple-system,
-    BlinkMacSystemFont, 'Hiragino Sans', 'Hiragino Kaku Gothic Pro',
-    'Yu Gothic', Meiryo, sans-serif;
-  --font-sans: var(--font-noto);
-
-  /* Brand display face for the header site name (and any `font-futura` use).
-     System Futura with graceful fallbacks (Jost / Century Gothic). Not shipped
-     by theme.css — this is the pre-zfb site's brand token. */
-  --font-futura:
-    Futura, Jost, 'Century Gothic', system-ui, -apple-system, BlinkMacSystemFont,
-    'Segoe UI', 'Noto Sans', 'Noto Sans JP', 'Hiragino Sans', sans-serif;
-}
-
-/* Futura on the header site name. The header site-name anchor is rendered by
-   @takazudo/zudo-doc (no className hook), so target it via its stable
-   `data-header-logo` attribute. Normal weight matches the pre-zfb site (the
-   package defaults it to font-bold). */
-[data-header-logo] {
-  font-family: var(--font-futura);
-  font-weight: var(--font-weight-normal);
+  /* e.g. --color-accent: oklch(0.6 0.2 250); */
 }

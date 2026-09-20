@@ -27,7 +27,7 @@ pages/                       # Thin route stubs (package-owned routes injected a
   [locale]/docs/[[...slug]].tsx  # JA doc route stub
 src/
   content/                   # MDX doc pages (docs/ + docs-ja/)
-  styles/global.css          # Package CSS imports + host brand overrides
+  styles/global.css          # Package CSS imports + empty token override seam
 zfb.config.ts                # The single config file — zudoDoc({ ... })
 ```
 
@@ -212,9 +212,9 @@ Available globally in MDX without imports:
 
 ## Typography
 
-- Futura for page h1 titles and header site name (`font-futura` class)
-- Noto Sans JP for body text
-- Headings use font-weight 400 (normal), not bold
+- The `matcha` theme pack owns display typography: Shippori Mincho for page h1/h2 titles, the lead, and the header site name.
+- The pack supplies Zen Kaku Gothic New for Latin body text and M PLUS 1 Code for code; its generic fallbacks let the platform render CJK glyphs.
+- Heading weights follow the pack: doc h1, h2, and h3 use weight 600.
 
 ## Doc Skill (cloudflare-wisdom)
 

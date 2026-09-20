@@ -36,6 +36,10 @@ export default defineConfig(
     // which existed only because zudo-doc 4.2.1 had no toggle (zudo-doc#2959);
     // 4.4.x added `home.wide`, so the package-owned routes are used again.
     home: { wide: true },
+    // Matcha owns the display, sans, mono, header, heading, surface, and
+    // palette tokens. Keep the pack build-pinned; the default switcher stays
+    // disabled.
+    themePack: "matcha",
     locales: {
       ja: { label: "JA", dir: "src/content/docs-ja" },
     },
@@ -46,22 +50,6 @@ export default defineConfig(
       ogSiteName: true,
       twitterCard: "summary_large_image",
       twitterCreator: "@Takazudo",
-    },
-    // Noto Sans JP webfont for JA + Latin body text. Emitted as real <head>
-    // links (preconnect + async stylesheet); global.css points --font-sans at
-    // it. Never load the font via CSS @import — Tailwind v4 bundling can push
-    // it past the first style rule and the browser silently drops it.
-    head: {
-      preconnect: [
-        { href: "https://fonts.googleapis.com" },
-        { href: "https://fonts.gstatic.com", crossorigin: "anonymous" },
-      ],
-      stylesheets: [
-        {
-          href: "https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700&display=swap",
-          async: true,
-        },
-      ],
     },
     llmsTxt: true,
     cjkFriendly: true,
