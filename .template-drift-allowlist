@@ -6,7 +6,7 @@
 # Format: one repo-relative path per line (no leading slash).
 # Blank lines and `#` comments are ignored.
 #
-# Reconciled for the zudo-doc 5.26.2 baseline (single-entry `zudoDoc()` config;
+# Reconciled for the zudo-doc 5.27.0 baseline (single-entry `zudoDoc()` config;
 # the ejected pages/lib + src/{config,components,utils,types,integrations}
 # shells are gone — all wiring now lives inside @takazudo/zudo-doc). Only two
 # template files diverge from the pinned baseline; everything else is either

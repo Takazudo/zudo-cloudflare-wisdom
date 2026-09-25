@@ -142,3 +142,22 @@ test("checkMdxAnchors accepts static id targets", async () => {
     },
   );
 });
+
+test("checkMdxAnchors derives ids from escaped punctuation and code spans like the renderer", async () => {
+  await withFiles(
+    {
+      "source.mdx": [
+        "[ok](./target.mdx#use-a-b-c-now)",
+        "[ok](./target.mdx#_private_-fields)",
+        "[ok](./target.mdx#parent-deep-five)",
+        "[stale](./target.mdx#use-abc-now)",
+        "[stale](./target.mdx#private-fields)",
+      ].join("\n"),
+      "target.mdx": "## Parent\n##### Deep five\n## \\_private\\_ fields\n## Use `a*b*c` now\n",
+    },
+    async (root) => {
+      const result = await checkMdxAnchors([root], root, "/", [], []);
+      assert.deepEqual(hrefs(result), ["./target.mdx#use-abc-now", "./target.mdx#private-fields"]);
+    },
+  );
+});
