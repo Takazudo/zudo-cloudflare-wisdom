@@ -3,6 +3,8 @@ node_modules
 dist
 .zfb
 .zfb-build
+# zudo-doc >=5.26.5 stages package-owned route sources here at build time
+.zudo-doc/
 
 # Astro (legacy; kept harmless during migration)
 .astro
