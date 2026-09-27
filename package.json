@@ -35,7 +35,6 @@
     "setup:doc-skill:both": "bash scripts/setup-doc-skill.sh --target both cloudflare-wisdom"
   },
   "dependencies": {
-    "@takazudo/zdtp": "0.8.5",
     "@takazudo/zfb": "2.22.0",
     "@takazudo/zfb-adapter-cloudflare": "2.22.0",
     "@takazudo/zfb-md-wasm": "2.22.0",
