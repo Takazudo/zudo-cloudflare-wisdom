@@ -1,8 +1,8 @@
 import { defineConfig } from "zfb/config";
 import { zudoDoc } from "@takazudo/zudo-doc/config";
 
-// zudo-doc v4 single-entry config. `zudoDoc()` shallow-merges these fields over
-// the package defaults and returns a complete ZfbConfig (framework, tailwind,
+// zudo-doc v7 single-entry config. `zudoDoc()` shallow-merges these fields over
+// the package defaults and returns a complete ZfbConfig (framework, Wind,
 // collections, plugins, markdown, package-owned routes are all supplied
 // internally — the host sets only what differs from the defaults). Fields left
 // at their documented @default are intentionally omitted:

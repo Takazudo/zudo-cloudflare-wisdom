@@ -1,6 +1,6 @@
 # zudo-cloudflare-wisdom
 
-Takazudo's personal Cloudflare dev notes, built with zudo-doc (zfb stack, MDX, Tailwind CSS v4).
+Takazudo's personal Cloudflare dev notes, built with zudo-doc (zfb stack, MDX, zudo-react and Wind).
 
 **Live site**: <https://zudo-cloudflare-wisdom.takazudomodular.com/>
 
@@ -16,6 +16,8 @@ Not official Cloudflare documentation. Written for personal reference and AI-ass
 - Recipes: real-world patterns from Astro + Pages, search APIs, auth
 
 ## Commands
+
+Requires Node.js 24 (`>=24 <25`).
 
 ```bash
 pnpm install
