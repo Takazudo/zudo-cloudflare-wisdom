@@ -1,6 +1,6 @@
 # zudo-cloudflare-wisdom
 
-Takazudo's Cloudflare dev notes, built with zudo-doc (zfb stack, MDX, Tailwind CSS v4).
+Takazudo's Cloudflare dev notes, built with zudo-doc (zfb stack, MDX, zudo-react and Wind).
 
 ## Commands
 
@@ -16,7 +16,7 @@ pnpm setup:doc-skill  # Generate cloudflare-wisdom skill + symlink all skills
 
 ## Project Layout
 
-zudo-doc 4.x is a thin host shell — all wiring (components, config types,
+zudo-doc 7.x is a thin host shell — all wiring (components, config types,
 utils, routes, chrome) lives inside `@takazudo/zudo-doc`, driven by the single
 `zudoDoc()` config.
 
