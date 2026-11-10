@@ -1,20 +1,27 @@
 import { defineConfig } from "zfb/config";
 import { zudoDoc } from "@takazudo/zudo-doc/config";
 
-// zudo-doc v7 single-entry config. `zudoDoc()` shallow-merges these fields over
+// zudo-doc v10 single-entry config. `zudoDoc()` shallow-merges these fields over
 // the package defaults and returns a complete ZfbConfig (framework, Wind,
 // collections, plugins, markdown, package-owned routes are all supplied
 // internally — the host sets only what differs from the defaults). Fields left
 // at their documented @default are intentionally omitted:
 //   - colorScheme "Default Dark" + colorMode { defaultMode: "dark", lightScheme:
 //     "Default Light", darkScheme: "Default Dark", respectPrefersColorScheme:
-//     true } — the v4 default IS dark-default, matching this site's dark-first
-//     brand, so no colorMode override is needed.
+//     true } — the package default IS dark-default, matching this site's
+//     dark-first brand, so no colorMode override is needed.
+//   - themePack. On a light/dark site, omission resolves to Graphite, the
+//     current default look. create-zudo-doc 10 writes `themePack` only when
+//     the chosen pack differs from that omission (Classic is `themePack:
+//     "classic"`). Do not set the `"default"` alias, and do not list both
+//     `"default"` and `"graphite"` in `themePacks` — that pair fails the build.
 //   - directives (the canonical seven, incl. caution/details), buildDocsSchema,
 //     translations (en/ja/de), colorSchemes (Default Light/Dark) — this site
 //     uses the package defaults verbatim.
 //   - base "/", mermaid true, trailingSlash false, port 4321, packageOwnedRoutes
 //     true, docsDir, defaultLocale "en", tocMin/MaxDepth.
+// ZFB 6 always bundles with Rolldown. Leave ZFB_BUNDLER, ZFB_ROLLDOWN_PROTOTYPE,
+// and ZFB_ESBUILD_BIN unset.
 export default defineConfig(
   zudoDoc({
     siteName: "zudo-cloudflare-wisdom",
@@ -36,10 +43,6 @@ export default defineConfig(
     // which existed only because zudo-doc 4.2.1 had no toggle (zudo-doc#2959);
     // 4.4.x added `home.wide`, so the package-owned routes are used again.
     home: { wide: true },
-    // Matcha owns the display, sans, mono, header, heading, surface, and
-    // palette tokens. Keep the pack build-pinned; the default switcher stays
-    // disabled.
-    themePack: "matcha",
     locales: {
       ja: { label: "JA", dir: "src/content/docs-ja" },
     },
