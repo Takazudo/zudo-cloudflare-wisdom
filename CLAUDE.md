@@ -212,9 +212,8 @@ Available globally in MDX without imports:
 
 ## Typography
 
-- The `matcha` theme pack owns display typography: Shippori Mincho for page h1/h2 titles, the lead, and the header site name.
-- The pack supplies Zen Kaku Gothic New for Latin body text and M PLUS 1 Code for code; its generic fallbacks let the platform render CJK glyphs.
-- Heading weights follow the pack: doc h1, h2, and h3 use weight 600.
+- The site uses zudo-doc's default theme pack, Graphite. `themePack` is omitted in `zfb.config.ts`; on this light/dark site that omission resolves to Graphite.
+- Graphite loads no webfonts. Display, body, and code stay on the package default type stack, and the pack only sets palette, heading ink, and the document heading rules.
 
 ## Doc Skill (cloudflare-wisdom)
 

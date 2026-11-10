@@ -1,4 +1,4 @@
-# Intentional divergences from published create-zudo-doc 7.0.0 templates.
+# Intentional divergences from published create-zudo-doc 10.0.0 templates.
 # Doc history is enabled: both raw route templates receive the generator's
 # DocHistoryBoundary binding. The EN comment also names the current boundary.
 pages/docs/[[...slug]].tsx

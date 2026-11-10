@@ -178,8 +178,24 @@ if [ "$SKILL_NAME" = "$DEFAULT_SKILL_NAME" ] && [ "$DEFAULT_SKILL_NAME" != "$LEG
 fi
 
 # Resolve the main repo root (handles git worktrees correctly)
-# Use the main worktree path so symlinks survive worktree removal
-REPO_ROOT="$(git -C "$ROOT_DIR" worktree list | head -1 | awk '{print $1}')"
+# Use the main worktree path so symlinks survive worktree removal. Read the
+# porcelain form: the plain listing is space-separated, so a checkout path
+# containing a space would be cut short (#4705). When the main entry is a bare
+# repository it has no checkout to link into, so fall back to the current
+# worktree's top level.
+WORKTREE_PORCELAIN="$(git -C "$ROOT_DIR" worktree list --porcelain)"
+REPO_ROOT=""
+MAIN_WORKTREE_IS_BARE="false"
+while IFS= read -r porcelain_line; do
+  [ -z "$porcelain_line" ] && break
+  case "$porcelain_line" in
+    "worktree "*) REPO_ROOT="${porcelain_line#worktree }" ;;
+    bare) MAIN_WORKTREE_IS_BARE="true" ;;
+  esac
+done <<< "$WORKTREE_PORCELAIN"
+if [ "$MAIN_WORKTREE_IS_BARE" = "true" ] || [ -z "$REPO_ROOT" ]; then
+  REPO_ROOT="$(git -C "$ROOT_DIR" rev-parse --show-toplevel)"
+fi
 
 # Path from the repository root to the project directory: "" at the repo
 # root, "doc/" (trailing slash) when the project lives in a subdirectory
@@ -488,8 +504,11 @@ while IFS=$'\t' read -r record_type record_value record_extra; do
   esac
 done <<< "$CONFIG_LOCALE_DATA"
 
-DOCS_DIR="$ROOT_DIR/$DOCS_DIR_REL"
-REPO_DOCS_DIR="$REPO_ROOT/${PROJECT_PREFIX}${DOCS_DIR_REL}"
+# Validate and enumerate the same tree the docs symlink targets (main), not
+# the worktree the script runs from, so the category list in SKILL.md matches
+# what the link shows (#4704, as #4698/#4702 for AUTHORING.md and locales).
+REPO_DOCS_DIR="$MAIN_PROJECT_DIR/$DOCS_DIR_REL"
+DOCS_DIR="$REPO_DOCS_DIR"
 
 # Validate docs directory exists
 if [ ! -d "$DOCS_DIR" ]; then
@@ -612,11 +631,23 @@ locale_link_name() {
   printf '%s\n' "$name"
 }
 
+# LOCALE_PRESENT holds the ONE existence decision per locale that the
+# guidance, the Japanese section, and generate_skill's symlink step all read,
+# so the three can never disagree (#4047). It tests MAIN_PROJECT_DIR, the tree
+# the locale symlinks target: testing ROOT_DIR from a linked worktree could
+# link or mention a directory main lacks, or skip one main has (#4702, as
+# #4698 for AUTHORING.md).
+LOCALE_PRESENT=()
 for locale_index in "${!LOCALE_CODES[@]}"; do
   locale_code="${LOCALE_CODES[$locale_index]}"
   locale_dir="${LOCALE_DIR_RELS[$locale_index]}"
   locale_link="$(locale_link_name "$locale_code" "$locale_dir")"
   LOCALE_LINK_NAMES+=("$locale_link")
+  if [ -d "$MAIN_PROJECT_DIR/$locale_dir" ]; then
+    LOCALE_PRESENT+=("true")
+  else
+    LOCALE_PRESENT+=("false")
+  fi
 done
 
 locale_starter_note() {
@@ -628,16 +659,15 @@ locale_starter_note() {
 }
 
 # Build exact locale-map guidance for the generated skill. Entries come from
-# configured `locales`, but only when the directory exists on disk -- gated
-# by the SAME existence check generate_skill uses below before symlinking,
-# so the guidance can never point at a locale link that was never created
-# (#4047).
+# configured `locales`, but only when LOCALE_PRESENT (above) says the
+# directory exists, so the guidance can never point at a locale link that was
+# never created (#4047).
 LOCALE_GUIDANCE="- \`$DEFAULT_LOCALE\` (default): \`${DOCS_DIR_REL%/}/\` — \`/docs/...\` ($(locale_starter_note "$DEFAULT_LOCALE"))"
 LOCALE_GUIDANCE+=$'\n'
 for locale_index in "${!LOCALE_CODES[@]}"; do
   locale_code="${LOCALE_CODES[$locale_index]}"
   locale_dir="${LOCALE_DIR_RELS[$locale_index]}"
-  [ -d "$ROOT_DIR/$locale_dir" ] || continue
+  [ "${LOCALE_PRESENT[$locale_index]}" = "true" ] || continue
   locale_link="${LOCALE_LINK_NAMES[$locale_index]}"
   locale_note="$(locale_starter_note "$locale_code")"
   LOCALE_GUIDANCE+="- \`$locale_code\`: \`${locale_dir%/}/\` — \`/$locale_code/docs/...\` (${locale_note}); lookup link: \`$locale_link/\`"
@@ -652,10 +682,9 @@ if [ "$DEFAULT_LOCALE" = "ja" ]; then
 else
   for locale_index in "${!LOCALE_CODES[@]}"; do
     if [ "${LOCALE_CODES[$locale_index]}" = "ja" ]; then
-      locale_dir="${LOCALE_DIR_RELS[$locale_index]}"
-      # Same existence check as the LOCALE_GUIDANCE loop above and
+      # Same LOCALE_PRESENT decision as the LOCALE_GUIDANCE loop above and
       # generate_skill's symlink step below (#4047).
-      [ -d "$ROOT_DIR/$locale_dir" ] || break
+      [ "${LOCALE_PRESENT[$locale_index]}" = "true" ] || break
       JA_DOCS_LINK="${LOCALE_LINK_NAMES[$locale_index]}"
       JA_DOCS_PATH="${LOCALE_DIR_RELS[$locale_index]}"
       break
@@ -698,6 +727,19 @@ fi
 # build` from the outer repo root would otherwise invoke the wrong
 # package.json, #2918).
 VERIFY_STEP="Run \`pnpm build\` from \`$MAIN_PROJECT_DIR\` to confirm the site builds correctly."
+
+# Name the project's editorial policy when it uses the scaffold default
+# (AUTHORING.md); otherwise defer to whatever policy the instruction files
+# name. The four placement questions are embedded either way so Update mode
+# never depends on a network connection. Test the same tree the pointer
+# names (MAIN_PROJECT_DIR, like every other path in the skill text): checking
+# ROOT_DIR from a linked worktree could name a file main lacks, or drop a
+# pointer main has (#4698).
+if [ -f "$MAIN_PROJECT_DIR/AUTHORING.md" ]; then
+  POLICY_STEP="Read the editorial policy \`$MAIN_PROJECT_DIR/AUTHORING.md\` (categories, boundaries, URL and translation constraints)."
+else
+  POLICY_STEP="Read the project's editorial policy: the file that \`CLAUDE.md\`, \`AGENTS.md\`, or \`README.md\` in \`$MAIN_PROJECT_DIR\` names for adding or organizing docs. If none is named, treat category boundaries as undecided and rely on the questions below."
+fi
 
 resolve_targets() {
   case "$TARGET_MODE" in
@@ -744,12 +786,14 @@ generate_skill() {
     locale_code="${LOCALE_CODES[$locale_index]}"
     locale_dir="${LOCALE_DIR_RELS[$locale_index]}"
     locale_link="${LOCALE_LINK_NAMES[$locale_index]}"
-    locale_target="$REPO_ROOT/${PROJECT_PREFIX}${locale_dir}"
-    if [ -d "$ROOT_DIR/$locale_dir" ]; then
+    locale_target="$MAIN_PROJECT_DIR/$locale_dir"
+    if [ "${LOCALE_PRESENT[$locale_index]}" = "true" ]; then
       ensure_symlink "$skill_dir/$locale_link" "$locale_target"
       echo "  [$target] Created $locale_link symlink for $locale_code -> $locale_target"
     else
-      echo "  [$target] Skipping $locale_code link; configured directory not found at $ROOT_DIR/$locale_dir"
+      # Drop a link an earlier run left behind: SKILL.md no longer names it.
+      [ -L "$skill_dir/$locale_link" ] && rm "$skill_dir/$locale_link"
+      echo "  [$target] Skipping $locale_code link; configured directory not found at $locale_target"
     fi
   done
 
@@ -795,8 +839,23 @@ The user has new information and wants to add or update documentation in this re
    document. The topic keyword (if provided) hints at the subject area.
 2. **Find existing docs**: Search the default \`docs/\` directory or the exact configured locale link for articles related to
    the topic. Read them to understand what is already covered.
-3. **Decide create vs update**: If an existing article covers the topic, update
-   it. Otherwise, create a new \`.mdx\` file in the appropriate subdirectory.
+3. **Check placement and decide create vs update**: For a typo, wording, or
+   formatting fix, update the article and skip the rest of this step.
+   Otherwise: ${POLICY_STEP} Then answer:
+   1. Who can do what with this content?
+   2. Does an existing page already serve that role? If so, update it.
+   3. Why this category, and is there a competing destination?
+   4. Does this addition change what the category means?
+   If the answers are clear, report the placement reason in one line. Only
+   when there is evidence of a category conflict, duplication, a new independent
+   cluster of reader tasks, or a findability problem, write the concrete reader
+   problem and compare updating an existing article, improving while keeping
+   the structure, a local reorganization, and related links or an index —
+   keep the options that solve the problem, then prefer the smaller change.
+   Read only the related or competing articles, and say what you surveyed.
+   Keeping the structure is a valid result; do not decide by page count.
+   If no existing page serves the role, create a new \`.mdx\` file in the
+   subdirectory chosen above.
 4. **Write the content**: Follow the doc-authoring rules in this project's CLAUDE.md (\`$MAIN_PROJECT_DIR/CLAUDE.md\`):
    - Required frontmatter: \`title\` (string). Always set \`sidebar_position\`.
      Optional: \`description\`, \`sidebar_label\`, \`tags\`, etc.
